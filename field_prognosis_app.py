@@ -4628,78 +4628,126 @@ def main():
         # --- Excel export ---
         with ex1:
             buf = io.BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as wr:
-                # Convert to display units so Excel users see the same numbers
-                # as the plots and KPI metrics.
-                df_e_disp = df_e_to_display_units(df_e, fluid, units)
-                df_e_disp.to_excel(wr, "Field forecast", index=False)
-                per_well_df.to_excel(wr, "Per-well", index=False)
-                # Per-reservoir time series (if present)
-                per_res_df_export = R.get("per_res_df")
-                if per_res_df_export is not None and len(per_res_df_export) > 0:
-                    per_res_df_export.to_excel(wr, "Per-reservoir", index=False)
-                # Per-reservoir summary
-                if per_res_df_export is not None and len(per_res_df_export) > 0:
-                    res_summary = per_res_df_export.groupby(
-                        ["reservoir_id", "reservoir_name", "fluid_system"]
-                    ).agg(
-                        cum_primary_final=("cum_primary", "last"),
-                        final_rf=("recovery_factor", "last"),
-                        pressure_final=("pressure", "last"),
-                        peak_rate=("primary_rate", "max"),
-                    ).reset_index()
-                    res_summary.to_excel(wr, "Reservoir summary", index=False)
-                # Reservoirs definition
-                if asm_r.reservoirs:
-                    res_def = pd.DataFrame([{
-                        "id": r.id, "name": r.name,
-                        "fluid_system": r.fluid_system,
-                        "strategy": r.strategy,
-                        "ooip_oil_MMstb": r.ooip_oil,
-                        "ogip_gas_Bscf": r.ogip_gas,
-                        "rf_target": r.rf_target,
-                        "p_init_psi": r.pvt.p_init_psi,
-                        "t_res_F": r.pvt.t_res_F,
-                        "api": r.pvt.api, "gas_grav": r.pvt.gas_grav,
-                        "rs_init": r.pvt.rs_init, "p_bub_psi": r.pvt.p_bub_psi,
-                        "aquifer_active": r.aquifer.active,
-                        "gas_cap_active": r.gas_cap.active,
-                        "vrr": r.voidage_ratio,
-                    } for r in asm_r.reservoirs])
-                    res_def.to_excel(wr, "Reservoirs", index=False)
-                    if asm_r.well_links:
-                        pd.DataFrame([{
-                            "well": l.well_name, "reservoir": l.reservoir_id,
-                            "fraction": l.fraction,
-                        } for l in asm_r.well_links]).to_excel(
-                            wr, "Allocations", index=False)
-                pd.DataFrame([{
-                    "fluid_system": asm_r.fluid_system,
-                    "strategy": asm_r.strategy,
-                    "ooip_oil": asm_r.ooip_oil, "ogip_gas": asm_r.ogip_gas,
-                    "rf_target": asm_r.rf_target,
-                    "forecast_years": asm_r.forecast_years,
-                    "rock_compressibility": asm_r.rock_compressibility,
-                    "sw_init": asm_r.sw_init,
-                    "voidage_ratio": asm_r.voidage_ratio,
-                    "inj_efficiency": asm_r.inj_efficiency,
-                    "production_efficiency": asm_r.production_efficiency,
-                    "gas_export_fraction": asm_r.gas_export_fraction,
-                    "gas_injection_fraction": asm_r.gas_injection_fraction,
-                    "gas_fuel_fraction": asm_r.gas_fuel_fraction,
-                    "gas_flare_fraction": asm_r.gas_flare_fraction,
-                    **asdict(asm_r.pvt),
-                    **{f"aq_{k}": v for k, v in asdict(asm_r.aquifer).items()},
-                    **{f"gc_{k}": v for k, v in asdict(asm_r.gas_cap).items()},
-                }]).to_excel(wr, "Assumptions", index=False)
-                econ_dict = {k: v for k, v in asdict(econ_r).items() if k != "facility_capex"}
-                pd.DataFrame([econ_dict]).to_excel(wr, "Economics", index=False)
-                econ_r.facility_capex.df.to_excel(wr, "Facility CAPEX", index=False)
-            buf.seek(0)
-            st.download_button("📊 Excel (.xlsx)", data=buf.getvalue(),
-                               file_name="field_prognosis.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
+
+            def _safe_to_excel(df_obj, sheet_name: str, writer):
+                """Write a DataFrame to Excel only if it has rows AND columns.
+
+                Empty DataFrames trigger an openpyxl IndexError in the workbook
+                save() (it walks column_dimensions and bails on zero columns).
+                We also coerce timezone-aware datetimes to naive — Excel doesn't
+                support tz — and replace ±inf with NaN.
+                """
+                try:
+                    if df_obj is None:
+                        return
+                    if not hasattr(df_obj, "shape"):
+                        return
+                    rows, cols = df_obj.shape
+                    if rows == 0 or cols == 0:
+                        return
+                    safe = df_obj.copy()
+                    # Replace ±inf with NaN (openpyxl can struggle)
+                    try:
+                        safe = safe.replace([np.inf, -np.inf], np.nan)
+                    except Exception:
+                        pass
+                    # Strip timezone from any datetime columns
+                    for c in safe.columns:
+                        try:
+                            if pd.api.types.is_datetime64tz_dtype(safe[c]):
+                                safe[c] = safe[c].dt.tz_localize(None)
+                        except Exception:
+                            pass
+                    # Truncate sheet name to Excel's 31-char limit
+                    sn = str(sheet_name)[:31]
+                    safe.to_excel(writer, sn, index=False)
+                except Exception as exc:
+                    # Don't kill the whole export over one bad sheet
+                    st.warning(f"Could not write sheet '{sheet_name}': {exc}")
+
+            try:
+                with pd.ExcelWriter(buf, engine="openpyxl") as wr:
+                    # Convert to display units so Excel users see the same numbers
+                    # as the plots and KPI metrics.
+                    df_e_disp = df_e_to_display_units(df_e, fluid, units)
+                    _safe_to_excel(df_e_disp, "Field forecast", wr)
+                    _safe_to_excel(per_well_df, "Per-well", wr)
+                    per_res_df_export = R.get("per_res_df")
+                    if per_res_df_export is not None and len(per_res_df_export) > 0:
+                        _safe_to_excel(per_res_df_export, "Per-reservoir", wr)
+                        # Per-reservoir summary
+                        try:
+                            res_summary = per_res_df_export.groupby(
+                                ["reservoir_id", "reservoir_name", "fluid_system"]
+                            ).agg(
+                                cum_primary_final=("cum_primary", "last"),
+                                final_rf=("recovery_factor", "last"),
+                                pressure_final=("pressure", "last"),
+                                peak_rate=("primary_rate", "max"),
+                            ).reset_index()
+                            _safe_to_excel(res_summary, "Reservoir summary", wr)
+                        except Exception:
+                            pass
+                    # Reservoirs definition
+                    if asm_r.reservoirs:
+                        res_def = pd.DataFrame([{
+                            "id": r.id, "name": r.name,
+                            "fluid_system": r.fluid_system,
+                            "strategy": r.strategy,
+                            "ooip_oil_MMstb": r.ooip_oil,
+                            "ogip_gas_Bscf": r.ogip_gas,
+                            "rf_target": r.rf_target,
+                            "p_init_psi": r.pvt.p_init_psi,
+                            "t_res_F": r.pvt.t_res_F,
+                            "api": r.pvt.api, "gas_grav": r.pvt.gas_grav,
+                            "rs_init": r.pvt.rs_init, "p_bub_psi": r.pvt.p_bub_psi,
+                            "aquifer_active": r.aquifer.active,
+                            "gas_cap_active": r.gas_cap.active,
+                            "vrr": r.voidage_ratio,
+                        } for r in asm_r.reservoirs])
+                        _safe_to_excel(res_def, "Reservoirs", wr)
+                        if asm_r.well_links:
+                            alloc = pd.DataFrame([{
+                                "well": l.well_name, "reservoir": l.reservoir_id,
+                                "fraction": l.fraction,
+                            } for l in asm_r.well_links])
+                            _safe_to_excel(alloc, "Allocations", wr)
+                    asm_dict = pd.DataFrame([{
+                        "fluid_system": asm_r.fluid_system,
+                        "strategy": asm_r.strategy,
+                        "ooip_oil": asm_r.ooip_oil, "ogip_gas": asm_r.ogip_gas,
+                        "rf_target": asm_r.rf_target,
+                        "forecast_years": asm_r.forecast_years,
+                        "rock_compressibility": asm_r.rock_compressibility,
+                        "sw_init": asm_r.sw_init,
+                        "voidage_ratio": asm_r.voidage_ratio,
+                        "inj_efficiency": asm_r.inj_efficiency,
+                        "production_efficiency": asm_r.production_efficiency,
+                        "gas_export_fraction": asm_r.gas_export_fraction,
+                        "gas_injection_fraction": asm_r.gas_injection_fraction,
+                        "gas_fuel_fraction": asm_r.gas_fuel_fraction,
+                        "gas_flare_fraction": asm_r.gas_flare_fraction,
+                        **asdict(asm_r.pvt),
+                        **{f"aq_{k}": v for k, v in asdict(asm_r.aquifer).items()},
+                        **{f"gc_{k}": v for k, v in asdict(asm_r.gas_cap).items()},
+                    }])
+                    _safe_to_excel(asm_dict, "Assumptions", wr)
+                    econ_dict = {k: v for k, v in asdict(econ_r).items() if k != "facility_capex"}
+                    _safe_to_excel(pd.DataFrame([econ_dict]), "Economics", wr)
+                    # Facility CAPEX may be empty — only write when it has rows
+                    fac_df_export = econ_r.facility_capex.df
+                    if fac_df_export is not None and len(fac_df_export) > 0:
+                        _safe_to_excel(fac_df_export, "Facility CAPEX", wr)
+                buf.seek(0)
+                xlsx_ready = True
+            except Exception as exc:
+                xlsx_ready = False
+                st.error(f"Excel export failed: {exc}. The PDF and JSON exports still work.")
+            if xlsx_ready:
+                st.download_button("📊 Excel (.xlsx)", data=buf.getvalue(),
+                                   file_name="field_prognosis.xlsx",
+                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                   use_container_width=True)
 
         # --- JSON-API export ---
         with ex2:
