@@ -131,31 +131,59 @@ _DF_COLUMN_KINDS = {
 
 def df_to_display_units(df: "pd.DataFrame", fluid_system: str, units: str) -> "pd.DataFrame":
     """Return a copy of ``df`` with all rate/volume/pressure columns converted
-    from field units to the user's chosen display units. Used for the Data tab
-    and Excel export so the numeric values match what the plots show.
+    from field units to the user's chosen display units, and column headers
+    suffixed with their unit (e.g. ``gas_rate [kSm³/d]``) so Excel exports and
+    the Data tab are self-documenting.
 
-    The input ``df`` is the engine's raw output, which is always in field units.
-    Pass ``units='field'`` to get a no-op copy.
+    Works in both ``field`` and ``metric`` modes — when ``field``, only the
+    headers are relabelled (no value conversion needed).
     """
     out = df.copy()
-    if units == "field":
-        return out
     primary = "oil_rate" if FLUID_SYSTEMS[fluid_system]["primary"] == "oil" else "gas_rate"
     secondary = "gas_rate" if primary == "oil_rate" else "oil_rate"
     col_map = dict(_DF_COLUMN_KINDS)
     col_map["primary_rate"]   = primary
     col_map["secondary_rate"] = secondary
-    for col, kind in col_map.items():
-        if col in out.columns and kind:
-            try:
-                out[col] = from_field(out[col].astype(float), kind, units)
-            except Exception:
-                pass
-    # Rename columns to make units explicit so Excel readers don't get confused
+    # Convert values (no-op when units == 'field')
+    if units != "field":
+        for col, kind in col_map.items():
+            if col in out.columns and kind:
+                try:
+                    out[col] = from_field(out[col].astype(float), kind, units)
+                except Exception:
+                    pass
+    # Rename rate / volume / pressure columns to include the unit
     rename = {}
     for col, kind in col_map.items():
         if col in out.columns and kind:
             rename[col] = f"{col} [{ulabel(kind, units)}]"
+    # Also label money columns (always USD) for self-documenting exports
+    money_cols = {
+        "revenue":         "[USD/month]",
+        "revenue_oil":     "[USD/month]",
+        "revenue_gas":     "[USD/month]",
+        "revenue_condensate": "[USD/month]",
+        "revenue_ngl":     "[USD/month]",
+        "ngl_rate":        "[bbl/d]",
+        "opex":            "[USD/month]",
+        "tax":             "[USD/month]",
+        "capex_well":      "[USD/month]",
+        "capex_facility":  "[USD/month]",
+        "abandonment":     "[USD/month]",
+        "cashflow":        "[USD/month]",
+        "cum_cashflow":    "[USD]",
+        "pretax_cf":       "[USD/month]",
+        "discounted_cf":   "[USD/month]",
+        "npv":             "[USD]",
+        "co2_total_t":     "[tonnes/month]",
+        "cum_co2_tonnes":  "[tonnes]",
+    }
+    for col, label in money_cols.items():
+        if col in out.columns:
+            rename[col] = f"{col} {label}"
+    # Date column header gets a small clarification too
+    if "date" in out.columns:
+        rename["date"] = "date [YYYY-MM-DD]"
     out = out.rename(columns=rename)
     return out
 
@@ -415,6 +443,16 @@ class EconInputs:
     completion_day_rate_kUSD: float = 350.0 # completion-spread dayrate
     well_tangibles_MM: float = 4.0         # per-well tangibles (casing, tree, etc.) in $MM
     well_intangibles_pct: float = 0.10     # intangibles as a fraction of (rig + completion) cost
+    # ---- NGL (Natural Gas Liquids) stream ----
+    # NGL = propane / butane / pentane+ extracted from the produced gas at a
+    # midstream plant. Modelled as a yield factor (volume of NGL per volume of
+    # gross gas), priced per barrel. Subject to its own opex and (optionally)
+    # to gas shrinkage at the plant.
+    ngl_yield_bbl_per_mmscf: float = 0.0    # bbl NGL per MMscf gas (typical: 0 dry, 30-150 condensate)
+    ngl_price_bbl: float = 25.0              # $/bbl (often quoted as 30-60% of WTI)
+    ngl_opex_bbl: float = 5.0                # processing + transport tariff
+    ngl_shrinkage_pct: float = 0.0           # fraction of gas volume lost at extraction
+                                              # (0 = ignore shrinkage; typical 2-5%)
 
 
 @dataclass
@@ -1337,7 +1375,30 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         tariff = sold_gas * days * econ.tariff_gas + \
                  df["secondary_rate"] * days * econ.tariff_oil
 
-    revenue = rev_oil + rev_gas + rev_cond
+    # ---- NGL stream (independent of oil/gas, derived from gross gas) ----
+    # NGL volume = gross_gas (MMscf/d) × yield (bbl/MMscf). We use *gross* gas,
+    # not sold gas, because NGLs are extracted at the plant *before* the gas
+    # disposition split (export/inject/fuel/flare).
+    ngl_yield = float(getattr(econ, "ngl_yield_bbl_per_mmscf", 0.0))
+    ngl_price = float(getattr(econ, "ngl_price_bbl", 0.0))
+    ngl_opex_bbl = float(getattr(econ, "ngl_opex_bbl", 0.0))
+    ngl_shrinkage = float(getattr(econ, "ngl_shrinkage_pct", 0.0))
+    if "gross_gas_rate" in df.columns:
+        gross_gas_mmscfd = df["gross_gas_rate"] / 1000.0   # Mscf/d -> MMscf/d
+    else:
+        gross_gas_mmscfd = (df["secondary_rate"] if is_oil else df["primary_rate"]) / 1000.0
+    ngl_rate_bpd = gross_gas_mmscfd * ngl_yield            # bbl/d NGL
+    ngl_monthly_bbl = ngl_rate_bpd * days
+    rev_ngl = ngl_monthly_bbl * ngl_price
+    ngl_opex = ngl_monthly_bbl * ngl_opex_bbl
+
+    # Apply shrinkage to the sold-gas revenue (NGL extraction removes volume
+    # from the gas stream that goes to market).
+    if ngl_shrinkage > 0:
+        shrink_factor = max(1.0 - ngl_shrinkage, 0.0)
+        rev_gas = rev_gas * shrink_factor
+
+    revenue = rev_oil + rev_gas + rev_cond + rev_ngl
     royalty = revenue * econ.royalty_rate
     net_revenue = revenue - royalty - tariff
 
@@ -1347,7 +1408,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         # primary_rate in Mscf/d, opex_var in $/Mscf
         var_cost = df["primary_rate"] * days * econ.opex_var
     fixed_cost = econ.opex_fixed / 12.0
-    opex = var_cost + fixed_cost
+    opex = var_cost + fixed_cost + ngl_opex
 
     capex_well = np.zeros(len(df))
     well_cost_breakdown = []   # for transparency / display
@@ -1471,6 +1532,8 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["revenue_oil"] = rev_oil
         df_e["revenue_gas"] = rev_gas
         df_e["revenue_condensate"] = rev_cond
+        df_e["revenue_ngl"] = rev_ngl
+        df_e["ngl_rate"] = ngl_rate_bpd
         df_e["revenue"] = revenue
         df_e["royalty"] = royalty_arr
         df_e["tariff"] = tariff
@@ -1499,6 +1562,8 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["revenue_oil"] = rev_oil
         df_e["revenue_gas"] = rev_gas
         df_e["revenue_condensate"] = rev_cond
+        df_e["revenue_ngl"] = rev_ngl
+        df_e["ngl_rate"] = ngl_rate_bpd
         df_e["revenue"] = revenue
         df_e["royalty"] = royalty
         df_e["tariff"] = tariff
@@ -2139,13 +2204,20 @@ def sidebar_inputs():
         initial_pressure_psi=to_field(gc_pi, "pressure", units),
     )
 
-    with st.sidebar.expander("💧 Injection", expanded=(strategy == "Injection")):
-        vrr = st.slider("Voidage replacement ratio (target)", 0.5, 1.5, 1.0, 0.05,
-                        key="vrr", on_change=mark_stale,
-                        help="Used only when no injector wells are defined.")
-        eff = st.slider("Injection efficiency", 0.3, 1.0, 0.85, 0.05,
-                        key="inj_eff", on_change=mark_stale,
-                        help="Fraction of injected fluid that effectively replaces voidage.")
+    # Injection inputs are only meaningful for Injection strategy. In Depletion
+    # mode we still need defaults for the FieldAssumptions dataclass but the UI
+    # is hidden to keep the sidebar focused.
+    if strategy == "Injection":
+        with st.sidebar.expander("💧 Injection", expanded=True):
+            vrr = st.slider("Voidage replacement ratio (target)", 0.5, 1.5, 1.0, 0.05,
+                            key="vrr", on_change=mark_stale,
+                            help="Used only when no injector wells are defined.")
+            eff = st.slider("Injection efficiency", 0.3, 1.0, 0.85, 0.05,
+                            key="inj_eff", on_change=mark_stale,
+                            help="Fraction of injected fluid that effectively replaces voidage.")
+    else:
+        vrr = st.session_state.get("vrr", 1.0)
+        eff = st.session_state.get("inj_eff", 0.85)
 
     with st.sidebar.expander("🧪 Productivity index (single-reservoir)", expanded=False):
         st.caption(
@@ -2307,14 +2379,28 @@ def well_type_curve_picker(units: str, fluid: str, rig_names: list):
                  "Uncheck to see all archetypes.",
         )
 
+        # Strategy context — keeps injectors out of the picker for Depletion fields
+        strategy_ctx = st.session_state.get("strategy", "Injection")
+
         if filter_on and reservoir_ctx:
-            names = fh.list_well_types_for_reservoir(reservoir_ctx, min_score=0.5)
+            names = fh.list_well_types_for_reservoir(reservoir_ctx, min_score=0.5,
+                                                      strategy=strategy_ctx)
             if not names:
                 st.info("No archetypes scored above 0.5 for this reservoir. "
                         "Showing all.")
                 names = fh.list_well_types()
         else:
             names = fh.list_well_types()
+
+        # Hide injector archetypes when the field is in Depletion mode (belt-and-
+        # braces — the scorer already downranks them, this enforces it regardless
+        # of the filter toggle).
+        if strategy_ctx == "Depletion":
+            names = [n for n in names
+                     if (fh.get_well_type(n) or {}).get("kind") != "injector"]
+            if not names:
+                names = [n for n in fh.list_well_types()
+                          if (fh.get_well_type(n) or {}).get("kind") != "injector"]
 
         c_left, c_right = st.columns([3, 2])
 
@@ -2333,7 +2419,8 @@ def well_type_curve_picker(units: str, fluid: str, rig_names: list):
 
             # Reservoir-fit chips for the selected archetype
             if tmpl and reservoir_ctx:
-                fit = fh.well_template_reservoir_fit(tmpl, reservoir_ctx)
+                fit = fh.well_template_reservoir_fit(tmpl, reservoir_ctx,
+                                                       strategy=strategy_ctx)
                 if fit["badges"]:
                     chips_html = " ".join(
                         f'<span class="eq-chip">{b}</span>' for b in fit["badges"]
@@ -2901,9 +2988,10 @@ def well_section(units, fluid, start_date):
             "well_pi_override": st.column_config.NumberColumn(
                 "PI override",
                 min_value=0.0, step=0.1, format="%.2f",
-                help="Optional per-well PI override (bbl/d/psi for oil, "
-                     "Mscf/d/psi for gas). Leave at 0 to use the linked "
-                     "reservoir's PI."),
+                help=("Optional per-well PI override "
+                      f"({'bbl/d/psi' if units=='field' else 'Sm³/d/bar'} for oil, "
+                      f"{'Mscf/d/psi' if units=='field' else 'kSm³/d/bar'} for gas). "
+                      "Leave at 0 to use the linked reservoir's PI.")),
             "fluid": st.column_config.SelectboxColumn(
                 "Fluid",
                 options=["auto", "oil", "gas"],
@@ -2920,68 +3008,87 @@ def well_section(units, fluid, start_date):
                      "capacity choke is still applied separately. When OFF, decline "
                      "alone determines the rate."),
             "wellhead_pressure_psi": st.column_config.NumberColumn(
-                "P_wh (psi)", min_value=0.0, step=10.0, format="%.0f",
-                help="Flowing wellhead pressure (separator / manifold). "
-                     "Typical 100-500 psi onshore, 200-1500 psi offshore."),
+                "P_wh [psi]" if units == "field" else "P_wh [psi — field units]",
+                min_value=0.0, step=10.0, format="%.0f",
+                help=("Flowing wellhead pressure (separator / manifold), in **psi** "
+                      "regardless of unit system. Typical 100-500 psi onshore, "
+                      "200-1500 psi offshore. (1 bar ≈ 14.50 psi.)")),
             "tubing_depth_ft": st.column_config.NumberColumn(
-                "Depth (ft)", min_value=0.0, step=100.0, format="%.0f",
-                help="Mid-perf depth — sets the hydrostatic head for outflow."),
+                "Depth [ft]" if units == "field" else "Depth [ft — field units]",
+                min_value=0.0, step=100.0, format="%.0f",
+                help=("Mid-perf depth in **feet**, regardless of unit system — "
+                      "sets the hydrostatic head for outflow. (1 m ≈ 3.281 ft.)")),
             "fluid_gradient_psi_per_ft": st.column_config.NumberColumn(
-                "ρ (psi/ft)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                help="Mixture hydrostatic gradient. Oil ~0.30-0.40, water ~0.43, "
-                     "gas ~0.05-0.15. For high-WC wells use 0.40-0.43."),
+                "ρ [psi/ft]" if units == "field" else "ρ [psi/ft — field units]",
+                min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                help=("Mixture hydrostatic gradient in psi/ft. Oil ~0.30-0.40, "
+                      "water ~0.43, gas ~0.05-0.15. For high-WC wells use 0.40-0.43.")),
             "friction_psi_per_kbpd": st.column_config.NumberColumn(
-                "Friction", min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
-                help="Linear friction proxy (psi per 1000 bbl/d). Higher tubing "
-                     "ID and lower viscosity reduce this. Typical 2-10 for oil "
-                     "wells, 5-20 for high-rate gas wells."),
+                "Friction [psi/kbpd]" if units == "field" else "Friction [psi per 1000 bbl/d]",
+                min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
+                help=("Linear friction proxy (psi per 1000 bbl/d). Higher tubing "
+                      "ID and lower viscosity reduce this. Typical 2-10 for oil "
+                      "wells, 5-20 for high-rate gas wells.")),
         },
         key="producers_editor", on_change=mark_stale,
     )
     st.session_state.producers_df = producers_df
 
-    st.markdown("**Injectors**")
-    if "injectors_df" not in st.session_state:
-        # Seed two example injectors so the UX has something visible to edit
-        inj_default_rate = from_field(20000.0, "water_rate", units)
-        st.session_state.injectors_df = pd.DataFrame([{
-            "name": f"WI-{i+1:02d}",
-            "rig": rig_names[(i + 0) % len(rig_names)],
-            "drill_days": 45, "completion_days": 15,
-            "inj_rate": inj_default_rate,
-            "scale_factor": 1.0, "uptime": 0.95,
-        } for i in range(2)])
-    else:
-        # Backfill missing columns when loading older sessions / saved cases
-        df = st.session_state.injectors_df
-        if "uptime" not in df.columns:
-            df["uptime"] = 0.95
-        if "scale_factor" not in df.columns:
-            df["scale_factor"] = 1.0
-        st.session_state.injectors_df = df
+    # Injectors table — only shown for Injection strategy. In Depletion mode
+    # we keep an empty injectors_df in session so downstream code still works.
+    strategy = st.session_state.get("strategy", "Depletion")
+    is_injection = (strategy == "Injection")
 
-    injectors_df = st.data_editor(
-        st.session_state.injectors_df, num_rows="dynamic", use_container_width=True,
-        column_config={
-            "name": st.column_config.TextColumn("Well", required=True),
-            "rig": st.column_config.SelectboxColumn("Rig", options=rig_names, required=True),
-            "drill_days": st.column_config.NumberColumn("Drill days", min_value=1, step=1),
-            "completion_days": st.column_config.NumberColumn("Compl. days", min_value=1, step=1),
-            "inj_rate": st.column_config.NumberColumn(
-                f"Injection rate ({ulabel('water_rate', units)})",
-                min_value=0.0,
-                help="Constant target injection rate while online (subject to facility "
-                     "capacity and, if VRR cap is enabled below, voidage matching)."),
-            "scale_factor": st.column_config.NumberColumn(
-                "Scale", min_value=0.1, max_value=5.0, step=0.05, format="%.2f",
-                help="Sensitivity multiplier on the injection target."),
-            "uptime": st.column_config.NumberColumn(
-                "Uptime", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                help="Fraction of online time the injector actually injects."),
-        },
-        key="injectors_editor", on_change=mark_stale,
-    )
-    st.session_state.injectors_df = injectors_df
+    if is_injection:
+        st.markdown("**Injectors**")
+        if "injectors_df" not in st.session_state:
+            # Seed two example injectors so the UX has something visible to edit
+            inj_default_rate = from_field(20000.0, "water_rate", units)
+            st.session_state.injectors_df = pd.DataFrame([{
+                "name": f"WI-{i+1:02d}",
+                "rig": rig_names[(i + 0) % len(rig_names)],
+                "drill_days": 45, "completion_days": 15,
+                "inj_rate": inj_default_rate,
+                "scale_factor": 1.0, "uptime": 0.95,
+            } for i in range(2)])
+        else:
+            # Backfill missing columns when loading older sessions / saved cases
+            df = st.session_state.injectors_df
+            if "uptime" not in df.columns:
+                df["uptime"] = 0.95
+            if "scale_factor" not in df.columns:
+                df["scale_factor"] = 1.0
+            st.session_state.injectors_df = df
+
+        injectors_df = st.data_editor(
+            st.session_state.injectors_df, num_rows="dynamic", use_container_width=True,
+            column_config={
+                "name": st.column_config.TextColumn("Well", required=True),
+                "rig": st.column_config.SelectboxColumn("Rig", options=rig_names, required=True),
+                "drill_days": st.column_config.NumberColumn("Drill days", min_value=1, step=1),
+                "completion_days": st.column_config.NumberColumn("Compl. days", min_value=1, step=1),
+                "inj_rate": st.column_config.NumberColumn(
+                    f"Injection rate ({ulabel('water_rate', units)})",
+                    min_value=0.0,
+                    help="Constant target injection rate while online (subject to facility "
+                         "capacity and, if VRR cap is enabled below, voidage matching)."),
+                "scale_factor": st.column_config.NumberColumn(
+                    "Scale", min_value=0.1, max_value=5.0, step=0.05, format="%.2f",
+                    help="Sensitivity multiplier on the injection target."),
+                "uptime": st.column_config.NumberColumn(
+                    "Uptime", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+                    help="Fraction of online time the injector actually injects."),
+            },
+            key="injectors_editor", on_change=mark_stale,
+        )
+        st.session_state.injectors_df = injectors_df
+    else:
+        # Depletion mode: empty injectors so add_well() finds nothing to add.
+        # Preserve any existing injectors_df in session (in case user toggles
+        # strategy back to Injection) but pass an empty frame downstream.
+        injectors_df = pd.DataFrame(columns=["name", "rig", "drill_days",
+                                              "completion_days", "inj_rate",
+                                              "scale_factor", "uptime"])
 
     user_profiles = {}
     needs_upload = producers_df[producers_df["decline_model"] == "User-defined profile"]["name"].tolist()
@@ -3429,16 +3536,26 @@ def reservoir_section(units: str, sidebar_inputs: dict,
 # =============================================================================
 # Capacities UI
 # =============================================================================
-def capacity_section(units, start_date):
-    st.subheader("🛢️ Production & injection capacities (time-varying)")
+def capacity_section(units, start_date, strategy: str = "Injection"):
+    """Render the capacity table. In Depletion mode the water/gas injection
+    columns are hidden — the engine still receives a CapacitySchedule with
+    those columns set to 0 (effectively unlimited) so downstream logic
+    works unchanged.
+    """
+    is_injection = (strategy == "Injection")
+    st.subheader("🛢️ Production capacities (time-varying)"
+                 if not is_injection
+                 else "🛢️ Production & injection capacities (time-varying)")
     with st.expander("ℹ️ How capacities work", expanded=False):
-        st.markdown(
-            "- Each row defines a **change date**; values apply forward until the next row.\n"
-            "- A proportional choke is applied each month so the field honors the tightest active limit.\n"
-            "- Set a value to 0 to disable that constraint.\n"
-            "- `Gas` is in MMscf/d in field units (note the unit in the column header).\n"
-            "- `water_inj` and `gas_inj` cap the injection plant capacity."
-        )
+        notes = [
+            "- Each row defines a **change date**; values apply forward until the next row.",
+            "- A proportional choke is applied each month so the field honors the tightest active limit.",
+            "- Set a value to 0 to disable that constraint.",
+            "- `Gas` is in MMscf/d in field units (note the unit in the column header).",
+        ]
+        if is_injection:
+            notes.append("- `water_inj` and `gas_inj` cap the injection plant capacity.")
+        st.markdown("\n".join(notes))
     if "cap_df" not in st.session_state:
         st.session_state.cap_df = pd.DataFrame({
             "start_date": [start_date],
@@ -3449,32 +3566,59 @@ def capacity_section(units, start_date):
             "water_inj": [from_field(100000.0, "water_rate", units)],
             "gas_inj":   [0.0],
         })
-    cap_df = st.data_editor(
-        st.session_state.cap_df, num_rows="dynamic", use_container_width=True,
-        column_config={
-            "start_date": st.column_config.DateColumn("From"),
-            "oil": st.column_config.NumberColumn(
-                f"Oil ({ulabel('oil_rate', units)})", min_value=0.0,
-                help="Oil treatment / export. 0 = unlimited."),
-            "gas": st.column_config.NumberColumn(
-                f"Gas ({'MMscf/d' if units=='field' else ulabel('gas_rate', units)})",
-                min_value=0.0, help="Gas processing capacity."),
-            "water": st.column_config.NumberColumn(
-                f"Water ({ulabel('water_rate', units)})", min_value=0.0,
-                help="Produced water handling capacity."),
-            "liquid": st.column_config.NumberColumn(
-                f"Liquid ({ulabel('oil_rate', units)})", min_value=0.0,
-                help="Total liquid (oil+water) handling capacity."),
-            "water_inj": st.column_config.NumberColumn(
-                f"Water inj. ({ulabel('water_rate', units)})", min_value=0.0,
-                help="Water injection plant capacity."),
-            "gas_inj": st.column_config.NumberColumn(
-                f"Gas inj. ({ulabel('gas_rate', units)})", min_value=0.0,
-                help="Gas injection plant capacity."),
-        },
+    # Build the display-only DataFrame and column config, hiding injection
+    # columns in Depletion mode.
+    cap_display = st.session_state.cap_df.copy()
+    column_config = {
+        "start_date": st.column_config.DateColumn("From"),
+        "oil": st.column_config.NumberColumn(
+            f"Oil ({ulabel('oil_rate', units)})", min_value=0.0,
+            help="Oil treatment / export. 0 = unlimited."),
+        "gas": st.column_config.NumberColumn(
+            f"Gas ({'MMscf/d' if units=='field' else ulabel('gas_rate', units)})",
+            min_value=0.0, help="Gas processing capacity."),
+        "water": st.column_config.NumberColumn(
+            f"Water ({ulabel('water_rate', units)})", min_value=0.0,
+            help="Produced water handling capacity."),
+        "liquid": st.column_config.NumberColumn(
+            f"Liquid ({ulabel('oil_rate', units)})", min_value=0.0,
+            help="Total liquid (oil+water) handling capacity."),
+    }
+    if is_injection:
+        column_config["water_inj"] = st.column_config.NumberColumn(
+            f"Water inj. ({ulabel('water_rate', units)})", min_value=0.0,
+            help="Water injection plant capacity.")
+        column_config["gas_inj"] = st.column_config.NumberColumn(
+            f"Gas inj. ({ulabel('gas_rate', units)})", min_value=0.0,
+            help="Gas injection plant capacity.")
+        edit_df = cap_display
+    else:
+        # Drop injection columns from the displayed editor; preserve them in
+        # session_state under the hood so toggling back to Injection restores
+        # the values.
+        edit_df = cap_display.drop(columns=[c for c in ("water_inj", "gas_inj")
+                                              if c in cap_display.columns],
+                                    errors="ignore")
+    cap_df_edited = st.data_editor(
+        edit_df, num_rows="dynamic", use_container_width=True,
+        column_config=column_config,
         key="cap_editor", on_change=mark_stale,
     )
-    st.session_state.cap_df = cap_df
+    # Merge edited columns back into the full cap_df so injection columns
+    # survive a strategy toggle.
+    full = st.session_state.cap_df.copy()
+    # The user may have added/removed rows; the edited frame is the source of truth
+    # for the visible columns. Inject 0 for the hidden columns.
+    for c in cap_df_edited.columns:
+        if c in full.columns:
+            pass
+    full = cap_df_edited.copy()
+    if "water_inj" not in full.columns:
+        full["water_inj"] = 0.0
+    if "gas_inj" not in full.columns:
+        full["gas_inj"] = 0.0
+    st.session_state.cap_df = full
+    cap_df = full
 
     cap_field = cap_df.copy()
     for col, kind in [("oil", "oil_rate"), ("water", "water_rate"),
@@ -3503,19 +3647,88 @@ def economics_section(units, start_date):
             "- **Tax** is applied on positive pre-tax cashflow only (no loss carry-forward)."
         )
 
+    # Prices are always shown in $/bbl (oil) and $/MMBtu (gas) regardless of
+    # the metric/field units toggle — this is the industry-standard convention
+    # (oil traded as Brent/WTI per barrel; gas as Henry Hub/JKM/TTF per MMBtu).
+    # The engine internally uses $/bbl (oil) and $/Mscf (gas) for consistency
+    # with field-unit production. We convert $/MMBtu → $/Mscf via the standard
+    # natural-gas heating-value factor of 1.0 Mcf/MMBtu (a close screening
+    # approximation; real values vary 0.95-1.10 with composition).
+    MMBTU_PER_MCF = 1.0   # screening factor; engine treats gas_price as $/Mscf
     c1, c2, c3, c4 = st.columns(4)
-    oil_price = c1.number_input(f"Oil price ({ulabel('price_oil', units)})",
-                                value=from_field(75.0, "price_oil", units),
-                                key="oil_price", on_change=mark_stale)
-    gas_price = c2.number_input(f"Gas price ({ulabel('price_gas', units)})",
-                                value=from_field(3.5, "price_gas", units),
-                                key="gas_price", on_change=mark_stale)
-    opex_var = c3.number_input(f"Var. OPEX ({ulabel('price_oil', units)})",
-                               value=from_field(8.0, "price_oil", units),
-                               key="opex_var", on_change=mark_stale,
-                               help="Per unit of primary fluid produced.")
+    oil_price_bbl = c1.number_input(
+        "Oil price ($/bbl)", value=75.0,
+        key="oil_price_bbl", on_change=mark_stale,
+        help="Crude oil price per barrel. Industry-standard regardless of unit system."
+    )
+    gas_price_mmbtu = c2.number_input(
+        "Gas price ($/MMBtu)", value=3.5,
+        key="gas_price_mmbtu", on_change=mark_stale,
+        help="Natural-gas price per MMBtu (Henry Hub / JKM / TTF benchmark unit). "
+             "Internally converted to $/Mscf using 1 Mcf ≈ 1 MMBtu "
+             "(screening approximation; real heating values vary 0.95–1.10)."
+    )
+    opex_var_bbl = c3.number_input(
+        "Var. OPEX ($/bbl)", value=8.0,
+        key="opex_var_bbl", on_change=mark_stale,
+        help="Per barrel of primary fluid produced. Industry-standard "
+             "regardless of unit system."
+    )
     opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
                                  key="opex_fixed", on_change=mark_stale)
+
+    # Convert always-$/bbl and always-$/MMBtu to engine-internal $/bbl, $/Mscf
+    oil_price = float(oil_price_bbl)
+    gas_price = float(gas_price_mmbtu) * MMBTU_PER_MCF
+    opex_var = float(opex_var_bbl)
+
+    # ---- NGL (Natural Gas Liquids) ----
+    with st.expander("💎 NGL (Natural Gas Liquids) stream", expanded=False):
+        st.markdown(
+            "NGL = propane / butane / pentane+ extracted from the produced gas at "
+            "a midstream plant. Modelled as a per-MMscf yield, priced per barrel. "
+            "Set yield to **0** to disable. "
+            "Typical yields by reservoir type:\n"
+            "- Dry gas: 0–10 bbl/MMscf\n"
+            "- Wet gas: 10–50 bbl/MMscf\n"
+            "- Gas condensate: 30–150 bbl/MMscf\n"
+            "- Rich gas / volatile oil associated: 50–200 bbl/MMscf\n\n"
+            "NGL pricing is typically quoted as a **30–60% fraction of WTI** "
+            "(so at oil = $75/bbl, expect NGL $22–45/bbl)."
+        )
+        ngl1, ngl2, ngl3, ngl4 = st.columns(4)
+        ngl_yield = ngl1.number_input(
+            "NGL yield (bbl/MMscf)", value=0.0, min_value=0.0, step=5.0,
+            key="ngl_yield", on_change=mark_stale,
+            help="Volume of NGL recovered per MMscf of gross gas processed. "
+                 "Always bbl/MMscf regardless of unit system."
+        )
+        ngl_price = ngl2.number_input(
+            "NGL price ($/bbl)", value=25.0, min_value=0.0, step=1.0,
+            key="ngl_price", on_change=mark_stale,
+            help="Composite NGL price. As a rule of thumb, 35-50% of the oil price."
+        )
+        ngl_opex = ngl3.number_input(
+            "NGL OPEX ($/bbl)", value=5.0, min_value=0.0, step=0.5,
+            key="ngl_opex", on_change=mark_stale,
+            help="NGL-specific processing + transport + fractionation tariff. "
+                 "Typical 3-10 $/bbl."
+        )
+        ngl_shrink = ngl4.slider(
+            "Gas shrinkage from NGL", 0.0, 0.15, 0.0, 0.005, format="%.3f",
+            key="ngl_shrink", on_change=mark_stale,
+            help="Fraction of gas volume lost to the NGL plant (extraction "
+                 "removes hydrocarbons that no longer reach the gas sales meter). "
+                 "Typical 2-5%. Set to 0 to ignore (slightly optimistic)."
+        )
+        # Live preview
+        if ngl_yield > 0:
+            st.caption(
+                f"💡 At yield = {ngl_yield:.0f} bbl/MMscf, NGL price = ${ngl_price:.0f}/bbl, "
+                f"every **1 MMscf/d** of gas yields **{ngl_yield:.0f} bbl/d** of NGL → "
+                f"**${ngl_yield * ngl_price * 365 / 1e6:,.2f}MM/yr** revenue (gross), "
+                f"net of ${ngl_yield * ngl_opex * 365 / 1e6:,.2f}MM/yr OPEX."
+            )
 
     # ---- Well cost (fixed vs rig-rate bottom-up) ----
     st.markdown("**Well cost model**")
@@ -3585,13 +3798,15 @@ def economics_section(units, start_date):
                         help="Deducted from gross revenue.")
 
     c1, c2, c3 = st.columns(3)
-    tariff_oil = c1.number_input(f"Oil tariff ({ulabel('price_oil', units)})",
-                                 value=from_field(2.0, "price_oil", units),
-                                 key="tariff_oil", on_change=mark_stale,
-                                 help="Pipeline / processing tariff per bbl (or Sm³).")
-    tariff_gas = c2.number_input(f"Gas tariff ({ulabel('price_gas', units)})",
-                                 value=from_field(0.3, "price_gas", units),
-                                 key="tariff_gas", on_change=mark_stale)
+    tariff_oil_bbl = c1.number_input(
+        "Oil tariff ($/bbl)", value=2.0,
+        key="tariff_oil_bbl", on_change=mark_stale,
+        help="Pipeline / processing tariff per barrel of oil. Always per bbl "
+             "regardless of unit system.")
+    tariff_gas_mmbtu = c2.number_input(
+        "Gas tariff ($/MMBtu)", value=0.3,
+        key="tariff_gas_mmbtu", on_change=mark_stale,
+        help="Gas transport / processing tariff per MMBtu.")
     aban_cost = c3.number_input("Abandonment cost ($MM)", value=80.0,
                                 key="aban_cost", on_change=mark_stale)
 
@@ -3662,14 +3877,14 @@ def economics_section(units, start_date):
     st.session_state.fac_df = fac_df
 
     return EconInputs(
-        oil_price=to_field(oil_price, "price_oil", units),
-        gas_price=to_field(gas_price, "price_gas", units),
-        opex_var=to_field(opex_var, "price_oil", units),
+        oil_price=oil_price,        # already in $/bbl (engine-internal)
+        gas_price=gas_price,        # already in $/Mscf (engine-internal)
+        opex_var=opex_var,           # already in $/bbl
         opex_fixed=opex_fixed * 1e6,
         capex_per_well=capex_well,
         discount_rate=disc, tax_rate=tax, royalty_rate=royalty,
-        tariff_oil=to_field(tariff_oil, "price_oil", units),
-        tariff_gas=to_field(tariff_gas, "price_gas", units),
+        tariff_oil=tariff_oil_bbl,    # will be set below from $/bbl input
+        tariff_gas=tariff_gas_mmbtu * MMBTU_PER_MCF,  # $/MMBtu → $/Mscf
         abandonment_cost_MM=aban_cost,
         facility_capex=CapexSchedule(df=fac_df.copy()),
         fiscal_regime=regime,
@@ -3683,6 +3898,10 @@ def economics_section(units, start_date):
         completion_day_rate_kUSD=completion_day_rate_kUSD,
         well_tangibles_MM=well_tangibles_MM,
         well_intangibles_pct=well_intangibles_pct,
+        ngl_yield_bbl_per_mmscf=ngl_yield,
+        ngl_price_bbl=ngl_price,
+        ngl_opex_bbl=ngl_opex,
+        ngl_shrinkage_pct=ngl_shrink,
     )
 
 
@@ -4309,7 +4528,7 @@ def main():
     inj_names  = [w.name for w in wells if not w.is_producer]
     reservoirs, well_links = reservoir_section(units, inputs, prod_names, inj_names)
 
-    cap_sched = capacity_section(units, inputs["start_date"])
+    cap_sched = capacity_section(units, inputs["start_date"], inputs.get("strategy", "Injection"))
     econ = economics_section(units, inputs["start_date"])
 
     asm = FieldAssumptions(
@@ -4494,6 +4713,23 @@ def main():
                         f"{econ_r.discount_rate:.0%} equals zero. "
                         f"Implied gas price: ${be['gas_price']:.2f}/Mscf."))
 
+    # NGL contribution (only show when yield > 0)
+    ngl_yield_active = float(getattr(econ_r, "ngl_yield_bbl_per_mmscf", 0.0))
+    if ngl_yield_active > 0 and "revenue_ngl" in df_e.columns:
+        total_ngl_rev = df_e["revenue_ngl"].sum() / 1e6
+        total_rev = df_e["revenue"].sum() / 1e6
+        peak_ngl_bpd = df_e["ngl_rate"].max() if "ngl_rate" in df_e.columns else 0.0
+        ngl_share = (total_ngl_rev / total_rev * 100) if total_rev > 0 else 0.0
+        cum_ngl_MMbbl = (df_e.get("ngl_rate", pd.Series(0.0, index=df_e.index))
+                          * DAYS_PER_MONTH).sum() / 1e6
+        st.caption(
+            f"💎 **NGL stream:** peak {peak_ngl_bpd:,.0f} bbl/d  •  "
+            f"cumulative {cum_ngl_MMbbl:,.1f} MMbbl  •  "
+            f"revenue ${total_ngl_rev:,.0f}MM "
+            f"({ngl_share:.1f}% of total)  •  "
+            f"yield {ngl_yield_active:.0f} bbl/MMscf at ${econ_r.ngl_price_bbl:.0f}/bbl."
+        )
+
     tabs = st.tabs([
         "Production", "Cumulatives & RF", "Per-well",
         "Drilling sequence", "Material balance", "Economics",
@@ -4594,6 +4830,31 @@ def main():
         e3.metric("Total CAPEX",
                   f"${(df_e['capex_well'].sum() + df_e['capex_facility'].sum())/1e6:,.0f}MM")
         e4.metric("Total tax", f"${df_e['tax'].sum()/1e6:,.0f}MM")
+
+        # Revenue breakdown by stream (oil / gas / condensate / NGL)
+        with st.expander("💰 Revenue breakdown by stream", expanded=False):
+            stream_rows = []
+            total_rev = df_e["revenue"].sum()
+            for col, label in [
+                ("revenue_oil",        "Oil"),
+                ("revenue_gas",        "Gas"),
+                ("revenue_condensate", "Condensate"),
+                ("revenue_ngl",        "NGL"),
+            ]:
+                if col in df_e.columns:
+                    v = df_e[col].sum()
+                    if v > 0:
+                        stream_rows.append({
+                            "Stream": label,
+                            "Revenue ($MM)": v / 1e6,
+                            "% of total":    (v / total_rev * 100) if total_rev > 0 else 0.0,
+                        })
+            if stream_rows:
+                sdf = pd.DataFrame(stream_rows)
+                st.dataframe(
+                    sdf.style.format({"Revenue ($MM)": "{:,.0f}", "% of total": "{:.1f}%"}),
+                    use_container_width=True, hide_index=True,
+                )
 
         # Well-cost breakdown (rig-rate or fixed)
         breakdown = df_e.attrs.get("well_cost_breakdown", [])
@@ -4846,13 +5107,19 @@ def collect_inputs_payload() -> dict:
         "prod_eff",
         "gas_export", "gas_inj_frac", "gas_fuel", "gas_flare",
         "multi_res_enable",
-        "oil_price", "gas_price", "opex_var", "opex_fixed",
-        "capex_well", "disc", "tax_rate", "royalty",
-        "tariff_oil", "tariff_gas", "aban_cost",
+        # New price keys (always $/bbl and $/MMBtu)
+        "oil_price_bbl", "gas_price_mmbtu", "opex_var_bbl",
+        "tariff_oil_bbl", "tariff_gas_mmbtu",
+        # Old price keys retained for backward compatibility on load
+        "oil_price", "gas_price", "opex_var",
+        "tariff_oil", "tariff_gas",
+        "opex_fixed", "capex_well", "disc", "tax_rate", "royalty",
+        "aban_cost",
         "fiscal_regime", "psc_cr_ceiling", "psc_pos", "psc_tax",
         "psc_gov_part", "psc_sig_bonus",
         "well_cost_mode", "rig_dayrate", "cmpl_dayrate",
         "well_tangibles", "well_intangibles_pct",
+        "ngl_yield", "ngl_price", "ngl_opex", "ngl_shrink",
         "aq_ct_U", "aq_ct_diff",
         "well_pi_default", "min_bhp_default",
     ]
@@ -5271,15 +5538,20 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
         ("VRR / efficiency", f"{asm.voidage_ratio:.2f} / {asm.inj_efficiency:.0%}"),
         ("Producers", f"{sum(1 for w in wells if w.is_producer)}"),
         ("Injectors", f"{sum(1 for w in wells if not w.is_producer)}"),
-        (f"Oil price ({ulabel('price_oil', units)})",
-         f"{from_field(econ.oil_price, 'price_oil', units):,.1f}"),
-        (f"Gas price ({ulabel('price_gas', units)})",
-         f"{from_field(econ.gas_price, 'price_gas', units):,.2f}"),
+        ("Oil price ($/bbl)", f"{econ.oil_price:,.2f}"),
+        ("Gas price ($/MMBtu)", f"{econ.gas_price:,.2f}"),     # internal $/Mscf ≈ $/MMBtu
         ("Discount rate", f"{econ.discount_rate:.1%}"),
         ("Tax rate", f"{econ.tax_rate:.1%}"),
         ("Royalty rate", f"{econ.royalty_rate:.1%}"),
         ("Abandonment", f"${econ.abandonment_cost_MM:.0f}MM"),
     ]
+    # NGL row only when the stream is active
+    if getattr(econ, "ngl_yield_bbl_per_mmscf", 0.0) > 0:
+        assumptions.append(
+            ("NGL yield / price",
+             f"{econ.ngl_yield_bbl_per_mmscf:.0f} bbl/MMscf @ "
+             f"${econ.ngl_price_bbl:.0f}/bbl  (OPEX ${econ.ngl_opex_bbl:.1f}/bbl)")
+        )
 
     # Render figures
     figs_for_pdf = []
@@ -5553,19 +5825,50 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "cap_sched": cap_sched, "facility_capex": facility_capex,
     }
 
+    # Backward compat: old saves stored oil_price/gas_price/opex_var/tariffs
+    # in the user's *display* units (e.g. $/Sm³ for metric users). New saves
+    # always use $/bbl and $/MMBtu. We prefer the new keys when present, and
+    # fall back to converting the old keys via the (saved) units.
+    MMBTU_PER_MCF = 1.0
+    if "oil_price_bbl" in scalar:
+        oil_price_f = float(scalar.get("oil_price_bbl", 75.0))
+    else:
+        # Old format: convert from display units
+        oil_price_f = to_field(float(scalar.get("oil_price", 75)), "price_oil", units)
+    if "gas_price_mmbtu" in scalar:
+        gas_price_f = float(scalar.get("gas_price_mmbtu", 3.5)) * MMBTU_PER_MCF
+    else:
+        gas_price_f = to_field(float(scalar.get("gas_price", 3.5)), "price_gas", units)
+    if "opex_var_bbl" in scalar:
+        opex_var_f = float(scalar.get("opex_var_bbl", 8.0))
+    else:
+        opex_var_f = to_field(float(scalar.get("opex_var", 8)), "price_oil", units)
+    if "tariff_oil_bbl" in scalar:
+        tariff_oil_f = float(scalar.get("tariff_oil_bbl", 2.0))
+    else:
+        tariff_oil_f = to_field(float(scalar.get("tariff_oil", 2)), "price_oil", units)
+    if "tariff_gas_mmbtu" in scalar:
+        tariff_gas_f = float(scalar.get("tariff_gas_mmbtu", 0.3)) * MMBTU_PER_MCF
+    else:
+        tariff_gas_f = to_field(float(scalar.get("tariff_gas", 0.3)), "price_gas", units)
+
     econ_dict = {
-        "oil_price": to_field(float(scalar.get("oil_price", 75)), "price_oil", units),
-        "gas_price": to_field(float(scalar.get("gas_price", 3.5)), "price_gas", units),
-        "opex_var":  to_field(float(scalar.get("opex_var", 8)), "price_oil", units),
+        "oil_price": oil_price_f,
+        "gas_price": gas_price_f,
+        "opex_var":  opex_var_f,
         "opex_fixed": float(scalar.get("opex_fixed", 20)) * 1e6,
         "capex_per_well": float(scalar.get("capex_well", 15)),
         "discount_rate": float(scalar.get("disc", 0.10)),
         "tax_rate":      float(scalar.get("tax_rate", 0.30)),
         "royalty_rate":  float(scalar.get("royalty", 0.10)),
-        "tariff_oil": to_field(float(scalar.get("tariff_oil", 2)), "price_oil", units),
-        "tariff_gas": to_field(float(scalar.get("tariff_gas", 0.3)), "price_gas", units),
+        "tariff_oil": tariff_oil_f,
+        "tariff_gas": tariff_gas_f,
         "abandonment_cost_MM": float(scalar.get("aban_cost", 80)),
         "facility_capex": facility_capex,
+        "ngl_yield_bbl_per_mmscf": float(scalar.get("ngl_yield", 0.0)),
+        "ngl_price_bbl": float(scalar.get("ngl_price", 25.0)),
+        "ngl_opex_bbl": float(scalar.get("ngl_opex", 5.0)),
+        "ngl_shrinkage_pct": float(scalar.get("ngl_shrink", 0.0)),
     }
     return wells, _reservoirs_from_payload(payload, units), meta, econ_dict
 

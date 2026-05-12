@@ -1115,7 +1115,8 @@ def is_builtin_well_type(name: str) -> bool:
     return name in WELL_TYPE_CURVES
 
 
-def well_template_reservoir_fit(template: dict, reservoir_dict: dict | None) -> dict:
+def well_template_reservoir_fit(template: dict, reservoir_dict: dict | None,
+                                  strategy: str | None = None) -> dict:
     """Score how well a well-archetype matches a reservoir's physical envelope.
 
     Args:
@@ -1123,6 +1124,10 @@ def well_template_reservoir_fit(template: dict, reservoir_dict: dict | None) -> 
         reservoir_dict: a reservoir dict with keys 'fluid_system', 'p_init',
                          'well_pi', 'min_bhp', 'description' (optional).
                          Pass None to skip reservoir-context scoring.
+        strategy: optional "Depletion" / "Injection" context. When "Depletion",
+                  injector archetypes are heavily downranked (they're irrelevant
+                  in that mode). When None or "Injection", injectors get a
+                  neutral score that lets them appear but not dominate.
 
     Returns:
         dict with keys:
@@ -1139,6 +1144,22 @@ def well_template_reservoir_fit(template: dict, reservoir_dict: dict | None) -> 
     # Always check fluid compatibility first
     tmpl_fluid = template.get("fluid", "oil")
     tmpl_kind = template.get("kind", "producer")
+
+    # Injectors: handled separately so they don't crowd out producer recommendations.
+    if tmpl_kind == "injector":
+        if strategy == "Depletion":
+            # Injectors are nonsensical for a pure depletion field — push them
+            # to the bottom of the ranking but don't hide entirely.
+            return {"score": 0.10, "badges": ["⚠ injector (depletion mode)"],
+                     "reason": "Depletion strategy — no injection wells needed.",
+                     "pi_implied_qi": 0.0}
+        # Injection mode (or unknown strategy): give a neutral 0.65 so they
+        # appear in the recommended list but rank below well-matched producers.
+        return {"score": 0.65, "badges": [f"injector ({tmpl_fluid})"],
+                 "reason": "Injector archetype — match against the reservoir's "
+                           "injection strategy (water/gas).",
+                 "pi_implied_qi": 0.0}
+
     if reservoir_dict:
         res_fluid_system = reservoir_dict.get("fluid_system", "Oil with associated gas")
         # Map fluid_system to dominant primary phase
@@ -1146,56 +1167,56 @@ def well_template_reservoir_fit(template: dict, reservoir_dict: dict | None) -> 
             res_primary = "gas"
         else:
             res_primary = "oil"
-        # Producers must match fluid; injectors get a separate badge
-        if tmpl_kind == "producer":
-            if tmpl_fluid != res_primary:
-                score *= 0.20
-                badges.append("⚠ fluid mismatch")
-                reasons.append(f"Archetype is for {tmpl_fluid}, reservoir produces {res_primary}.")
-            else:
-                badges.append("✓ fluid match")
+        if tmpl_fluid != res_primary:
+            score *= 0.15
+            badges.append("⚠ fluid mismatch")
+            reasons.append(f"Archetype is for {tmpl_fluid}, reservoir produces {res_primary}.")
         else:
-            # Injectors: just label them, don't penalize match
-            badges.append(f"injector ({tmpl_fluid})")
+            badges.append("✓ fluid match")
 
         # PI × ΔP envelope check (producers only)
-        if template.get("kind") == "producer":
-            pi = float(reservoir_dict.get("well_pi", 0) or 0)
-            p_init = float(reservoir_dict.get("p_init", 0) or 0)
-            min_bhp = float(reservoir_dict.get("min_bhp", 1500.0) or 1500.0)
-            implied_qi = pi * max(p_init - min_bhp, 0.0)
-            tmpl_qi = float(template.get("qi_primary", 0))
-            if implied_qi > 0 and tmpl_qi > 0:
-                ratio = tmpl_qi / implied_qi
-                if 0.5 <= ratio <= 2.0:
-                    badges.append("✓ qi in range")
-                elif 0.25 <= ratio <= 4.0:
-                    score *= 0.7
-                    badges.append(f"≈ qi {ratio:.1f}× implied")
-                    reasons.append(
-                        f"Archetype qi {tmpl_qi:,.0f} is {ratio:.1f}× the "
-                        f"reservoir-implied qi ({implied_qi:,.0f} = "
-                        f"PI {pi:.2f} × ΔP {p_init - min_bhp:,.0f}).")
-                else:
-                    score *= 0.3
-                    badges.append(f"⚠ qi {ratio:.1f}× off")
-                    reasons.append(
-                        f"Archetype qi {tmpl_qi:,.0f} is {ratio:.1f}× the "
-                        f"reservoir-implied qi ({implied_qi:,.0f}); likely "
-                        "wrong reservoir class for this archetype.")
-            return {"score": score, "badges": badges,
-                     "reason": "; ".join(reasons) if reasons else "Good fit.",
-                     "pi_implied_qi": implied_qi}
+        pi = float(reservoir_dict.get("well_pi", 0) or 0)
+        p_init = float(reservoir_dict.get("p_init", 0) or 0)
+        min_bhp = float(reservoir_dict.get("min_bhp", 1500.0) or 1500.0)
+        implied_qi = pi * max(p_init - min_bhp, 0.0)
+        tmpl_qi = float(template.get("qi_primary", 0))
+        if implied_qi > 0 and tmpl_qi > 0:
+            ratio = tmpl_qi / implied_qi
+            # Widened windows for a more permissive screening recommendation.
+            # Real archetypes within one fluid class can legitimately span an
+            # order of magnitude (tight gas vs. unconventional shale, light-oil
+            # onshore vs. offshore high-rate), so be generous.
+            if 0.33 <= ratio <= 3.0:
+                badges.append(f"✓ qi {ratio:.1f}× implied")
+            elif 0.10 <= ratio <= 10.0:
+                score *= 0.6
+                badges.append(f"≈ qi {ratio:.1f}× implied")
+                reasons.append(
+                    f"Archetype qi {tmpl_qi:,.0f} is {ratio:.1f}× the "
+                    f"reservoir-implied qi ({implied_qi:,.0f} = "
+                    f"PI {pi:.2f} × ΔP {p_init - min_bhp:,.0f}).")
+            else:
+                score *= 0.25
+                badges.append(f"⚠ qi {ratio:.1f}× off")
+                reasons.append(
+                    f"Archetype qi {tmpl_qi:,.0f} is {ratio:.1f}× the "
+                    f"reservoir-implied qi ({implied_qi:,.0f}); likely "
+                    "wrong reservoir class for this archetype.")
+        return {"score": score, "badges": badges,
+                 "reason": "; ".join(reasons) if reasons else "Good fit.",
+                 "pi_implied_qi": implied_qi}
     return {"score": score, "badges": badges,
              "reason": "; ".join(reasons) if reasons else "Good fit.",
              "pi_implied_qi": 0.0}
 
 
 def list_well_types_for_reservoir(reservoir_dict: dict | None,
-                                    min_score: float = 0.5) -> list[str]:
+                                    min_score: float = 0.5,
+                                    strategy: str | None = None) -> list[str]:
     """Return well-archetype names ranked by reservoir fit, optionally filtered
-    to those scoring ≥ min_score. Pass None to skip filtering and return all
-    archetypes by their default ordering.
+    to those scoring ≥ min_score. Pass None for reservoir_dict to skip
+    filtering and return all archetypes by their default ordering. Strategy
+    context ('Depletion' / 'Injection') further downranks irrelevant types.
     """
     if reservoir_dict is None:
         return list_well_types()
@@ -1204,10 +1225,9 @@ def list_well_types_for_reservoir(reservoir_dict: dict | None,
         tmpl = get_well_type(name)
         if tmpl is None:
             continue
-        fit = well_template_reservoir_fit(tmpl, reservoir_dict)
+        fit = well_template_reservoir_fit(tmpl, reservoir_dict, strategy=strategy)
         if fit["score"] >= min_score:
             scored.append((name, fit["score"]))
-    # Stable sort by descending score
     scored.sort(key=lambda x: -x[1])
     return [n for n, _ in scored]
 
