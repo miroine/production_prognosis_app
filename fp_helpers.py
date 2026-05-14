@@ -288,6 +288,86 @@ def breakeven_price(df, is_oil, econ_inputs, wells, base_oil_price: float,
     }
 
 
+def minimum_economical_volume(df, is_oil, econ_inputs, wells,
+                               compute_economics_fn, target_npv: float = 0.0,
+                               tol: float = 1e5, max_iter: int = 60):
+    """Bisection on a *production multiplier* applied to all rate columns.
+
+    Finds the smallest fraction of the base production profile at which the
+    project still meets the target NPV (default 0). This is the "minimum
+    economical volume" — below this scaled profile, the project is
+    value-destructive at the current price/cost assumptions.
+
+    Returns a dict with:
+      'multiplier'        : production scaling at NPV = target (0..base_mult_hi)
+      'cum_primary_base'  : base-case cumulative primary volume
+      'cum_primary_min'   : minimum economical cumulative primary volume
+      'fraction_of_base'  : multiplier expressed as a %
+      'note'              : human-readable interpretation
+    Returns multiplier=None when even the full profile can't reach target.
+    """
+    # The production columns that scale together
+    rate_cols = ["primary_rate", "secondary_rate", "oil_rate", "gas_rate",
+                 "water_rate", "gross_gas_rate", "gas_export_rate",
+                 "gas_fuel_rate", "gas_flare_rate", "gas_inject_rate"]
+    present = [c for c in rate_cols if c in df.columns]
+
+    cum_primary_base = float((df["primary_rate"] * df.get("days_in_month", 30.4)).sum()) \
+        if "primary_rate" in df.columns else 0.0
+
+    def npv_at(mult: float) -> float:
+        scaled = df.copy()
+        for c in present:
+            scaled[c] = scaled[c] * mult
+        # cum columns must be recomputed downstream by compute_economics; if it
+        # relies on cumulatives in df, scale those too
+        for c in ["cum_primary", "cum_secondary", "cum_oil", "cum_gas", "cum_water"]:
+            if c in scaled.columns:
+                scaled[c] = scaled[c] * mult
+        df_e = compute_economics_fn(scaled, is_oil, econ_inputs, wells)
+        return float(df_e["npv"].iloc[-1])
+
+    npv_full = npv_at(1.0)
+    npv_zero = npv_at(0.0)   # no production: pure cost → must be negative
+
+    if npv_full <= target_npv:
+        return {"multiplier": None, "cum_primary_base": cum_primary_base,
+                "cum_primary_min": None, "fraction_of_base": None,
+                "npv_full": npv_full,
+                "note": ("Even the full base production profile does not reach "
+                         "the target NPV — the project is uneconomical at "
+                         "current price/cost assumptions regardless of volume.")}
+    if npv_zero >= target_npv:
+        return {"multiplier": 0.0, "cum_primary_base": cum_primary_base,
+                "cum_primary_min": 0.0, "fraction_of_base": 0.0,
+                "npv_full": npv_full,
+                "note": "Project meets target NPV even at zero production "
+                        "(costs alone are not value-destructive — unusual; "
+                        "check inputs)."}
+
+    lo, hi = 0.0, 1.0
+    for _ in range(max_iter):
+        mid = 0.5 * (lo + hi)
+        npv_mid = npv_at(mid)
+        if abs(npv_mid - target_npv) < tol:
+            break
+        if npv_mid < target_npv:
+            lo = mid
+        else:
+            hi = mid
+    mult = 0.5 * (lo + hi)
+    return {
+        "multiplier": mult,
+        "cum_primary_base": cum_primary_base,
+        "cum_primary_min": cum_primary_base * mult,
+        "fraction_of_base": mult * 100.0,
+        "npv_full": npv_full,
+        "note": (f"At {mult*100:.1f}% of the base production profile the "
+                 f"project's NPV equals the target. Below this volume the "
+                 f"project is value-destructive at current assumptions."),
+    }
+
+
 # =============================================================================
 # PDF report
 # =============================================================================

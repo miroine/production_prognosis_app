@@ -344,26 +344,53 @@ class CapacitySchedule:
     def at_date(self, d):
         """Single-date lookup (kept for backward compat; prefer to_arrays in hot loops)."""
         ts = pd.Timestamp(d)
-        col = pd.to_datetime(self.df["start_date"])
-        sub = self.df[col <= ts]
-        row = self.df.iloc[0] if len(sub) == 0 else sub.iloc[-1]
-        return {k: float(row[k]) for k in
-                ["oil", "gas", "water", "liquid", "water_inj", "gas_inj"]}
+        clean = self._clean_df()
+        if len(clean) == 0:
+            return {k: 0.0 for k in
+                    ["oil", "gas", "water", "liquid", "water_inj", "gas_inj", "prod_eff"]}
+        col = pd.to_datetime(clean["start_date"])
+        sub = clean[col <= ts]
+        row = clean.iloc[0] if len(sub) == 0 else sub.iloc[-1]
+        return {k: float(row.get(k, 0.0) or 0.0) for k in
+                ["oil", "gas", "water", "liquid", "water_inj", "gas_inj", "prod_eff"]}
+
+    def _clean_df(self) -> pd.DataFrame:
+        """Drop rows with no valid start_date; coerce numerics; ensure all expected
+        columns exist (filled with 0). Tolerates user-entered empty rows."""
+        df = self.df.copy() if self.df is not None else pd.DataFrame()
+        if "start_date" not in df.columns:
+            return pd.DataFrame(columns=["start_date", "oil", "gas", "water",
+                                          "liquid", "water_inj", "gas_inj", "prod_eff"])
+        df["start_date"] = pd.to_datetime(df["start_date"], errors="coerce")
+        df = df.dropna(subset=["start_date"])
+        # Ensure all expected numeric columns exist
+        for k, default in [("oil", 0.0), ("gas", 0.0), ("water", 0.0),
+                            ("liquid", 0.0), ("water_inj", 0.0), ("gas_inj", 0.0),
+                            ("prod_eff", 0.95)]:
+            if k not in df.columns:
+                df[k] = default
+            df[k] = pd.to_numeric(df[k], errors="coerce").fillna(default)
+        return df.reset_index(drop=True)
 
     def to_arrays(self, dates) -> dict:
         """Vectorized lookup: returns {key: np.ndarray of length len(dates)}.
 
         For each timestamp, picks the most recent row with start_date <= ts;
         before the first row, the first row is used (as in `at_date`).
+        Tolerates user-edited tables with empty / partial rows.
         """
         n = len(dates)
-        keys = ["oil", "gas", "water", "liquid", "water_inj", "gas_inj"]
-        ordered = self.df.assign(
-            _ts=pd.to_datetime(self.df["start_date"])
+        keys = ["oil", "gas", "water", "liquid", "water_inj", "gas_inj", "prod_eff"]
+        clean = self._clean_df()
+        if len(clean) == 0:
+            # No usable rows → return safe defaults (no choking, default PE)
+            return {k: np.zeros(n) if k != "prod_eff" else np.full(n, 0.95)
+                    for k in keys}
+        ordered = clean.assign(
+            _ts=pd.to_datetime(clean["start_date"])
         ).sort_values("_ts").reset_index(drop=True)
         ts_arr = ordered["_ts"].values
         date_ts = pd.DatetimeIndex(dates).values
-        # idx[i] = number of schedule rows with ts <= date_ts[i] - 1 (clamped to ≥ 0)
         idx = np.searchsorted(ts_arr, date_ts, side="right") - 1
         idx = np.clip(idx, 0, len(ordered) - 1)
         out = {}
@@ -453,6 +480,9 @@ class EconInputs:
     ngl_opex_bbl: float = 5.0                # processing + transport tariff
     ngl_shrinkage_pct: float = 0.0           # fraction of gas volume lost at extraction
                                               # (0 = ignore shrinkage; typical 2-5%)
+    # Rig metadata (move-in/out + maintenance) — keyed by rig name. Populated
+    # from the rigs table; used to cost mob/demob/maintenance days.
+    rig_meta: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -966,17 +996,31 @@ def run_simulation(wells, asm: FieldAssumptions):
     p_mat *= aban; s_mat *= aban; w_mat *= aban
     oil_mat *= aban; gas_mat *= aban
 
-    # Apply field-level production efficiency (operational uptime)
-    pe = asm.production_efficiency
-    p_mat *= pe; s_mat *= pe; w_mat *= pe
-    oil_mat *= pe; gas_mat *= pe
+    # Pull capacity (and time-varying PE) from the schedule
+    cap = asm.cap_schedule.to_arrays(dates)                  # dict of np.ndarray
+
+    # Production efficiency: prefer the schedule's per-row PE (time-varying)
+    # when present; fall back to the constant asm.production_efficiency for
+    # legacy cases. Treat zero / negative PE as the constant fallback (avoid
+    # accidentally zeroing the whole forecast if user empties the column).
+    pe_array = cap.get("prod_eff", None)
+    if pe_array is None or (np.asarray(pe_array) <= 0).all():
+        pe_array = np.full(n_months, float(asm.production_efficiency))
+    else:
+        pe_array = np.where(pe_array > 0, pe_array, asm.production_efficiency)
+        pe_array = np.clip(pe_array.astype(float), 0.0, 1.0)
+    # Per-timestep PE (broadcast over wells)
+    p_mat *= pe_array[:, None]
+    s_mat *= pe_array[:, None]
+    w_mat *= pe_array[:, None]
+    oil_mat *= pe_array[:, None]
+    gas_mat *= pe_array[:, None]
 
     field_p = p_mat.sum(axis=1); field_s = s_mat.sum(axis=1)
     field_w = w_mat.sum(axis=1); field_l = field_p + field_w
     field_inj = inj_mat.sum(axis=1)
 
     # Vectorized choke: compute capacity arrays once, evaluate all timesteps in NumPy.
-    cap = asm.cap_schedule.to_arrays(dates)                  # dict of np.ndarray
     EPS = 1e-12
     # Helper: factor = cap / rate where cap > 0 AND rate > cap, else 1.0
     def _bind_factor(rate, capacity):
@@ -1438,14 +1482,62 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         })
 
     capex_fac = np.zeros(len(df))
+    prod_start_ts = pd.Timestamp(df["date"].iloc[0])
     for _, row in econ.facility_capex.df.iterrows():
         try:
             ts = pd.Timestamp(row["date"])
+            # Pre-production CAPEX is handled by the pre-FOP prepend step at the
+            # end of this function — skip it here to avoid double-counting.
+            if ts < prod_start_ts:
+                continue
             idx_arr = df.index[df["date"] >= ts]
             if len(idx_arr) > 0:
                 capex_fac[idx_arr[0]] += float(row["amount_MMUSD"]) * 1e6
         except (KeyError, TypeError, ValueError):
             pass
+
+    # ---- Rig mobilization / demobilization / maintenance costs ----
+    # Pulled from rig metadata (set by well_section). Move-in is booked at the
+    # rig's first well spud; move-out at the last well's end; maintenance is
+    # spread across the rig's active months. All use the rig day rate.
+    rig_meta = getattr(econ, "rig_meta", None) or {}
+    if rig_meta:
+        # Group wells by rig to find first-spud and last-end per rig
+        from collections import defaultdict
+        rig_wells = defaultdict(list)
+        for w in wells:
+            rig_wells[w.rig].append(w)
+        for rname, rws in rig_wells.items():
+            meta = rig_meta.get(rname, {})
+            day_rate = float(meta.get("day_rate_kUSD", 0.0)) * 1000.0  # kUSD → USD
+            if day_rate <= 0:
+                continue
+            mi_days = int(meta.get("move_in_days", 0))
+            mo_days = int(meta.get("move_out_days", 0))
+            maint_per_yr = int(meta.get("maintenance_days_per_year", 0))
+            first_spud = min(pd.Timestamp(w.spud_date) for w in rws)
+            last_end = max(pd.Timestamp(w.spud_date) +
+                           pd.Timedelta(days=w.drill_days + w.completion_days)
+                           for w in rws)
+            # Move-in cost — booked the month of (or before) first spud
+            if mi_days > 0:
+                idx_arr = df.index[df["date"] >= first_spud - pd.Timedelta(days=mi_days)]
+                if len(idx_arr) > 0:
+                    capex_fac[idx_arr[0]] += mi_days * day_rate
+            # Move-out cost — booked at last well end
+            if mo_days > 0:
+                idx_arr = df.index[df["date"] >= last_end]
+                book_idx = idx_arr[0] if len(idx_arr) > 0 else (len(df) - 1)
+                capex_fac[int(book_idx)] += mo_days * day_rate
+            # Maintenance cost — spread across the rig's active months
+            if maint_per_yr > 0:
+                active_mask = (df["date"] >= first_spud) & (df["date"] <= last_end)
+                n_active = int(active_mask.sum())
+                if n_active > 0:
+                    active_yrs = n_active / 12.0
+                    total_maint_days = maint_per_yr * active_yrs
+                    maint_cost_per_month = (total_maint_days * day_rate) / n_active
+                    capex_fac[active_mask.values] += maint_cost_per_month
 
     aban_cost = np.zeros(len(df))
     if (df["primary_rate"] > 0).any():
@@ -1581,6 +1673,66 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     disc = (1 + r_m) ** np.arange(len(df_e))
     df_e["discounted_cf"] = df_e["cashflow"].values / disc
     df_e["npv"] = df_e["discounted_cf"].cumsum()
+
+    # ---- Pre-production investment months ----
+    # Facility CAPEX (and rig move-in) can be dated *before* production start.
+    # The engine's df starts at production start, so any earlier spend would
+    # otherwise be collapsed into month 0. Here we prepend zero-production
+    # months back to the earliest investment date so the economics plots show
+    # the true investment timeline (CAPEX before first oil).
+    try:
+        prod_start = pd.Timestamp(df_e["date"].iloc[0])
+        invest_dates = []
+        for _, row in econ.facility_capex.df.iterrows():
+            try:
+                invest_dates.append(pd.Timestamp(row["date"]))
+            except (KeyError, TypeError, ValueError):
+                pass
+        # Rig move-in dates
+        rig_meta = getattr(econ, "rig_meta", None) or {}
+        # (rig move-in is already booked relative to first spud, which is ≥
+        #  production start in nearly all cases, so facility CAPEX dominates here)
+        earliest_invest = min(invest_dates) if invest_dates else prod_start
+        if earliest_invest < prod_start:
+            # Build the pre-FOP month index
+            pre_dates = pd.date_range(earliest_invest, prod_start, freq="MS",
+                                       inclusive="left")
+            if len(pre_dates) > 0:
+                pre = pd.DataFrame({"date": pre_dates})
+                # All production / revenue columns are zero pre-FOP
+                for c in df_e.columns:
+                    if c == "date":
+                        continue
+                    pre[c] = 0.0
+                # Book the pre-FOP facility CAPEX into the right months
+                for _, row in econ.facility_capex.df.iterrows():
+                    try:
+                        ts = pd.Timestamp(row["date"])
+                        if ts < prod_start:
+                            # Find the pre-month bucket
+                            hit = pre.index[pre["date"] >= ts]
+                            bucket = hit[0] if len(hit) > 0 else 0
+                            pre.loc[bucket, "capex_facility"] += \
+                                float(row["amount_MMUSD"]) * 1e6
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                # Pre-FOP cashflow = -capex_facility (no revenue, no opex)
+                if "capex_facility" in pre.columns:
+                    pre["cashflow"] = -pre["capex_facility"]
+                # Recompute discounted CF / NPV across the full (pre + main) span
+                df_e = pd.concat([pre, df_e], ignore_index=True)
+                # Re-discount from the new t=0 (earliest investment)
+                disc_full = (1 + r_m) ** np.arange(len(df_e))
+                df_e["discounted_cf"] = df_e["cashflow"].values / disc_full
+                df_e["npv"] = df_e["discounted_cf"].cumsum()
+                df_e["cum_cashflow"] = df_e["cashflow"].cumsum()
+                # Restore year column for the annual groupby in plot_economics
+                df_e["year"] = pd.to_datetime(df_e["date"]).dt.year
+                df_e.attrs["pre_fop_months"] = len(pre_dates)
+    except Exception:
+        # If anything goes wrong, fall back to the un-padded df_e
+        pass
+
     # Stash the per-well cost breakdown on the DataFrame so the UI can show it
     df_e.attrs["well_cost_breakdown"] = well_cost_breakdown
     df_e.attrs["well_cost_mode"] = "rig_rate" if use_rig_rate else "fixed"
@@ -2870,18 +3022,63 @@ def well_section(units, fluid, start_date):
         st.session_state.rigs_df = pd.DataFrame({
             "rig": ["Rig-A"],
             "start_date": [start_date],
+            "move_in_days": [30],
+            "move_out_days": [15],
+            "maintenance_days_per_year": [10],
+            "day_rate_kUSD": [350.0],
         })
-    rigs_df = st.data_editor(
+    # Backfill new columns on saved sessions
+    _rdf = st.session_state.rigs_df
+    for col, default in [("move_in_days", 30), ("move_out_days", 15),
+                          ("maintenance_days_per_year", 10),
+                          ("day_rate_kUSD", 350.0)]:
+        if col not in _rdf.columns:
+            _rdf[col] = default
+    st.session_state.rigs_df = _rdf
+
+    rigs_buf = st.data_editor(
         st.session_state.rigs_df, num_rows="dynamic", use_container_width=True,
         column_config={
             "rig": st.column_config.TextColumn("Rig name", required=True,
                 help="Unique rig identifier referenced by wells below."),
             "start_date": st.column_config.DateColumn("Available from", required=True,
                 help="The earliest date this rig can spud its first well."),
+            "move_in_days": st.column_config.NumberColumn(
+                "Move-in (days)", min_value=0, step=1,
+                help="Rig mobilization time before the FIRST well on this rig "
+                     "can spud. Pushes the whole rig's drilling program forward. "
+                     "Adds dayrate cost to facility CAPEX."),
+            "move_out_days": st.column_config.NumberColumn(
+                "Move-out (days)", min_value=0, step=1,
+                help="Rig demobilization time after the LAST well. Adds dayrate "
+                     "cost to facility CAPEX (no production impact)."),
+            "maintenance_days_per_year": st.column_config.NumberColumn(
+                "Maint. (days/yr)", min_value=0, max_value=120, step=1,
+                help="Planned rig maintenance / downtime per year. Inserted as "
+                     "gaps between wells, proportionally delaying spud dates of "
+                     "later wells on this rig."),
+            "day_rate_kUSD": st.column_config.NumberColumn(
+                "Day rate ($k/d)", min_value=0.0, step=10.0, format="%.0f",
+                help="Rig day rate — used to cost move-in/out and maintenance "
+                     "days, and (when 'Rig-rate' well-cost mode is on) the "
+                     "drilling + completion days of each well."),
         },
-        key="rigs_editor", on_change=mark_stale,
+        key="rigs_editor",
     )
-    st.session_state.rigs_df = rigs_df
+    br1, br2, _br3 = st.columns([1, 1, 4])
+    if br1.button("✓ Apply rig edits", key="rigs_apply", type="primary"):
+        commit = rigs_buf.copy()
+        if "rig" in commit.columns:
+            commit = commit[commit["rig"].notna() & (commit["rig"].astype(str).str.strip() != "")]
+            commit = commit.reset_index(drop=True)
+        st.session_state.rigs_df = commit
+        mark_stale()
+        st.rerun()
+    if br2.button("📋 Duplicate last rig", key="rigs_dup"):
+        st.session_state.rigs_df = _duplicate_last_row(st.session_state.rigs_df)
+        mark_stale()
+        st.rerun()
+    rigs_df = st.session_state.rigs_df
     rig_names = rigs_df["rig"].tolist() if len(rigs_df) > 0 else ["Rig-A"]
 
     qi_p_default = from_field(2500.0 if is_oil else 25_000.0,
@@ -2939,8 +3136,22 @@ def well_section(units, fluid, start_date):
             pdf["friction_psi_per_kbpd"] = 5.0
         st.session_state.producers_df = pdf
 
-    producers_df = st.data_editor(
-        st.session_state.producers_df, num_rows="dynamic", use_container_width=True,
+    # ---- Display→storage conversion for unit-bearing IPR columns ----
+    # Storage keeps the field-unit values (which is what the engine expects);
+    # the editor BUFFER displays in user units. On Apply we convert back.
+    is_metric = (units == "metric")
+    pdf_storage = st.session_state.producers_df
+    pdf_display = pdf_storage.copy()
+    if is_metric:
+        if "wellhead_pressure_psi" in pdf_display.columns:
+            pdf_display["wellhead_pressure_psi"] = pdf_display["wellhead_pressure_psi"].apply(
+                lambda v: from_field(float(v or 0.0), "pressure", units))
+        if "tubing_depth_ft" in pdf_display.columns:
+            pdf_display["tubing_depth_ft"] = pdf_display["tubing_depth_ft"].apply(
+                lambda v: from_field(float(v or 0.0), "depth", units))
+
+    producers_df_buf = st.data_editor(
+        pdf_display, num_rows="dynamic", use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Well", required=True),
             "rig": st.column_config.SelectboxColumn("Rig", options=rig_names, required=True),
@@ -2955,7 +3166,7 @@ def well_section(units, fluid, start_date):
                 min_value=0.0,
                 help="Initial primary-fluid rate at start of decline. "
                      "When 'PI mode' is enabled for this well, this value is "
-                     "ignored and qi is recomputed from PI × (P_res − BHP_min)."),
+                     "ignored and qi is recomputed from PI × (P_init − BHP_min)."),
             "qi_secondary": st.column_config.NumberColumn(
                 f"qi {'gas' if is_oil else 'cond'} ({ulabel('gas_rate' if is_oil else 'oil_rate', units)})",
                 min_value=0.0),
@@ -3004,35 +3215,62 @@ def well_section(units, fluid, start_date):
                 help="When ON, the engine computes the well's actual rate at every "
                      "timestep from the IPR (Vogel for oil, back-pressure for gas) "
                      "intersected with a simple outflow curve (hydrostatic + friction). "
-                     "Wells go off plateau when reservoir pressure drops. Surface "
-                     "capacity choke is still applied separately. When OFF, decline "
-                     "alone determines the rate."),
+                     "Wells go off plateau when reservoir pressure drops."),
             "wellhead_pressure_psi": st.column_config.NumberColumn(
-                "P_wh [psi]" if units == "field" else "P_wh [psi — field units]",
-                min_value=0.0, step=10.0, format="%.0f",
-                help=("Flowing wellhead pressure (separator / manifold), in **psi** "
-                      "regardless of unit system. Typical 100-500 psi onshore, "
-                      "200-1500 psi offshore. (1 bar ≈ 14.50 psi.)")),
+                f"P_wh ({ulabel('pressure', units)})",
+                min_value=0.0, step=10.0 if units == "field" else 1.0,
+                format="%.0f" if units == "field" else "%.1f",
+                help=("Flowing wellhead pressure (separator / manifold). "
+                      "Typical 100-500 psi onshore (7-35 bar), "
+                      "200-1500 psi offshore (14-100 bar).")),
             "tubing_depth_ft": st.column_config.NumberColumn(
-                "Depth [ft]" if units == "field" else "Depth [ft — field units]",
-                min_value=0.0, step=100.0, format="%.0f",
-                help=("Mid-perf depth in **feet**, regardless of unit system — "
-                      "sets the hydrostatic head for outflow. (1 m ≈ 3.281 ft.)")),
+                f"Depth ({ulabel('depth', units)})",
+                min_value=0.0, step=100.0 if units == "field" else 30.0,
+                format="%.0f",
+                help="Mid-perf depth — sets the hydrostatic head for outflow."),
             "fluid_gradient_psi_per_ft": st.column_config.NumberColumn(
-                "ρ [psi/ft]" if units == "field" else "ρ [psi/ft — field units]",
+                "ρ [psi/ft]",
                 min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                help=("Mixture hydrostatic gradient in psi/ft. Oil ~0.30-0.40, "
-                      "water ~0.43, gas ~0.05-0.15. For high-WC wells use 0.40-0.43.")),
+                help=("Mixture hydrostatic gradient in **psi/ft** (engineering "
+                      "convention, kept regardless of unit system). "
+                      "Oil ~0.30-0.40, water ~0.43, gas ~0.05-0.15. "
+                      "For high-WC wells use 0.40-0.43. "
+                      "1 psi/ft ≈ 22.62 kPa/m.")),
             "friction_psi_per_kbpd": st.column_config.NumberColumn(
-                "Friction [psi/kbpd]" if units == "field" else "Friction [psi per 1000 bbl/d]",
+                "Friction [psi/kbpd]",
                 min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
-                help=("Linear friction proxy (psi per 1000 bbl/d). Higher tubing "
-                      "ID and lower viscosity reduce this. Typical 2-10 for oil "
+                help=("Linear friction proxy (psi per 1000 bbl/d, kept in field "
+                      "convention regardless of unit system). Higher tubing ID "
+                      "and lower viscosity reduce this. Typical 2-10 for oil "
                       "wells, 5-20 for high-rate gas wells.")),
         },
-        key="producers_editor", on_change=mark_stale,
+        key="producers_editor",
     )
-    st.session_state.producers_df = producers_df
+
+    btn_p1, btn_p2, _btn_p3 = st.columns([1, 1, 4])
+    if btn_p1.button("✓ Apply producer edits", key="producers_apply", type="primary"):
+        commit = producers_df_buf.copy()
+        # Convert display→storage for IPR fields
+        if is_metric:
+            if "wellhead_pressure_psi" in commit.columns:
+                commit["wellhead_pressure_psi"] = commit["wellhead_pressure_psi"].apply(
+                    lambda v: to_field(float(v or 0.0), "pressure", units))
+            if "tubing_depth_ft" in commit.columns:
+                commit["tubing_depth_ft"] = commit["tubing_depth_ft"].apply(
+                    lambda v: to_field(float(v or 0.0), "depth", units))
+        # Drop rows missing required fields
+        if "name" in commit.columns:
+            commit = commit[commit["name"].notna() & (commit["name"].astype(str).str.strip() != "")]
+            commit = commit.reset_index(drop=True)
+        st.session_state.producers_df = commit
+        mark_stale()
+        st.rerun()
+    if btn_p2.button("📋 Duplicate last producer", key="producers_dup"):
+        st.session_state.producers_df = _duplicate_last_row(st.session_state.producers_df)
+        mark_stale()
+        st.rerun()
+
+    producers_df = st.session_state.producers_df
 
     # Injectors table — only shown for Injection strategy. In Depletion mode
     # we keep an empty injectors_df in session so downstream code still works.
@@ -3060,7 +3298,7 @@ def well_section(units, fluid, start_date):
                 df["scale_factor"] = 1.0
             st.session_state.injectors_df = df
 
-        injectors_df = st.data_editor(
+        injectors_buf = st.data_editor(
             st.session_state.injectors_df, num_rows="dynamic", use_container_width=True,
             column_config={
                 "name": st.column_config.TextColumn("Well", required=True),
@@ -3079,9 +3317,22 @@ def well_section(units, fluid, start_date):
                     "Uptime", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
                     help="Fraction of online time the injector actually injects."),
             },
-            key="injectors_editor", on_change=mark_stale,
+            key="injectors_editor",
         )
-        st.session_state.injectors_df = injectors_df
+        bi1, bi2, _bi3 = st.columns([1, 1, 4])
+        if bi1.button("✓ Apply injector edits", key="injectors_apply", type="primary"):
+            commit = injectors_buf.copy()
+            if "name" in commit.columns:
+                commit = commit[commit["name"].notna() & (commit["name"].astype(str).str.strip() != "")]
+                commit = commit.reset_index(drop=True)
+            st.session_state.injectors_df = commit
+            mark_stale()
+            st.rerun()
+        if bi2.button("📋 Duplicate last injector", key="injectors_dup"):
+            st.session_state.injectors_df = _duplicate_last_row(st.session_state.injectors_df)
+            mark_stale()
+            st.rerun()
+        injectors_df = st.session_state.injectors_df
     else:
         # Depletion mode: empty injectors so add_well() finds nothing to add.
         # Preserve any existing injectors_df in session (in case user toggles
@@ -3110,11 +3361,6 @@ def well_section(units, fluid, start_date):
                     except Exception as e:
                         st.error(f"{wname}: {e}")
 
-    rig_starts = {r["rig"]: r["start_date"] for _, r in rigs_df.iterrows()}
-    rig_cursor = {r: pd.Timestamp(rig_starts[r]).date() for r in rig_names}
-
-    wells = []
-
     def _f(v, default=0.0):
         """Safe float coercion for table cells (NaN/None/blank → default)."""
         try:
@@ -3134,6 +3380,30 @@ def well_section(units, fluid, start_date):
         except (TypeError, ValueError):
             return default
 
+    # Rig schedule: apply move-in (delays the rig's first well), and maintenance
+    # (inserted as gaps between wells). Move-out is costed but doesn't affect
+    # production timing.
+    rig_meta = {}
+    for _, r in rigs_df.iterrows():
+        rname = r["rig"]
+        rig_meta[rname] = {
+            "move_in_days": _i(r.get("move_in_days"), 0),
+            "move_out_days": _i(r.get("move_out_days"), 0),
+            "maintenance_days_per_year": _i(r.get("maintenance_days_per_year"), 0),
+            "day_rate_kUSD": _f(r.get("day_rate_kUSD"), 0.0),
+        }
+    rig_starts = {r["rig"]: r["start_date"] for _, r in rigs_df.iterrows()}
+    # First-well cursor = rig available date + move-in days
+    rig_cursor = {}
+    for r in rig_names:
+        base = pd.Timestamp(rig_starts[r]).date()
+        mi = rig_meta.get(r, {}).get("move_in_days", 0)
+        rig_cursor[r] = base + timedelta(days=mi)
+    # Track whether each rig has had its move-in applied (so we only do it once)
+    rig_first_well_done = {r: False for r in rig_names}
+
+    wells = []
+
     def add_well(row, is_producer):
         name = row.get("name")
         if not isinstance(name, str) or not name.strip():
@@ -3143,9 +3413,20 @@ def well_section(units, fluid, start_date):
             rig = rig_names[0] if rig_names else "Rig-A"
             if rig not in rig_cursor:
                 rig_cursor[rig] = start_date
+                rig_first_well_done[rig] = False
         spud = rig_cursor[rig]
         drill = max(1, _i(row.get("drill_days"), 45))
         compl = max(1, _i(row.get("completion_days"), 15))
+        # Maintenance: distribute the rig's annual maintenance over its wells,
+        # added as a gap *before* this well (except the very first well, which
+        # already had the move-in applied).
+        maint_per_yr = rig_meta.get(rig, {}).get("maintenance_days_per_year", 0)
+        if rig_first_well_done.get(rig, False) and maint_per_yr > 0:
+            # Pro-rate: maintenance days for the time this well's program spans
+            well_span_yrs = (drill + compl) / 365.0
+            maint_gap = int(round(maint_per_yr * well_span_yrs))
+            spud = spud + timedelta(days=maint_gap)
+        rig_first_well_done[rig] = True
         if is_producer:
             qi_p = to_field(_f(row.get("qi_primary"), 0.0),
                             "oil_rate" if is_oil else "gas_rate", units)
@@ -3196,6 +3477,8 @@ def well_section(units, fluid, start_date):
     for _, r in injectors_df.iterrows():
         add_well(r, False)
 
+    # Stash rig metadata so the economics layer can cost move-in/out/maintenance
+    st.session_state["_rig_meta"] = rig_meta
     return wells
 
 
@@ -3402,9 +3685,22 @@ def reservoir_section(units: str, sidebar_inputs: dict,
                 help="Minimum flowing bottom-hole pressure (well-level constraint). "
                      "Used by the PI bridge to compute drawdown."),
         },
-        key="reservoirs_editor", on_change=mark_stale,
+        key="reservoirs_editor",
     )
-    st.session_state.reservoirs_df = res_df
+    brs1, brs2, _brs3 = st.columns([1, 1, 4])
+    if brs1.button("✓ Apply reservoir edits", key="reservoirs_apply", type="primary"):
+        commit = res_df.copy()
+        if "id" in commit.columns:
+            commit = commit[commit["id"].notna() & (commit["id"].astype(str).str.strip() != "")]
+            commit = commit.reset_index(drop=True)
+        st.session_state.reservoirs_df = commit
+        mark_stale()
+        st.rerun()
+    if brs2.button("📋 Duplicate last reservoir", key="reservoirs_dup"):
+        st.session_state.reservoirs_df = _duplicate_last_row(st.session_state.reservoirs_df)
+        mark_stale()
+        st.rerun()
+    res_df = st.session_state.reservoirs_df
 
     # Build Reservoir objects
     reservoirs: list[Reservoir] = []
@@ -3487,9 +3783,23 @@ def reservoir_section(units: str, sidebar_inputs: dict,
                      "Values across all rows for one well should sum to 1.0; "
                      "the engine renormalizes if they don't."),
         },
-        key="well_reservoir_editor", on_change=mark_stale,
+        key="well_reservoir_editor",
     )
-    st.session_state.well_reservoir_df = alloc_df
+    bw1, bw2, _bw3 = st.columns([1, 1, 4])
+    if bw1.button("✓ Apply allocation edits", key="well_reservoir_apply", type="primary"):
+        commit = alloc_df.copy()
+        # Drop rows missing well or reservoir
+        if "well" in commit.columns and "reservoir" in commit.columns:
+            commit = commit[commit["well"].notna() & commit["reservoir"].notna()]
+            commit = commit.reset_index(drop=True)
+        st.session_state.well_reservoir_df = commit
+        mark_stale()
+        st.rerun()
+    if bw2.button("📋 Duplicate last allocation", key="well_reservoir_dup"):
+        st.session_state.well_reservoir_df = _duplicate_last_row(st.session_state.well_reservoir_df)
+        mark_stale()
+        st.rerun()
+    alloc_df = st.session_state.well_reservoir_df
 
     well_links: list[WellReservoirLink] = []
     for _, row in alloc_df.iterrows():
@@ -3541,6 +3851,11 @@ def capacity_section(units, start_date, strategy: str = "Injection"):
     columns are hidden — the engine still receives a CapacitySchedule with
     those columns set to 0 (effectively unlimited) so downstream logic
     works unchanged.
+
+    UX pattern: the user edits a *buffer* DataFrame; a single "Apply" button
+    commits the buffer to the canonical session_state. This avoids the
+    "have to enter values twice" problem caused by Streamlit's rerun
+    behavior on data_editor onchange callbacks.
     """
     is_injection = (strategy == "Injection")
     st.subheader("🛢️ Production capacities (time-varying)"
@@ -3552,6 +3867,8 @@ def capacity_section(units, start_date, strategy: str = "Injection"):
             "- A proportional choke is applied each month so the field honors the tightest active limit.",
             "- Set a value to 0 to disable that constraint.",
             "- `Gas` is in MMscf/d in field units (note the unit in the column header).",
+            "- The **PE** column lets you vary production efficiency over time (0–1).",
+            "- Add a row and click **✓ Apply** when done. Adding empty rows is safe.",
         ]
         if is_injection:
             notes.append("- `water_inj` and `gas_inj` cap the injection plant capacity.")
@@ -3565,7 +3882,12 @@ def capacity_section(units, start_date, strategy: str = "Injection"):
             "liquid":    [from_field(120000.0, "oil_rate", units)],
             "water_inj": [from_field(100000.0, "water_rate", units)],
             "gas_inj":   [0.0],
+            "prod_eff":  [0.95],
         })
+    # Backfill new prod_eff column on saved sessions
+    if "prod_eff" not in st.session_state.cap_df.columns:
+        st.session_state.cap_df["prod_eff"] = 0.95
+
     # Build the display-only DataFrame and column config, hiding injection
     # columns in Depletion mode.
     cap_display = st.session_state.cap_df.copy()
@@ -3583,6 +3905,11 @@ def capacity_section(units, start_date, strategy: str = "Injection"):
         "liquid": st.column_config.NumberColumn(
             f"Liquid ({ulabel('oil_rate', units)})", min_value=0.0,
             help="Total liquid (oil+water) handling capacity."),
+        "prod_eff": st.column_config.NumberColumn(
+            "PE", min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
+            help="Production efficiency (0..1) for this period. "
+                 "Vary over field life to model maintenance windows, "
+                 "facility upgrades, etc. 0.95 = typical mature ops."),
     }
     if is_injection:
         column_config["water_inj"] = st.column_config.NumberColumn(
@@ -3593,42 +3920,79 @@ def capacity_section(units, start_date, strategy: str = "Injection"):
             help="Gas injection plant capacity.")
         edit_df = cap_display
     else:
-        # Drop injection columns from the displayed editor; preserve them in
-        # session_state under the hood so toggling back to Injection restores
-        # the values.
         edit_df = cap_display.drop(columns=[c for c in ("water_inj", "gas_inj")
                                               if c in cap_display.columns],
                                     errors="ignore")
+    # Editable buffer — committed only via Apply button below
     cap_df_edited = st.data_editor(
         edit_df, num_rows="dynamic", use_container_width=True,
         column_config=column_config,
-        key="cap_editor", on_change=mark_stale,
+        key="cap_editor",
     )
-    # Merge edited columns back into the full cap_df so injection columns
-    # survive a strategy toggle.
-    full = st.session_state.cap_df.copy()
-    # The user may have added/removed rows; the edited frame is the source of truth
-    # for the visible columns. Inject 0 for the hidden columns.
-    for c in cap_df_edited.columns:
-        if c in full.columns:
-            pass
-    full = cap_df_edited.copy()
-    if "water_inj" not in full.columns:
-        full["water_inj"] = 0.0
-    if "gas_inj" not in full.columns:
-        full["gas_inj"] = 0.0
-    st.session_state.cap_df = full
-    cap_df = full
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 4])
+    if btn_col1.button("✓ Apply", key="cap_apply", type="primary"):
+        cleaned = _clean_table_buffer(cap_df_edited, st.session_state.cap_df,
+                                        date_cols=["start_date"])
+        if "water_inj" not in cleaned.columns:
+            cleaned["water_inj"] = 0.0
+        if "gas_inj" not in cleaned.columns:
+            cleaned["gas_inj"] = 0.0
+        if "prod_eff" not in cleaned.columns:
+            cleaned["prod_eff"] = 0.95
+        st.session_state.cap_df = cleaned
+        mark_stale()
+        st.rerun()
+    if btn_col2.button("📋 Duplicate last row", key="cap_dup"):
+        st.session_state.cap_df = _duplicate_last_row(st.session_state.cap_df)
+        mark_stale()
+        st.rerun()
+    cap_df = st.session_state.cap_df
 
+    # ---- Convert to engine field units ----
     cap_field = cap_df.copy()
     for col, kind in [("oil", "oil_rate"), ("water", "water_rate"),
                       ("liquid", "oil_rate"),
                       ("water_inj", "water_rate"), ("gas_inj", "gas_rate")]:
-        cap_field[col] = cap_field[col].apply(lambda v: to_field(float(v), kind, units))
+        if col in cap_field.columns:
+            cap_field[col] = cap_field[col].apply(lambda v: to_field(float(v or 0.0), kind, units))
     if units == "metric":
-        cap_field["gas"] = cap_field["gas"].apply(lambda v: to_field(v, "gas_rate", units) / 1000.0)
+        cap_field["gas"] = cap_field["gas"].apply(lambda v: to_field(float(v or 0.0), "gas_rate", units) / 1000.0)
     cap_field = cap_field.sort_values("start_date").reset_index(drop=True)
     return CapacitySchedule(df=cap_field)
+
+
+def _clean_table_buffer(edited_df: pd.DataFrame, fallback_df: pd.DataFrame,
+                         date_cols: list = None) -> pd.DataFrame:
+    """Sanitize a data_editor buffer before committing it to session_state.
+
+    - Drops rows where all date_cols are NaT (truly empty)
+    - Preserves the column dtype of the fallback (so int columns stay int, etc.)
+    - When the user inserts a blank row, returns the buffer with that row removed
+      rather than crashing downstream code that assumes valid dates/numbers.
+    """
+    if edited_df is None or len(edited_df) == 0:
+        return fallback_df.iloc[0:0].copy()
+    out = edited_df.copy()
+    if date_cols:
+        for c in date_cols:
+            if c in out.columns:
+                out[c] = pd.to_datetime(out[c], errors="coerce")
+        # Drop rows where ALL date cols are NaT
+        keep_mask = pd.Series(False, index=out.index)
+        for c in date_cols:
+            if c in out.columns:
+                keep_mask = keep_mask | out[c].notna()
+        out = out[keep_mask].reset_index(drop=True)
+    return out
+
+
+def _duplicate_last_row(df: pd.DataFrame) -> pd.DataFrame:
+    """Append a copy of the last row to a DataFrame. If the DataFrame is empty,
+    returns it unchanged."""
+    if df is None or len(df) == 0:
+        return df
+    out = pd.concat([df, df.iloc[[-1]]], ignore_index=True)
+    return out
 
 
 # =============================================================================
@@ -3858,6 +4222,144 @@ def economics_section(units, start_date):
         # royalty stays from earlier slider (it's PSC royalty too).
         # 'tax' from earlier becomes irrelevant; we use psc_psc_tax_rate.
 
+    st.markdown("**Facility CAPEX**")
+
+    # ---- CAPEX recipe builder ----
+    with st.expander("🏗️ CAPEX recipe builder — generate phased CAPEX from a development concept",
+                     expanded=False):
+        st.caption(
+            "Pick a development concept and enter component costs. Clicking "
+            "**Generate CAPEX schedule** overwrites the phased table below with "
+            "rows derived from your recipe. You can then fine-tune dates/amounts "
+            "directly in the table."
+        )
+        concept = st.radio(
+            "Development concept",
+            ["Subsea tie-in", "Standalone offshore (shallow water)",
+             "Standalone offshore (deep water)", "Standalone onshore"],
+            key="capex_concept",
+            help="Subsea tie-in: wells tied back to existing host facility. "
+                 "Standalone: dedicated production facility "
+                 "(platform/FPSO offshore, processing plant onshore).",
+        )
+        rc1, rc2, rc3 = st.columns(3)
+        recipe_rows = []
+        fop = start_date  # first facility spend anchor
+
+        if concept == "Subsea tie-in":
+            tmpl_cost = rc1.number_input("Subsea template / manifold ($MM)",
+                                          value=80.0, min_value=0.0, step=5.0,
+                                          key="cx_tie_template")
+            flowline_cost = rc2.number_input("Flowline + umbilical ($MM)",
+                                              value=120.0, min_value=0.0, step=5.0,
+                                              key="cx_tie_flowline",
+                                              help="Includes tie-in spool, riser, controls.")
+            install_cost = rc3.number_input("Installation + hookup ($MM)",
+                                             value=60.0, min_value=0.0, step=5.0,
+                                             key="cx_tie_install")
+            host_mod_cost = rc1.number_input("Host facility modifications ($MM)",
+                                              value=40.0, min_value=0.0, step=5.0,
+                                              key="cx_tie_hostmod",
+                                              help="Topsides tie-in, capacity upgrades on the host.")
+            cessation_cost = rc2.number_input("Cessation / P&A ($MM)",
+                                               value=30.0, min_value=0.0, step=5.0,
+                                               key="cx_tie_cessation",
+                                               help="Booked at end of field life.")
+            recipe_rows = [
+                (fop, tmpl_cost, "Subsea template / manifold"),
+                (fop, host_mod_cost, "Host facility modifications"),
+                (fop + timedelta(days=180), flowline_cost, "Flowline + umbilical"),
+                (fop + timedelta(days=300), install_cost, "Installation + hookup"),
+            ]
+        elif concept == "Standalone offshore (shallow water)":
+            jacket = rc1.number_input("Jacket + piles ($MM)", value=150.0,
+                                       min_value=0.0, step=10.0, key="cx_sh_jacket")
+            topsides = rc2.number_input("Topsides + processing ($MM)", value=400.0,
+                                         min_value=0.0, step=10.0, key="cx_sh_topsides")
+            subsea = rc3.number_input("Wells + subsea ($MM)", value=120.0,
+                                       min_value=0.0, step=10.0, key="cx_sh_subsea")
+            pipeline = rc1.number_input("Export pipeline ($MM)", value=180.0,
+                                         min_value=0.0, step=10.0, key="cx_sh_pipeline")
+            install = rc2.number_input("Installation + commissioning ($MM)", value=100.0,
+                                        min_value=0.0, step=10.0, key="cx_sh_install")
+            cessation = rc3.number_input("Cessation / P&A ($MM)", value=120.0,
+                                          min_value=0.0, step=10.0, key="cx_sh_cessation")
+            recipe_rows = [
+                (fop, jacket, "Jacket + piles"),
+                (fop + timedelta(days=180), topsides, "Topsides + processing"),
+                (fop + timedelta(days=360), subsea, "Wells + subsea"),
+                (fop + timedelta(days=360), pipeline, "Export pipeline"),
+                (fop + timedelta(days=540), install, "Installation + commissioning"),
+            ]
+        elif concept == "Standalone offshore (deep water)":
+            fpso = rc1.number_input("FPSO hull + topsides ($MM)", value=1200.0,
+                                     min_value=0.0, step=50.0, key="cx_dw_fpso")
+            subsea = rc2.number_input("Subsea production system ($MM)", value=600.0,
+                                       min_value=0.0, step=50.0, key="cx_dw_subsea",
+                                       help="Trees, manifolds, jumpers, controls.")
+            risers = rc3.number_input("Risers + flowlines + umbilicals ($MM)", value=450.0,
+                                       min_value=0.0, step=50.0, key="cx_dw_risers")
+            install = rc1.number_input("Installation (heavy-lift / pipelay) ($MM)", value=350.0,
+                                        min_value=0.0, step=50.0, key="cx_dw_install")
+            mooring = rc2.number_input("Mooring + station-keeping ($MM)", value=200.0,
+                                        min_value=0.0, step=25.0, key="cx_dw_mooring")
+            cessation = rc3.number_input("Cessation / P&A ($MM)", value=300.0,
+                                          min_value=0.0, step=25.0, key="cx_dw_cessation")
+            recipe_rows = [
+                (fop, fpso * 0.4, "FPSO — milestone 1 (order)"),
+                (fop + timedelta(days=365), fpso * 0.6, "FPSO — milestone 2 (delivery)"),
+                (fop + timedelta(days=180), subsea, "Subsea production system"),
+                (fop + timedelta(days=540), risers, "Risers + flowlines + umbilicals"),
+                (fop + timedelta(days=540), mooring, "Mooring + station-keeping"),
+                (fop + timedelta(days=700), install, "Installation"),
+            ]
+        else:  # Standalone onshore
+            wellpads = rc1.number_input("Well pads + access roads ($MM)", value=40.0,
+                                         min_value=0.0, step=5.0, key="cx_on_pads")
+            cpf = rc2.number_input("Central processing facility ($MM)", value=250.0,
+                                    min_value=0.0, step=10.0, key="cx_on_cpf")
+            pipelines = rc3.number_input("Gathering + export pipelines ($MM)", value=120.0,
+                                          min_value=0.0, step=10.0, key="cx_on_pipe")
+            utilities = rc1.number_input("Utilities + infrastructure ($MM)", value=60.0,
+                                          min_value=0.0, step=5.0, key="cx_on_util")
+            install = rc2.number_input("Construction + commissioning ($MM)", value=80.0,
+                                        min_value=0.0, step=5.0, key="cx_on_install")
+            cessation = rc3.number_input("Cessation / restoration ($MM)", value=50.0,
+                                          min_value=0.0, step=5.0, key="cx_on_cessation")
+            recipe_rows = [
+                (fop, wellpads, "Well pads + access roads"),
+                (fop + timedelta(days=120), cpf, "Central processing facility"),
+                (fop + timedelta(days=240), pipelines, "Gathering + export pipelines"),
+                (fop + timedelta(days=240), utilities, "Utilities + infrastructure"),
+                (fop + timedelta(days=400), install, "Construction + commissioning"),
+            ]
+        # Pull the cessation value out of whichever branch ran
+        _cessation_val = locals().get("cessation_cost",
+                                       locals().get("cessation", 0.0))
+        total_recipe = sum(r[1] for r in recipe_rows) + _cessation_val
+        st.caption(
+            f"**Total CAPEX (excl. cessation): ${sum(r[1] for r in recipe_rows):,.0f}MM**  •  "
+            f"Cessation: ${_cessation_val:,.0f}MM  •  "
+            f"**Grand total: ${total_recipe:,.0f}MM**. "
+            "Cessation is added at the end of the forecast horizon."
+        )
+        if st.button("⚙️ Generate CAPEX schedule", key="capex_recipe_gen",
+                      type="primary"):
+            # Cessation booked near end of forecast
+            horizon_yrs = st.session_state.get("horizon", 20)
+            cessation_date = start_date + timedelta(days=int(horizon_yrs * 365) - 30)
+            rows_out = [{"date": d, "amount_MMUSD": amt, "label": lbl}
+                        for (d, amt, lbl) in recipe_rows]
+            if _cessation_val > 0:
+                rows_out.append({"date": cessation_date,
+                                  "amount_MMUSD": _cessation_val,
+                                  "label": "Cessation / P&A"})
+            st.session_state.fac_df = pd.DataFrame(rows_out)
+            mark_stale()
+            st.success(f"Generated {len(rows_out)} CAPEX line(s) from the "
+                       f"'{concept}' recipe. Edit the table below to fine-tune.")
+            st.rerun()
+
     st.markdown("**Phased facility CAPEX**")
     if "fac_df" not in st.session_state:
         st.session_state.fac_df = pd.DataFrame({
@@ -3865,16 +4367,26 @@ def economics_section(units, start_date):
             "amount_MMUSD": [200.0, 150.0],
             "label":        ["FEED + topsides", "Subsea & hookup"],
         })
-    fac_df = st.data_editor(
+    fac_df_buf = st.data_editor(
         st.session_state.fac_df, num_rows="dynamic", use_container_width=True,
         column_config={
             "date": st.column_config.DateColumn("Spend date"),
             "amount_MMUSD": st.column_config.NumberColumn("Amount ($MM)", min_value=0.0),
             "label": st.column_config.TextColumn("Description"),
         },
-        key="fac_editor", on_change=mark_stale,
+        key="fac_editor",
     )
-    st.session_state.fac_df = fac_df
+    bf1, bf2, _bf3 = st.columns([1, 1, 4])
+    if bf1.button("✓ Apply CAPEX edits", key="fac_apply", type="primary"):
+        st.session_state.fac_df = _clean_table_buffer(
+            fac_df_buf, st.session_state.fac_df, date_cols=["date"])
+        mark_stale()
+        st.rerun()
+    if bf2.button("📋 Duplicate last CAPEX row", key="fac_dup"):
+        st.session_state.fac_df = _duplicate_last_row(st.session_state.fac_df)
+        mark_stale()
+        st.rerun()
+    fac_df = st.session_state.fac_df
 
     return EconInputs(
         oil_price=oil_price,        # already in $/bbl (engine-internal)
@@ -3902,6 +4414,7 @@ def economics_section(units, start_date):
         ngl_price_bbl=ngl_price,
         ngl_opex_bbl=ngl_opex,
         ngl_shrinkage_pct=ngl_shrink,
+        rig_meta=st.session_state.get("_rig_meta", {}),
     )
 
 
@@ -4238,6 +4751,58 @@ def plot_per_reservoir_rate(per_res_df, units, fluid):
     fig.update_layout(height=720, hovermode="x unified",
                       title="Per-reservoir production by phase",
                       legend=dict(orientation="v"))
+    return fh.apply_plot_template(fig)
+
+
+def plot_npv_waterfall(df_e, discount_rate: float):
+    """Waterfall chart: how gross revenue is whittled down to NPV through
+    royalty, tariffs, OPEX, CAPEX, tax, and abandonment — then discounted.
+
+    Shows two bars at the ends (Gross revenue → NPV) with the deductions as
+    floating intermediate steps. Uses undiscounted totals for the value-
+    construction steps, then a final explicit 'discounting' bridge to NPV.
+    """
+    rev      = df_e["revenue"].sum()
+    royalty  = df_e["royalty"].sum()
+    tariff   = df_e["tariff"].sum()
+    opex     = df_e["opex"].sum()
+    capex_w  = df_e["capex_well"].sum()
+    capex_f  = df_e["capex_facility"].sum()
+    tax      = df_e["tax"].sum()
+    aban     = df_e["abandonment"].sum()
+    undiscounted_cf = df_e["cashflow"].sum()
+    npv = df_e["npv"].iloc[-1] if "npv" in df_e.columns and len(df_e) else 0.0
+    discount_effect = npv - undiscounted_cf
+
+    labels = ["Gross revenue", "Royalty", "Tariffs", "OPEX",
+              "Well CAPEX", "Facility CAPEX", "Tax", "Abandonment",
+              "Undiscounted CF", f"Discounting @ {discount_rate:.0%}", "NPV"]
+    measures = ["absolute", "relative", "relative", "relative",
+                "relative", "relative", "relative", "relative",
+                "total", "relative", "total"]
+    values = [rev/1e6, -royalty/1e6, -tariff/1e6, -opex/1e6,
+              -capex_w/1e6, -capex_f/1e6, -tax/1e6, -aban/1e6,
+              0, discount_effect/1e6, 0]
+
+    fig = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=measures,
+        x=labels,
+        y=values,
+        textposition="outside",
+        text=[f"{v:,.0f}" if m == "relative" else "" for v, m in zip(values, measures)],
+        connector={"line": {"color": "rgb(160,160,160)"}},
+        decreasing={"marker": {"color": "#d62728"}},
+        increasing={"marker": {"color": "#2ca02c"}},
+        totals={"marker": {"color": "#1f77b4"}},
+    ))
+    fig.update_layout(
+        title="NPV value construction (waterfall, $MM)",
+        height=460, showlegend=False,
+        yaxis_title="$MM",
+        xaxis=dict(tickangle=-30),
+    )
+    fig.add_hline(y=0, line=dict(color="grey", dash="dot"))
     return fh.apply_plot_template(fig)
 
 
@@ -4831,6 +5396,57 @@ def main():
                   f"${(df_e['capex_well'].sum() + df_e['capex_facility'].sum())/1e6:,.0f}MM")
         e4.metric("Total tax", f"${df_e['tax'].sum()/1e6:,.0f}MM")
 
+        # NPV value-construction waterfall
+        st.plotly_chart(plot_npv_waterfall(df_e, econ_r.discount_rate),
+                        use_container_width=True)
+        st.caption(
+            "The waterfall shows how gross revenue is reduced step-by-step to "
+            "the undiscounted cashflow, then the discounting bridge to NPV. "
+            "Green = value added, red = value removed, blue = subtotals."
+        )
+
+        # Minimum economical volume
+        with st.expander("📉 Minimum economical volume (NPV = 0 threshold)",
+                         expanded=False):
+            st.caption(
+                "Finds the smallest fraction of the current production profile "
+                "at which the project still breaks even (NPV = 0) at the "
+                "current price and cost assumptions. Below this volume, the "
+                "project destroys value."
+            )
+            if st.button("Compute minimum economical volume",
+                          key="mev_compute"):
+                with st.spinner("Solving for NPV = 0 volume threshold…"):
+                    mev = fh.minimum_economical_volume(
+                        df, is_oil, econ_r, wells_r, compute_economics,
+                        target_npv=0.0)
+                if mev.get("multiplier") is None:
+                    st.error(mev["note"])
+                elif mev.get("multiplier") == 0.0:
+                    st.warning(mev["note"])
+                else:
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Min economical volume",
+                              f"{mev['fraction_of_base']:.1f}% of base")
+                    primary_label = ulabel("oil_vol" if is_oil else "gas_vol", units)
+                    cum_base_disp = from_field(
+                        mev["cum_primary_base"] / (1e6 if is_oil else 1e9),
+                        "oil_vol" if is_oil else "gas_vol", units)
+                    cum_min_disp = from_field(
+                        mev["cum_primary_min"] / (1e6 if is_oil else 1e9),
+                        "oil_vol" if is_oil else "gas_vol", units)
+                    m2.metric(f"Base cumulative ({primary_label})",
+                              f"{cum_base_disp:,.1f}")
+                    m3.metric(f"Min economical cum. ({primary_label})",
+                              f"{cum_min_disp:,.1f}",
+                              delta=f"-{(1-mev['multiplier'])*100:.0f}% headroom")
+                    st.info(mev["note"])
+                    st.caption(
+                        f"Interpretation: the project has "
+                        f"**{(1-mev['multiplier'])*100:.0f}% volume headroom** — "
+                        f"production could fall to {mev['fraction_of_base']:.0f}% "
+                        f"of forecast before NPV goes negative.")
+
         # Revenue breakdown by stream (oil / gas / condensate / NGL)
         with st.expander("💰 Revenue breakdown by stream", expanded=False):
             stream_rows = []
@@ -4993,7 +5609,8 @@ def main():
                         **{f"gc_{k}": v for k, v in asdict(asm_r.gas_cap).items()},
                     }])
                     _safe_to_excel(asm_dict, "Assumptions", wr)
-                    econ_dict = {k: v for k, v in asdict(econ_r).items() if k != "facility_capex"}
+                    econ_dict = {k: v for k, v in asdict(econ_r).items()
+                                  if k not in ("facility_capex", "rig_meta")}
                     _safe_to_excel(pd.DataFrame([econ_dict]), "Economics", wr)
                     # Facility CAPEX may be empty — only write when it has rows
                     fac_df_export = econ_r.facility_capex.df
@@ -5648,9 +6265,10 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
     except Exception:
         start_date = start_date_default
 
-    # Rebuild rigs cursor map
+    # Rebuild rigs cursor map (with move-in applied) + rig metadata
     rigs_data = tables.get("rigs_df", {})
     rig_cursor = {}
+    rig_meta = {}
     if rigs_data:
         for i in range(len(rigs_data.get("rig", []))):
             rig = rigs_data["rig"][i]
@@ -5660,7 +6278,25 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                     sd if isinstance(sd, date) else start_date)
             except Exception:
                 rd = start_date
-            rig_cursor[rig] = rd
+
+            def _rg(col, default):
+                arr = rigs_data.get(col)
+                if arr is None or i >= len(arr):
+                    return default
+                try:
+                    v = arr[i]
+                    return default if v is None else v
+                except Exception:
+                    return default
+
+            mi = int(float(_rg("move_in_days", 0)))
+            rig_meta[rig] = {
+                "move_in_days": mi,
+                "move_out_days": int(float(_rg("move_out_days", 0))),
+                "maintenance_days_per_year": int(float(_rg("maintenance_days_per_year", 0))),
+                "day_rate_kUSD": float(_rg("day_rate_kUSD", 0.0)),
+            }
+            rig_cursor[rig] = rd + timedelta(days=mi)
     if not rig_cursor:
         rig_cursor["Rig-A"] = start_date
 
@@ -5869,6 +6505,7 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "ngl_price_bbl": float(scalar.get("ngl_price", 25.0)),
         "ngl_opex_bbl": float(scalar.get("ngl_opex", 5.0)),
         "ngl_shrinkage_pct": float(scalar.get("ngl_shrink", 0.0)),
+        "rig_meta": rig_meta,
     }
     return wells, _reservoirs_from_payload(payload, units), meta, econ_dict
 
@@ -6516,6 +7153,128 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             "NPV. Bars near 0 are weak drivers; near ±1 are strong drivers."
         )
 
+    # ---- Reserves distribution (cum oil / cum gas / RF at end of life) ----
+    st.markdown("#### Reserves distribution")
+    st.caption(
+        "Probabilistic estimate of ultimate recovery (EUR) across all "
+        "realizations. P90 = optimistic (high reserves), P10 = pessimistic."
+    )
+    primary_metric = "cum_oil" if is_oil else "cum_gas"
+    primary_vol_kind = "oil_vol" if is_oil else "gas_vol"
+    res_metrics = [
+        (primary_metric, f"Cumulative {'oil' if is_oil else 'gas'} "
+                         f"({ulabel(primary_vol_kind, units)})", primary_vol_kind),
+        ("final_rf", "Final recovery factor", None),
+    ]
+    rcols = st.columns(len(res_metrics))
+    for (metric, label, vol_kind), rc in zip(res_metrics, rcols):
+        if metric not in summary.columns:
+            continue
+        vals = summary[metric].values.astype(float)
+        if vol_kind:
+            vals = np.array([from_field(v, vol_kind, units) for v in vals])
+        p10, p50, p90 = (np.percentile(vals, 10), np.percentile(vals, 50),
+                         np.percentile(vals, 90))
+        with rc:
+            fig_r = go.Figure()
+            fig_r.add_trace(go.Histogram(
+                x=vals, nbinsx=min(35, max(12, len(vals)//12)),
+                marker_color=C.get("spring", C["water"]), opacity=0.85,
+            ))
+            for pv, pl, pc in [(p10, "P10", C["water"]),
+                               (p50, "P50", C["rf"]),
+                               (p90, "P90", C["gas"])]:
+                fig_r.add_vline(x=pv, line=dict(color=pc, dash="dash"),
+                                annotation_text=pl, annotation_position="top")
+            fmt = ".1%" if metric == "final_rf" else ",.2f"
+            fig_r.update_layout(
+                title=label, height=300, bargap=0.05, showlegend=False,
+                xaxis_title=label, yaxis_title="Frequency",
+                xaxis=dict(tickformat=".0%" if metric == "final_rf" else None),
+            )
+            st.plotly_chart(fh.apply_plot_template(fig_r), use_container_width=True)
+            if metric == "final_rf":
+                st.caption(f"P10 {p10:.1%}  •  P50 {p50:.1%}  •  P90 {p90:.1%}")
+            else:
+                st.caption(f"P10 {p10:,.2f}  •  P50 {p50:,.2f}  •  P90 {p90:,.2f}  "
+                           f"{ulabel(vol_kind, units)}")
+
+    # ---- Input distribution snapshots (optional) ----
+    factor_cols_varied = [c for c in summary.columns
+                          if c.startswith("factor_")
+                          and float(np.std(summary[c].values)) > 1e-9]
+    if factor_cols_varied:
+        show_inputs = st.checkbox(
+            "📊 Show sampled input distributions",
+            value=False, key="mc_show_inputs",
+            help="Histograms of the actual sampled multipliers for each varied "
+                 "driver — confirms the sampling matched your intended "
+                 "distributions.")
+        if show_inputs:
+            st.caption(
+                "Each histogram shows the realized sample of the multiplier "
+                "applied to that driver. The spread here should match the "
+                "low/high bounds you configured above.")
+            n_per_row = 3
+            for i in range(0, len(factor_cols_varied), n_per_row):
+                batch = factor_cols_varied[i:i + n_per_row]
+                cols_in = st.columns(n_per_row)
+                for c, col_in in zip(batch, cols_in):
+                    vals = summary[c].values.astype(float)
+                    with col_in:
+                        fig_in = go.Figure()
+                        fig_in.add_trace(go.Histogram(
+                            x=vals, nbinsx=min(25, max(10, len(vals)//15)),
+                            marker_color=C.get("pressure", "#1f77b4"),
+                            opacity=0.8,
+                        ))
+                        fig_in.add_vline(x=float(np.mean(vals)),
+                                         line=dict(color=C["gas"], dash="dot"),
+                                         annotation_text=f"μ={np.mean(vals):.2f}")
+                        fig_in.update_layout(
+                            title=c.replace("factor_", ""),
+                            height=240, bargap=0.05, showlegend=False,
+                            xaxis_title="Multiplier", yaxis_title="Count",
+                            margin=dict(t=40, b=30, l=30, r=10),
+                        )
+                        st.plotly_chart(fh.apply_plot_template(fig_in),
+                                        use_container_width=True)
+
+    # ---- Parameter correlation matrix ----
+    if len(factor_cols_varied) >= 2 or (factor_cols_varied and
+                                         "npv_usd" in summary.columns):
+        with st.expander("🔗 Parameter correlation matrix", expanded=False):
+            st.caption(
+                "Pearson correlation between every sampled driver and the key "
+                "outcomes (NPV, cum production, RF). Drivers are sampled "
+                "independently so driver-driver correlations should be ≈0 — "
+                "the informative column is each driver vs. the outcomes.")
+            outcome_cols = [c for c in ["npv_usd", "cum_cf_usd", primary_metric,
+                                         "final_rf", "peak_oil", "peak_gas"]
+                            if c in summary.columns]
+            corr_cols = factor_cols_varied + outcome_cols
+            corr_data = summary[corr_cols].copy()
+            corr_data.columns = [c.replace("factor_", "").replace("_usd", "")
+                                 for c in corr_cols]
+            corr_mat = corr_data.corr(method="pearson")
+            fig_corr = go.Figure(data=go.Heatmap(
+                z=corr_mat.values,
+                x=list(corr_mat.columns),
+                y=list(corr_mat.index),
+                colorscale="RdBu", zmid=0, zmin=-1, zmax=1,
+                text=np.round(corr_mat.values, 2),
+                texttemplate="%{text}",
+                textfont={"size": 9},
+                colorbar=dict(title="r"),
+            ))
+            fig_corr.update_layout(
+                title="Pearson correlation matrix",
+                height=max(350, 40 * len(corr_cols)),
+                xaxis=dict(tickangle=-45),
+            )
+            st.plotly_chart(fh.apply_plot_template(fig_corr),
+                            use_container_width=True)
+
     # ---- Summary table + download ----
     with st.expander("📋 Realization-level summary table", expanded=False):
         # Pretty columns
@@ -6562,9 +7321,20 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
             "modify and save another case."
         )
 
-    cases = fh.list_cases()
+    try:
+        cases = fh.list_cases()
+    except Exception as exc:
+        st.info(f"Case directory not accessible ({exc}). "
+                "Save a case first from the case manager at the top of the page.")
+        return
     if not cases:
-        st.info("No saved cases yet — save a case from the case manager at the top of the page first.")
+        st.info("📭 No saved cases yet — save at least two cases from the "
+                "case manager at the top of the page before using comparison. "
+                "Once you have two or more cases saved, they will appear here.")
+        return
+    if len(cases) < 2:
+        st.info(f"Only one case saved (**{cases[0]['name']}**). "
+                "Save at least one more case to use the comparison view.")
         return
 
     case_names = [c["name"] for c in cases]
@@ -6608,10 +7378,19 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
                 econ_s = EconInputs(**econ_dict)
 
                 df_s, _, _ = run_simulation(wells_s, asm_s)
-                df_e_s = compute_economics(df_s,
-                    FLUID_SYSTEMS[case_fluid]["primary"] == "oil",
-                    econ_s, wells_s)
-                results[nm] = (df_s, df_e_s, case_fluid, case_units)
+                is_oil_s = FLUID_SYSTEMS[case_fluid]["primary"] == "oil"
+                df_e_s = compute_economics(df_s, is_oil_s, econ_s, wells_s)
+                # Breakeven price for this scenario
+                try:
+                    be_s = fh.breakeven_price(
+                        df_s, is_oil_s, econ_s, wells_s,
+                        base_oil_price=econ_s.oil_price,
+                        base_gas_price=econ_s.gas_price,
+                        compute_economics_fn=compute_economics,
+                        target_npv=0.0)
+                except Exception:
+                    be_s = None
+                results[nm] = (df_s, df_e_s, case_fluid, case_units, be_s)
             except Exception as e:
                 errors.append(f"{nm}: {e}")
 
@@ -6626,7 +7405,7 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
     # field-unit output into the active display units
     st.markdown("#### Field oil rate")
     fig_oil = go.Figure()
-    for nm, (df_s, _, _, _) in results.items():
+    for nm, (df_s, _, _, _, _) in results.items():
         fig_oil.add_trace(go.Scatter(
             x=df_s["date"],
             y=from_field(df_s["oil_rate"], "oil_rate", units),
@@ -6639,7 +7418,7 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
 
     st.markdown("#### Field gas rate")
     fig_gas = go.Figure()
-    for nm, (df_s, _, _, _) in results.items():
+    for nm, (df_s, _, _, _, _) in results.items():
         fig_gas.add_trace(go.Scatter(
             x=df_s["date"],
             y=from_field(df_s["gas_rate"], "gas_rate", units),
@@ -6652,7 +7431,7 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
 
     st.markdown("#### Recovery factor")
     fig_rf = go.Figure()
-    for nm, (df_s, _, _, _) in results.items():
+    for nm, (df_s, _, _, _, _) in results.items():
         fig_rf.add_trace(go.Scatter(x=df_s["date"], y=df_s["recovery_factor"],
                                     name=nm, mode="lines"))
     fig_rf.update_layout(title="Recovery factor", height=380,
@@ -6663,7 +7442,7 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
 
     st.markdown("#### Cumulative NPV")
     fig_npv = go.Figure()
-    for nm, (_, df_e, _, _) in results.items():
+    for nm, (_, df_e, _, _, _) in results.items():
         fig_npv.add_trace(go.Scatter(x=df_e["date"], y=df_e["npv"]/1e6,
                                       name=nm, mode="lines"))
     fig_npv.update_layout(title="Cumulative NPV ($MM)", height=380,
@@ -6674,7 +7453,7 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
 
     st.markdown("#### Summary table")
     rows = []
-    for nm, (df_s, df_e, case_fluid, _) in results.items():
+    for nm, (df_s, df_e, case_fluid, _, _) in results.items():
         is_oil_s = FLUID_SYSTEMS[case_fluid]["primary"] == "oil"
         peak_kind = "oil_rate" if is_oil_s else "gas_rate"
         rows.append({
@@ -6704,6 +7483,84 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
         }),
         use_container_width=True,
     )
+
+    # ---- Delta table: differences vs the first (reference) scenario ----
+    st.markdown("#### Differences vs reference case")
+    result_items = list(results.items())
+    ref_name, (ref_df_s, ref_df_e, ref_fluid, _, ref_be) = result_items[0]
+    st.caption(f"Reference case: **{ref_name}**. "
+               "Positive ΔNPV / ΔCF means the scenario beats the reference; "
+               "negative Δbreakeven means the scenario breaks even at a lower "
+               "(better) price; negative Δcost means the scenario is cheaper.")
+
+    def _total_cost(df_e):
+        """Total project cost = OPEX + well CAPEX + facility CAPEX +
+        abandonment + tax + royalty + tariff (everything deducted from
+        gross revenue)."""
+        cols = ["opex", "capex_well", "capex_facility", "abandonment",
+                "tax", "royalty", "tariff"]
+        return sum(df_e[c].sum() for c in cols if c in df_e.columns)
+
+    ref_npv  = ref_df_e["npv"].iloc[-1] / 1e6
+    ref_cf   = ref_df_e["cum_cashflow"].iloc[-1] / 1e6
+    ref_cost = _total_cost(ref_df_e) / 1e6
+    ref_be_oil = (ref_be or {}).get("oil_price")
+    ref_cum_primary_base = (ref_df_s["cum_oil"].iloc[-1]
+                            if FLUID_SYSTEMS[ref_fluid]["primary"] == "oil"
+                            else ref_df_s["cum_gas"].iloc[-1])
+
+    delta_rows = []
+    for nm, (df_s, df_e, case_fluid, _, be_s) in result_items:
+        is_oil_s = FLUID_SYSTEMS[case_fluid]["primary"] == "oil"
+        npv_s  = df_e["npv"].iloc[-1] / 1e6
+        cf_s   = df_e["cum_cashflow"].iloc[-1] / 1e6
+        cost_s = _total_cost(df_e) / 1e6
+        be_oil_s = (be_s or {}).get("oil_price")
+        cum_primary_s = (df_s["cum_oil"].iloc[-1] if is_oil_s
+                         else df_s["cum_gas"].iloc[-1])
+        row = {
+            "Scenario": nm + ("  (ref)" if nm == ref_name else ""),
+            "NPV ($MM)": npv_s,
+            "ΔNPV ($MM)": npv_s - ref_npv,
+            "ΔCum CF ($MM)": cf_s - ref_cf,
+            "Breakeven oil ($/bbl)": be_oil_s if be_oil_s is not None else float("nan"),
+            "ΔBreakeven ($/bbl)": (be_oil_s - ref_be_oil)
+                if (be_oil_s is not None and ref_be_oil is not None) else float("nan"),
+            "Total cost ($MM)": cost_s,
+            "ΔCost ($MM)": cost_s - ref_cost,
+            f"ΔCum primary ({ulabel('oil_vol' if is_oil_s else 'gas_vol', units)})":
+                from_field(cum_primary_s - ref_cum_primary_base,
+                           "oil_vol" if is_oil_s else "gas_vol", units),
+        }
+        delta_rows.append(row)
+    delta_df = pd.DataFrame(delta_rows)
+
+    def _color_delta(val):
+        """Green for value-positive deltas, red for negative. NaN untouched."""
+        if pd.isna(val):
+            return ""
+        return ("color: #2ca02c" if val > 0 else
+                "color: #d62728" if val < 0 else "")
+
+    def _color_delta_inverse(val):
+        """For breakeven & cost: lower is better → green for negative."""
+        if pd.isna(val):
+            return ""
+        return ("color: #d62728" if val > 0 else
+                "color: #2ca02c" if val < 0 else "")
+
+    styled = delta_df.style.format({
+        "NPV ($MM)": "{:,.0f}",
+        "ΔNPV ($MM)": "{:+,.0f}",
+        "ΔCum CF ($MM)": "{:+,.0f}",
+        "Breakeven oil ($/bbl)": "{:,.1f}",
+        "ΔBreakeven ($/bbl)": "{:+,.1f}",
+        "Total cost ($MM)": "{:,.0f}",
+        "ΔCost ($MM)": "{:+,.0f}",
+        delta_df.columns[-1]: "{:+,.2f}",
+    }).map(_color_delta, subset=["ΔNPV ($MM)", "ΔCum CF ($MM)", delta_df.columns[-1]]) \
+      .map(_color_delta_inverse, subset=["ΔBreakeven ($/bbl)", "ΔCost ($MM)"])
+    st.dataframe(styled, use_container_width=True)
 
 
 if __name__ == "__main__":
