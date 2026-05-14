@@ -288,59 +288,154 @@ def breakeven_price(df, is_oil, econ_inputs, wells, base_oil_price: float,
     }
 
 
+def _cum_boe(df, is_oil) -> float:
+    """Cumulative production in barrels of oil equivalent (BOE).
+
+    The engine stores cum_oil in MMstb and cum_gas in Bscf. We convert both
+    to BOE: oil 1 stb = 1 boe; gas 6 Mscf = 1 boe (industry-standard
+    energy-equivalence). Returns BOE (not MMBOE) — callers divide by 1e6.
+    """
+    MSCF_PER_BOE = 6.0
+    cum_oil_stb = 0.0
+    cum_gas_mscf = 0.0
+    if "cum_oil" in df.columns and len(df):
+        # cum_oil is in MMstb → ×1e6 to get stb
+        cum_oil_stb = float(df["cum_oil"].iloc[-1]) * 1e6
+    if "cum_gas" in df.columns and len(df):
+        # cum_gas is in Bscf → ×1e6 to get Mscf
+        cum_gas_mscf = float(df["cum_gas"].iloc[-1]) * 1e6
+    return cum_oil_stb + cum_gas_mscf / MSCF_PER_BOE
+
+
 def minimum_economical_volume(df, is_oil, econ_inputs, wells,
                                compute_economics_fn, target_npv: float = 0.0,
-                               tol: float = 1e5, max_iter: int = 60):
+                               tol: float = 1e5, max_iter: int = 60,
+                               breakeven_fn=None, target_breakeven: float = None):
     """Bisection on a *production multiplier* applied to all rate columns.
 
-    Finds the smallest fraction of the base production profile at which the
-    project still meets the target NPV (default 0). This is the "minimum
-    economical volume" — below this scaled profile, the project is
-    value-destructive at the current price/cost assumptions.
+    Two modes:
+      (a) target_npv (default): find the smallest fraction of the base
+          production profile at which NPV still meets `target_npv`.
+      (b) target_breakeven (when `target_breakeven` and `breakeven_fn` are
+          given): find the production multiplier at which the project's
+          breakeven oil price equals the user-specified `target_breakeven`.
+          This is the "robustness case" — the volume needed so the project
+          stays economic down to a given price floor.
+
+    Volumes are reported in BOE (barrels of oil equivalent; gas at 6 Mscf/boe)
+    so the answer is unit-system-independent.
 
     Returns a dict with:
-      'multiplier'        : production scaling at NPV = target (0..base_mult_hi)
-      'cum_primary_base'  : base-case cumulative primary volume
-      'cum_primary_min'   : minimum economical cumulative primary volume
-      'fraction_of_base'  : multiplier expressed as a %
-      'note'              : human-readable interpretation
-    Returns multiplier=None when even the full profile can't reach target.
+      'multiplier'         : production scaling at the target
+      'cum_boe_base'       : base-case cumulative BOE
+      'cum_boe_min'        : minimum economical cumulative BOE
+      'fraction_of_base'   : multiplier as a %
+      'mode'               : 'npv' or 'breakeven'
+      'note'               : human-readable interpretation
+    Returns multiplier=None when the target can't be reached.
     """
-    # The production columns that scale together
     rate_cols = ["primary_rate", "secondary_rate", "oil_rate", "gas_rate",
                  "water_rate", "gross_gas_rate", "gas_export_rate",
                  "gas_fuel_rate", "gas_flare_rate", "gas_inject_rate"]
     present = [c for c in rate_cols if c in df.columns]
+    cum_boe_base = _cum_boe(df, is_oil)
 
-    cum_primary_base = float((df["primary_rate"] * df.get("days_in_month", 30.4)).sum()) \
-        if "primary_rate" in df.columns else 0.0
-
-    def npv_at(mult: float) -> float:
+    def _scaled(mult: float):
         scaled = df.copy()
         for c in present:
             scaled[c] = scaled[c] * mult
-        # cum columns must be recomputed downstream by compute_economics; if it
-        # relies on cumulatives in df, scale those too
         for c in ["cum_primary", "cum_secondary", "cum_oil", "cum_gas", "cum_water"]:
             if c in scaled.columns:
                 scaled[c] = scaled[c] * mult
-        df_e = compute_economics_fn(scaled, is_oil, econ_inputs, wells)
+        return scaled
+
+    # ---- Mode (b): robustness at a user breakeven ----
+    if target_breakeven is not None and breakeven_fn is not None:
+        def be_at(mult: float):
+            scaled = _scaled(mult)
+            be = breakeven_fn(
+                scaled, is_oil, econ_inputs, wells,
+                base_oil_price=econ_inputs.oil_price,
+                base_gas_price=econ_inputs.gas_price,
+                compute_economics_fn=compute_economics_fn,
+                target_npv=0.0)
+            if be is None or be.get("oil_price") is None:
+                return None
+            return float(be["oil_price"])
+
+        be_full = be_at(1.0)
+        if be_full is None:
+            return {"multiplier": None, "cum_boe_base": cum_boe_base,
+                    "cum_boe_min": None, "fraction_of_base": None,
+                    "mode": "breakeven",
+                    "note": "Could not compute a breakeven at full volume — "
+                            "project may be uneconomic at any price."}
+        # Breakeven price falls as volume rises. If full-volume breakeven is
+        # already at/below target, the project is robust even at base volume.
+        if be_full <= target_breakeven:
+            return {"multiplier": 1.0, "cum_boe_base": cum_boe_base,
+                    "cum_boe_min": cum_boe_base, "fraction_of_base": 100.0,
+                    "mode": "breakeven", "breakeven_full": be_full,
+                    "note": (f"At base volume the breakeven is "
+                             f"${be_full:,.1f}/bbl — already at or below the "
+                             f"${target_breakeven:,.1f}/bbl target. The "
+                             f"project is robust at full volume.")}
+        # Otherwise we'd need MORE than base volume — search 1.0 .. 5.0
+        lo, hi = 1.0, 5.0
+        be_hi = be_at(hi)
+        if be_hi is None or be_hi > target_breakeven:
+            return {"multiplier": None, "cum_boe_base": cum_boe_base,
+                    "cum_boe_min": None, "fraction_of_base": None,
+                    "mode": "breakeven", "breakeven_full": be_full,
+                    "note": (f"Even at 5× base volume the breakeven "
+                             f"(${be_hi:,.1f}/bbl) stays above the "
+                             f"${target_breakeven:,.1f}/bbl target — the "
+                             f"target is not reachable by volume alone.")}
+        for _ in range(max_iter):
+            mid = 0.5 * (lo + hi)
+            be_mid = be_at(mid)
+            if be_mid is None:
+                lo = mid
+                continue
+            if abs(be_mid - target_breakeven) < 0.05:
+                break
+            if be_mid > target_breakeven:
+                lo = mid
+            else:
+                hi = mid
+        mult = 0.5 * (lo + hi)
+        return {
+            "multiplier": mult,
+            "cum_boe_base": cum_boe_base,
+            "cum_boe_min": cum_boe_base * mult,
+            "fraction_of_base": mult * 100.0,
+            "mode": "breakeven",
+            "breakeven_full": be_full,
+            "note": (f"To stay economic down to ${target_breakeven:,.1f}/bbl, "
+                     f"the project needs {mult*100:.0f}% of the base volume "
+                     f"({cum_boe_base*mult/1e6:,.1f} MMBOE) — "
+                     f"{'more than' if mult > 1 else 'within'} the base case."),
+        }
+
+    # ---- Mode (a): NPV target ----
+    def npv_at(mult: float) -> float:
+        df_e = compute_economics_fn(_scaled(mult), is_oil, econ_inputs, wells)
         return float(df_e["npv"].iloc[-1])
 
     npv_full = npv_at(1.0)
-    npv_zero = npv_at(0.0)   # no production: pure cost → must be negative
+    npv_zero = npv_at(0.0)
 
     if npv_full <= target_npv:
-        return {"multiplier": None, "cum_primary_base": cum_primary_base,
-                "cum_primary_min": None, "fraction_of_base": None,
-                "npv_full": npv_full,
+        return {"multiplier": None, "cum_boe_base": cum_boe_base,
+                "cum_boe_min": None, "fraction_of_base": None,
+                "mode": "npv", "npv_full": npv_full,
                 "note": ("Even the full base production profile does not reach "
                          "the target NPV — the project is uneconomical at "
                          "current price/cost assumptions regardless of volume.")}
     if npv_zero >= target_npv:
-        return {"multiplier": 0.0, "cum_primary_base": cum_primary_base,
-                "cum_primary_min": 0.0, "fraction_of_base": 0.0,
-                "npv_full": npv_full,
+        return {"multiplier": 0.0, "cum_boe_base": cum_boe_base,
+                "cum_boe_min": 0.0, "fraction_of_base": 0.0,
+                "mode": "npv", "npv_full": npv_full,
                 "note": "Project meets target NPV even at zero production "
                         "(costs alone are not value-destructive — unusual; "
                         "check inputs)."}
@@ -358,13 +453,64 @@ def minimum_economical_volume(df, is_oil, econ_inputs, wells,
     mult = 0.5 * (lo + hi)
     return {
         "multiplier": mult,
-        "cum_primary_base": cum_primary_base,
-        "cum_primary_min": cum_primary_base * mult,
+        "cum_boe_base": cum_boe_base,
+        "cum_boe_min": cum_boe_base * mult,
         "fraction_of_base": mult * 100.0,
+        "mode": "npv",
         "npv_full": npv_full,
         "note": (f"At {mult*100:.1f}% of the base production profile the "
                  f"project's NPV equals the target. Below this volume the "
                  f"project is value-destructive at current assumptions."),
+    }
+
+
+def co2_intensity_benchmark(df_e, df, is_oil) -> dict:
+    """Compute project CO2 intensity (kg CO2-eq per boe) and place it against
+    public industry benchmarks.
+
+    Benchmarks (kg CO2-eq/boe, Scope 1+2 upstream, screening-level — drawn
+    from published industry averages, IOGP / OGCI / national reporting):
+        Best-in-class (e.g. Norwegian Continental Shelf avg)   ~  7
+        Global upstream average                                ~ 18
+        High-intensity (heavy oil, mature, high-flaring)        ~ 35+
+    Returns a dict with intensity, total emissions, band, and benchmark set.
+    """
+    MSCF_PER_BOE = 6.0
+    total_co2_t = float(df_e["cum_co2_tonnes"].iloc[-1]) \
+        if "cum_co2_tonnes" in df_e.columns and len(df_e) else 0.0
+    # BOE produced over life
+    cum_oil_stb = float(df["cum_oil"].iloc[-1]) * 1e6 if "cum_oil" in df.columns else 0.0
+    cum_gas_mscf = float(df["cum_gas"].iloc[-1]) * 1e6 if "cum_gas" in df.columns else 0.0
+    cum_boe = cum_oil_stb + cum_gas_mscf / MSCF_PER_BOE
+    intensity = (total_co2_t * 1000.0 / cum_boe) if cum_boe > 0 else 0.0  # kg/boe
+
+    benchmarks = {
+        "Best-in-class (NCS avg)": 7.0,
+        "Global upstream average": 18.0,
+        "High-intensity": 35.0,
+    }
+    if intensity <= 10:
+        band = "Low — competitive with best-in-class assets"
+    elif intensity <= 22:
+        band = "Moderate — around the global upstream average"
+    elif intensity <= 35:
+        band = "Elevated — above average; emissions reduction worth studying"
+    else:
+        band = "High — well above average; significant decarbonization opportunity"
+
+    # Total power
+    total_power_mwh = float(df_e["power_mwh"].sum()) \
+        if "power_mwh" in df_e.columns else 0.0
+    power_intensity = (total_power_mwh * 1000.0 / cum_boe) if cum_boe > 0 else 0.0  # kWh/boe
+
+    return {
+        "intensity_kg_per_boe": intensity,
+        "total_co2_tonnes": total_co2_t,
+        "cum_boe": cum_boe,
+        "band": band,
+        "benchmarks": benchmarks,
+        "total_power_mwh": total_power_mwh,
+        "power_intensity_kwh_per_boe": power_intensity,
     }
 
 

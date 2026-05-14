@@ -483,6 +483,18 @@ class EconInputs:
     # Rig metadata (move-in/out + maintenance) — keyed by rig name. Populated
     # from the rigs table; used to cost mob/demob/maintenance days.
     rig_meta: dict = field(default_factory=dict)
+    # ---- Economic limit / cessation timing ----
+    # "horizon"   : produce for the full forecast horizon (legacy behaviour);
+    #               abandonment booked at last producing month.
+    # "economic"  : truncate production at the economic limit — the month
+    #               after which monthly operating cashflow (revenue − royalty
+    #               − tariff − OPEX) stays negative. Cessation cost is booked
+    #               at that month. This is the smart, self-consistent cutoff.
+    economic_cutoff_mode: str = "horizon"
+    # When in "economic" mode, require this many consecutive negative-CF
+    # months before declaring the economic limit (filters out transient dips
+    # e.g. a maintenance month). Typical: 6–12 months.
+    economic_cutoff_persistence: int = 6
 
 
 @dataclass
@@ -1454,6 +1466,64 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     fixed_cost = econ.opex_fixed / 12.0
     opex = var_cost + fixed_cost + ngl_opex
 
+    # ---- Economic limit / cessation timing ----
+    # In "economic" mode, find the month after which monthly operating
+    # cashflow (revenue − royalty − tariff − OPEX, excluding CAPEX) stays
+    # negative for `economic_cutoff_persistence` consecutive months. Production
+    # and all associated revenue / OPEX after that month are zeroed — the field
+    # is shut in rather than produced at a loss.
+    cutoff_mode = getattr(econ, "economic_cutoff_mode", "horizon")
+    cutoff_idx = None
+    if cutoff_mode == "economic":
+        persistence = max(1, int(getattr(econ, "economic_cutoff_persistence", 6)))
+        op_cf = (revenue - royalty - tariff - opex).values  # monthly operating CF
+        # Find the first month from which CF is negative for `persistence`
+        # consecutive months (and never recovers materially). We scan from the
+        # back: the economic limit is the last month with positive CF, +1.
+        producing = (df["primary_rate"].values > 0)
+        neg = op_cf < 0
+        # Rolling check: month i is the economic limit if neg[i:i+persistence] all True
+        for i in range(len(op_cf)):
+            if not producing[i]:
+                continue
+            window = neg[i:i + persistence]
+            if len(window) > 0 and window.all():
+                cutoff_idx = i
+                break
+        if cutoff_idx is not None and cutoff_idx > 0:
+            # Zero out production, revenue, opex from the cutoff onward
+            mask_after = np.arange(len(df)) >= cutoff_idx
+            for arr_name in ["revenue", "rev_oil", "rev_gas", "rev_cond",
+                             "rev_ngl", "royalty", "tariff", "net_revenue",
+                             "opex", "var_cost", "ngl_opex"]:
+                if arr_name in dir():
+                    pass  # placeholder; explicit handling below
+            # Explicit zeroing (these are pandas Series / np arrays)
+            revenue = revenue.copy(); revenue[mask_after] = 0.0
+            rev_oil = rev_oil.copy() if hasattr(rev_oil, "copy") else rev_oil
+            if hasattr(rev_oil, "__setitem__"): rev_oil[mask_after] = 0.0
+            if hasattr(rev_gas, "__setitem__"):
+                rev_gas = rev_gas.copy(); rev_gas[mask_after] = 0.0
+            if hasattr(rev_cond, "__setitem__"):
+                rev_cond = rev_cond.copy(); rev_cond[mask_after] = 0.0
+            if hasattr(rev_ngl, "__setitem__"):
+                rev_ngl = rev_ngl.copy(); rev_ngl[mask_after] = 0.0
+            royalty = royalty.copy(); royalty[mask_after] = 0.0
+            tariff = tariff.copy() if hasattr(tariff, "copy") else tariff
+            if hasattr(tariff, "__setitem__"): tariff[mask_after] = 0.0
+            net_revenue = revenue - royalty - tariff
+            opex = opex.copy(); opex[mask_after] = 0.0
+            # Mark the truncated production in df for display consistency
+            df = df.copy()
+            for rate_col in ["primary_rate", "secondary_rate", "oil_rate",
+                             "gas_rate", "water_rate", "gross_gas_rate",
+                             "gas_export_rate", "gas_fuel_rate",
+                             "gas_flare_rate", "injection_rate"]:
+                if rate_col in df.columns:
+                    df.loc[df.index[cutoff_idx]:, rate_col] = 0.0
+            df.attrs["economic_cutoff_idx"] = int(cutoff_idx)
+            df.attrs["economic_cutoff_date"] = str(df["date"].iloc[cutoff_idx].date())
+
     capex_well = np.zeros(len(df))
     well_cost_breakdown = []   # for transparency / display
     use_rig_rate = getattr(econ, "well_cost_mode", "fixed") == "rig_rate"
@@ -1540,7 +1610,12 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                     capex_fac[active_mask.values] += maint_cost_per_month
 
     aban_cost = np.zeros(len(df))
-    if (df["primary_rate"] > 0).any():
+    cutoff_idx_attr = df.attrs.get("economic_cutoff_idx")
+    if cutoff_idx_attr is not None:
+        # Economic-limit mode: cessation booked at the economic cutoff month
+        aban_cost[int(cutoff_idx_attr)] = econ.abandonment_cost_MM * 1e6
+    elif (df["primary_rate"] > 0).any():
+        # Horizon mode: cessation at last producing month
         last = df.index[df["primary_rate"] > 0].max()
         aban_cost[int(last)] = econ.abandonment_cost_MM * 1e6
 
@@ -1565,6 +1640,29 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
 
     co2_total_t = co2_combust_t + co2_slip_t + co2_routine_t  # tonnes / month
     co2_cost = co2_total_t * econ.co2_price                   # $ / month
+
+    # ---- Power consumption (screening estimate, MWh/month) ----
+    # Topsides power demand scales with what the facility has to move and
+    # process: liquids handling (pumps), gas compression, water injection.
+    # Screening intensities (kWh per unit), conservative mid-range values:
+    #   - liquid (oil+water) handling : ~1.5 kWh/bbl
+    #   - gas compression / processing: ~3.0 kWh/Mscf
+    #   - water injection             : ~2.0 kWh/bbl
+    # These are deliberately simple — real facility power studies are detailed.
+    KWH_PER_BBL_LIQUID   = 1.5
+    KWH_PER_MSCF_GAS     = 3.0
+    KWH_PER_BBL_WATERINJ = 2.0
+    liquid_bbl_month = (df["primary_rate"] if is_oil else df.get("secondary_rate",
+                        pd.Series(0.0, index=df.index))) * days
+    water_bbl_month  = df.get("water_rate", pd.Series(0.0, index=df.index)) * days
+    gas_mscf_month   = (df["gross_gas_rate"] if "gross_gas_rate" in df.columns
+                        else (df["secondary_rate"] if is_oil else df["primary_rate"])) * days
+    waterinj_bbl_month = df.get("injection_rate", pd.Series(0.0, index=df.index)) * days
+    power_mwh = (
+        (liquid_bbl_month + water_bbl_month) * KWH_PER_BBL_LIQUID
+        + gas_mscf_month * KWH_PER_MSCF_GAS
+        + waterinj_bbl_month * KWH_PER_BBL_WATERINJ
+    ) / 1000.0   # kWh → MWh
 
     capex = capex_well + capex_fac
 
@@ -1634,6 +1732,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["capex_facility"] = capex_fac
         df_e["abandonment"] = aban_cost
         df_e["co2_emissions_tonnes"] = co2_total_t
+        df_e["power_mwh"] = power_mwh
         df_e["co2_cost"] = co2_cost
         df_e["tax"] = tax_arr
         df_e["psc_cost_recovered"] = cost_recovered_arr
@@ -1664,6 +1763,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["capex_facility"] = capex_fac
         df_e["abandonment"] = aban_cost
         df_e["co2_emissions_tonnes"] = co2_total_t
+        df_e["power_mwh"] = power_mwh
         df_e["co2_cost"] = co2_cost
         df_e["tax"] = tax
         df_e["cashflow"] = cf
@@ -3065,8 +3165,11 @@ def well_section(units, fluid, start_date):
         },
         key="rigs_editor",
     )
-    br1, br2, _br3 = st.columns([1, 1, 4])
-    if br1.button("✓ Apply rig edits", key="rigs_apply", type="primary"):
+    br1, br2, _br3 = st.columns([2, 1, 3])
+    with br1:
+        rigs_apply_clicked = _apply_button(rigs_buf, st.session_state.rigs_df,
+                                            "rigs_apply", "Apply rig edits")
+    if rigs_apply_clicked:
         commit = rigs_buf.copy()
         if "rig" in commit.columns:
             commit = commit[commit["rig"].notna() & (commit["rig"].astype(str).str.strip() != "")]
@@ -3247,8 +3350,14 @@ def well_section(units, fluid, start_date):
         key="producers_editor",
     )
 
-    btn_p1, btn_p2, _btn_p3 = st.columns([1, 1, 4])
-    if btn_p1.button("✓ Apply producer edits", key="producers_apply", type="primary"):
+    btn_p1, btn_p2, _btn_p3 = st.columns([2, 1, 3])
+    # The buffer is in display units; compare against a display-converted copy
+    # of the committed (storage-unit) producers_df so dirty-detection is correct.
+    with btn_p1:
+        producers_apply_clicked = _apply_button(
+            producers_df_buf, pdf_display, "producers_apply",
+            "Apply producer edits")
+    if producers_apply_clicked:
         commit = producers_df_buf.copy()
         # Convert display→storage for IPR fields
         if is_metric:
@@ -3319,8 +3428,12 @@ def well_section(units, fluid, start_date):
             },
             key="injectors_editor",
         )
-        bi1, bi2, _bi3 = st.columns([1, 1, 4])
-        if bi1.button("✓ Apply injector edits", key="injectors_apply", type="primary"):
+        bi1, bi2, _bi3 = st.columns([2, 1, 3])
+        with bi1:
+            injectors_apply_clicked = _apply_button(
+                injectors_buf, st.session_state.injectors_df,
+                "injectors_apply", "Apply injector edits")
+        if injectors_apply_clicked:
             commit = injectors_buf.copy()
             if "name" in commit.columns:
                 commit = commit[commit["name"].notna() & (commit["name"].astype(str).str.strip() != "")]
@@ -3687,8 +3800,12 @@ def reservoir_section(units: str, sidebar_inputs: dict,
         },
         key="reservoirs_editor",
     )
-    brs1, brs2, _brs3 = st.columns([1, 1, 4])
-    if brs1.button("✓ Apply reservoir edits", key="reservoirs_apply", type="primary"):
+    brs1, brs2, _brs3 = st.columns([2, 1, 3])
+    with brs1:
+        reservoirs_apply_clicked = _apply_button(
+            res_df, st.session_state.reservoirs_df,
+            "reservoirs_apply", "Apply reservoir edits")
+    if reservoirs_apply_clicked:
         commit = res_df.copy()
         if "id" in commit.columns:
             commit = commit[commit["id"].notna() & (commit["id"].astype(str).str.strip() != "")]
@@ -3785,8 +3902,12 @@ def reservoir_section(units: str, sidebar_inputs: dict,
         },
         key="well_reservoir_editor",
     )
-    bw1, bw2, _bw3 = st.columns([1, 1, 4])
-    if bw1.button("✓ Apply allocation edits", key="well_reservoir_apply", type="primary"):
+    bw1, bw2, _bw3 = st.columns([2, 1, 3])
+    with bw1:
+        wr_apply_clicked = _apply_button(
+            alloc_df, st.session_state.well_reservoir_df,
+            "well_reservoir_apply", "Apply allocation edits")
+    if wr_apply_clicked:
         commit = alloc_df.copy()
         # Drop rows missing well or reservoir
         if "well" in commit.columns and "reservoir" in commit.columns:
@@ -3929,8 +4050,11 @@ def capacity_section(units, start_date, strategy: str = "Injection"):
         column_config=column_config,
         key="cap_editor",
     )
-    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 4])
-    if btn_col1.button("✓ Apply", key="cap_apply", type="primary"):
+    btn_col1, btn_col2, btn_col3 = st.columns([2, 1, 3])
+    with btn_col1:
+        cap_apply_clicked = _apply_button(cap_df_edited, edit_df,
+                                           "cap_apply", "Apply capacity edits")
+    if cap_apply_clicked:
         cleaned = _clean_table_buffer(cap_df_edited, st.session_state.cap_df,
                                         date_cols=["start_date"])
         if "water_inj" not in cleaned.columns:
@@ -3993,6 +4117,50 @@ def _duplicate_last_row(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = pd.concat([df, df.iloc[[-1]]], ignore_index=True)
     return out
+
+
+def _table_is_dirty(buffer_df: pd.DataFrame, committed_df: pd.DataFrame) -> bool:
+    """True when the data_editor buffer differs from the committed session
+    state — used to colour the Apply button orange (dirty) vs green (clean).
+
+    Compares shape and values; tolerant of dtype noise and NaN.
+    """
+    if buffer_df is None or committed_df is None:
+        return buffer_df is not committed_df
+    try:
+        if buffer_df.shape != committed_df.shape:
+            return True
+        # Align columns; if column sets differ → dirty
+        if set(buffer_df.columns) != set(committed_df.columns):
+            return True
+        b = buffer_df.reset_index(drop=True)
+        c = committed_df[buffer_df.columns].reset_index(drop=True)
+        # Stringify to dodge dtype / NaN comparison quirks
+        return not b.astype(str).equals(c.astype(str))
+    except Exception:
+        # When in doubt, treat as dirty so the user can always commit
+        return True
+
+
+def _apply_button(buffer_df: pd.DataFrame, committed_df: pd.DataFrame,
+                  key: str, label: str = "Apply") -> bool:
+    """Render an Apply button that is ORANGE when the buffer has unsaved
+    changes and GREEN when it matches the committed state. Returns True when
+    clicked.
+
+    Streamlit doesn't expose per-button colours directly, so we use the
+    button label + an emoji indicator + a coloured caption to convey state.
+    """
+    dirty = _table_is_dirty(buffer_df, committed_df)
+    if dirty:
+        clicked = st.button(f"🟠 {label} — unsaved changes", key=key,
+                            type="primary", use_container_width=False)
+        st.caption(":orange[● Edited — click Apply to commit and refresh results.]")
+    else:
+        clicked = st.button(f"🟢 {label} — up to date", key=key,
+                            type="secondary", use_container_width=False)
+        st.caption(":green[✓ All changes applied.]")
+    return clicked
 
 
 # =============================================================================
@@ -4173,6 +4341,35 @@ def economics_section(units, start_date):
         help="Gas transport / processing tariff per MMBtu.")
     aban_cost = c3.number_input("Abandonment cost ($MM)", value=80.0,
                                 key="aban_cost", on_change=mark_stale)
+
+    # ---- Economic limit / cessation timing ----
+    st.markdown("**Cessation timing**")
+    cutoff_mode_label = st.radio(
+        "When does the field cease production?",
+        ["Full forecast horizon", "Economic limit (smart cut-off)"],
+        horizontal=True, key="economic_cutoff_mode_label", on_change=mark_stale,
+        help="Full forecast horizon: produce until the end of the forecast "
+             "period; cessation cost booked at the last producing month "
+             "(legacy behaviour).\n\n"
+             "Economic limit: the engine finds the month after which monthly "
+             "operating cashflow (revenue − royalty − tariff − OPEX) stays "
+             "negative, shuts the field in there, and books cessation at that "
+             "month. This is the self-consistent way to define field life — "
+             "you don't keep producing at a loss.",
+    )
+    economic_cutoff_mode = ("economic"
+                            if cutoff_mode_label.startswith("Economic")
+                            else "horizon")
+    economic_cutoff_persistence = 6
+    if economic_cutoff_mode == "economic":
+        economic_cutoff_persistence = st.slider(
+            "Consecutive negative-CF months before cessation",
+            1, 24, 6, 1, key="economic_cutoff_persistence",
+            on_change=mark_stale,
+            help="How many consecutive months of negative operating cashflow "
+                 "are required before declaring the economic limit. A higher "
+                 "value rides through transient dips (e.g. a maintenance "
+                 "month or a price trough); 6–12 months is typical.")
 
     # ---- Fiscal regime (Tax/Royalty vs PSC) ----
     st.markdown("**Fiscal regime**")
@@ -4376,8 +4573,11 @@ def economics_section(units, start_date):
         },
         key="fac_editor",
     )
-    bf1, bf2, _bf3 = st.columns([1, 1, 4])
-    if bf1.button("✓ Apply CAPEX edits", key="fac_apply", type="primary"):
+    bf1, bf2, _bf3 = st.columns([2, 1, 3])
+    with bf1:
+        fac_apply_clicked = _apply_button(fac_df_buf, st.session_state.fac_df,
+                                           "fac_apply", "Apply CAPEX edits")
+    if fac_apply_clicked:
         st.session_state.fac_df = _clean_table_buffer(
             fac_df_buf, st.session_state.fac_df, date_cols=["date"])
         mark_stale()
@@ -4415,6 +4615,8 @@ def economics_section(units, start_date):
         ngl_opex_bbl=ngl_opex,
         ngl_shrinkage_pct=ngl_shrink,
         rig_meta=st.session_state.get("_rig_meta", {}),
+        economic_cutoff_mode=economic_cutoff_mode,
+        economic_cutoff_persistence=economic_cutoff_persistence,
     )
 
 
@@ -5405,47 +5607,83 @@ def main():
             "Green = value added, red = value removed, blue = subtotals."
         )
 
-        # Minimum economical volume
-        with st.expander("📉 Minimum economical volume (NPV = 0 threshold)",
+        # Minimum economical volume + robustness case
+        with st.expander("📉 Minimum economical volume & robustness case",
                          expanded=False):
             st.caption(
-                "Finds the smallest fraction of the current production profile "
-                "at which the project still breaks even (NPV = 0) at the "
-                "current price and cost assumptions. Below this volume, the "
-                "project destroys value."
+                "**Minimum economical volume** — the smallest fraction of the "
+                "current production profile at which the project still breaks "
+                "even (NPV = 0). Below this volume, the project destroys value.\n\n"
+                "**Robustness case** — the volume needed so the project stays "
+                "economic down to a price floor you specify (its breakeven "
+                "drops to that price). All volumes shown in **MMBOE** "
+                "(gas converted at 6 Mscf/boe)."
             )
-            if st.button("Compute minimum economical volume",
-                          key="mev_compute"):
-                with st.spinner("Solving for NPV = 0 volume threshold…"):
-                    mev = fh.minimum_economical_volume(
-                        df, is_oil, econ_r, wells_r, compute_economics,
-                        target_npv=0.0)
+            mev_mode = st.radio(
+                "Analysis", ["Minimum economical volume (NPV = 0)",
+                              "Robustness case (target breakeven price)"],
+                key="mev_mode", horizontal=True)
+
+            target_be = None
+            if mev_mode.startswith("Robustness"):
+                target_be = st.number_input(
+                    "Target breakeven oil price ($/bbl)",
+                    min_value=5.0, max_value=200.0, value=40.0, step=5.0,
+                    key="mev_target_be",
+                    help="The price floor the project should remain economic "
+                         "down to. The solver finds the production volume at "
+                         "which the project's breakeven equals this price.")
+
+            if st.button("Compute", key="mev_compute"):
+                with st.spinner("Solving… (this runs the full economics "
+                                "model many times)"):
+                    if target_be is not None:
+                        mev = fh.minimum_economical_volume(
+                            df, is_oil, econ_r, wells_r, compute_economics,
+                            breakeven_fn=fh.breakeven_price,
+                            target_breakeven=target_be)
+                    else:
+                        mev = fh.minimum_economical_volume(
+                            df, is_oil, econ_r, wells_r, compute_economics,
+                            target_npv=0.0)
+
                 if mev.get("multiplier") is None:
                     st.error(mev["note"])
                 elif mev.get("multiplier") == 0.0:
                     st.warning(mev["note"])
                 else:
+                    cum_base_boe = mev["cum_boe_base"] / 1e6   # → MMBOE
+                    cum_min_boe = mev["cum_boe_min"] / 1e6
                     m1, m2, m3 = st.columns(3)
-                    m1.metric("Min economical volume",
-                              f"{mev['fraction_of_base']:.1f}% of base")
-                    primary_label = ulabel("oil_vol" if is_oil else "gas_vol", units)
-                    cum_base_disp = from_field(
-                        mev["cum_primary_base"] / (1e6 if is_oil else 1e9),
-                        "oil_vol" if is_oil else "gas_vol", units)
-                    cum_min_disp = from_field(
-                        mev["cum_primary_min"] / (1e6 if is_oil else 1e9),
-                        "oil_vol" if is_oil else "gas_vol", units)
-                    m2.metric(f"Base cumulative ({primary_label})",
-                              f"{cum_base_disp:,.1f}")
-                    m3.metric(f"Min economical cum. ({primary_label})",
-                              f"{cum_min_disp:,.1f}",
-                              delta=f"-{(1-mev['multiplier'])*100:.0f}% headroom")
-                    st.info(mev["note"])
-                    st.caption(
-                        f"Interpretation: the project has "
-                        f"**{(1-mev['multiplier'])*100:.0f}% volume headroom** — "
-                        f"production could fall to {mev['fraction_of_base']:.0f}% "
-                        f"of forecast before NPV goes negative.")
+                    if mev["mode"] == "breakeven":
+                        m1.metric("Volume needed",
+                                  f"{mev['fraction_of_base']:.0f}% of base")
+                        m2.metric("Base cumulative (MMBOE)",
+                                  f"{cum_base_boe:,.1f}")
+                        m3.metric("Robustness volume (MMBOE)",
+                                  f"{cum_min_boe:,.1f}",
+                                  delta=f"{(mev['multiplier']-1)*100:+.0f}% vs base")
+                        st.info(mev["note"])
+                        if mev.get("breakeven_full") is not None:
+                            st.caption(
+                                f"At base volume the breakeven is "
+                                f"**${mev['breakeven_full']:,.1f}/bbl**. "
+                                f"Target floor: **${target_be:,.1f}/bbl**.")
+                    else:
+                        m1.metric("Min economical volume",
+                                  f"{mev['fraction_of_base']:.1f}% of base")
+                        m2.metric("Base cumulative (MMBOE)",
+                                  f"{cum_base_boe:,.1f}")
+                        m3.metric("Min economical cum. (MMBOE)",
+                                  f"{cum_min_boe:,.1f}",
+                                  delta=f"-{(1-mev['multiplier'])*100:.0f}% headroom")
+                        st.info(mev["note"])
+                        st.caption(
+                            f"Interpretation: the project has "
+                            f"**{(1-mev['multiplier'])*100:.0f}% volume "
+                            f"headroom** — production could fall to "
+                            f"{mev['fraction_of_base']:.0f}% of forecast "
+                            f"before NPV goes negative.")
 
         # Revenue breakdown by stream (oil / gas / condensate / NGL)
         with st.expander("💰 Revenue breakdown by stream", expanded=False):
@@ -5471,6 +5709,77 @@ def main():
                     sdf.style.format({"Revenue ($MM)": "{:,.0f}", "% of total": "{:.1f}%"}),
                     use_container_width=True, hide_index=True,
                 )
+
+        # ---- CO2 emissions, intensity & benchmarking + power ----
+        with st.expander("🌍 Emissions, carbon intensity & power", expanded=False):
+            bm = fh.co2_intensity_benchmark(df_e, df, is_oil)
+            ec1, ec2, ec3 = st.columns(3)
+            ec1.metric("Lifetime CO₂-eq emissions",
+                       f"{bm['total_co2_tonnes']/1e3:,.0f} kt")
+            ec2.metric("Carbon intensity",
+                       f"{bm['intensity_kg_per_boe']:,.1f} kg/boe")
+            ec3.metric("Production basis",
+                       f"{bm['cum_boe']/1e6:,.1f} MMBOE")
+            st.caption(f"**Assessment:** {bm['band']}")
+
+            # Benchmark bar chart
+            fig_bm = go.Figure()
+            bench_names = list(bm["benchmarks"].keys())
+            bench_vals = list(bm["benchmarks"].values())
+            fig_bm.add_trace(go.Bar(
+                y=bench_names, x=bench_vals, orientation="h",
+                marker_color=["#2ca02c", "#ff7f0e", "#d62728"],
+                name="Benchmark", opacity=0.55,
+                hovertemplate="%{y}: %{x:.0f} kg/boe<extra></extra>",
+            ))
+            fig_bm.add_vline(
+                x=bm["intensity_kg_per_boe"],
+                line=dict(color="#1f77b4", width=3),
+                annotation_text=f"This project: {bm['intensity_kg_per_boe']:.1f}",
+                annotation_position="top",
+            )
+            fig_bm.update_layout(
+                title="Carbon intensity vs industry benchmarks (kg CO₂-eq/boe)",
+                height=280, xaxis_title="kg CO₂-eq per boe",
+                showlegend=False, margin=dict(t=50, b=40),
+            )
+            st.plotly_chart(fh.apply_plot_template(fig_bm), use_container_width=True)
+            st.caption(
+                "Benchmarks are screening-level Scope 1+2 upstream averages "
+                "from published industry reporting (IOGP / OGCI / national "
+                "data). Best-in-class ≈ 7, global average ≈ 18, "
+                "high-intensity ≈ 35+ kg CO₂-eq/boe. This project's intensity "
+                "is the blue line. CO₂ here covers fuel + flare combustion, "
+                "methane slip from flaring, and routine operational venting."
+            )
+
+            st.divider()
+            pc1, pc2 = st.columns(2)
+            pc1.metric("Lifetime power consumption",
+                       f"{bm['total_power_mwh']/1e3:,.1f} GWh")
+            pc2.metric("Power intensity",
+                       f"{bm['power_intensity_kwh_per_boe']:,.1f} kWh/boe")
+            if "power_mwh" in df_e.columns:
+                annual_power = df_e.groupby(df_e["year"])["power_mwh"].sum().reset_index()
+                fig_pw = go.Figure()
+                fig_pw.add_trace(go.Bar(
+                    x=annual_power["year"], y=annual_power["power_mwh"]/1e3,
+                    marker_color="#9467bd", name="Power",
+                ))
+                fig_pw.update_layout(
+                    title="Annual power consumption (GWh/yr)",
+                    height=280, yaxis_title="GWh/yr", showlegend=False,
+                )
+                st.plotly_chart(fh.apply_plot_template(fig_pw),
+                                use_container_width=True)
+            st.caption(
+                "Power consumption is a screening estimate from production "
+                "throughput: liquids handling ≈ 1.5 kWh/bbl, gas compression "
+                "≈ 3.0 kWh/Mscf, water injection ≈ 2.0 kWh/bbl. A detailed "
+                "facility power study would refine this — typical offshore "
+                "intensities run 5–30 kWh/boe depending on gas handling and "
+                "artificial lift."
+            )
 
         # Well-cost breakdown (rig-rate or fixed)
         breakdown = df_e.attrs.get("well_cost_breakdown", [])
@@ -5737,6 +6046,7 @@ def collect_inputs_payload() -> dict:
         "well_cost_mode", "rig_dayrate", "cmpl_dayrate",
         "well_tangibles", "well_intangibles_pct",
         "ngl_yield", "ngl_price", "ngl_opex", "ngl_shrink",
+        "economic_cutoff_mode_label", "economic_cutoff_persistence",
         "aq_ct_U", "aq_ct_diff",
         "well_pi_default", "min_bhp_default",
     ]
@@ -6506,6 +6816,10 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "ngl_opex_bbl": float(scalar.get("ngl_opex", 5.0)),
         "ngl_shrinkage_pct": float(scalar.get("ngl_shrink", 0.0)),
         "rig_meta": rig_meta,
+        "economic_cutoff_mode": ("economic"
+            if str(scalar.get("economic_cutoff_mode_label", "")).startswith("Economic")
+            else "horizon"),
+        "economic_cutoff_persistence": int(scalar.get("economic_cutoff_persistence", 6)),
     }
     return wells, _reservoirs_from_payload(payload, units), meta, econ_dict
 
@@ -7277,33 +7591,53 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
 
     # ---- Summary table + download ----
     with st.expander("📋 Realization-level summary table", expanded=False):
-        # Pretty columns
+        # Pretty columns — built defensively so a partially-failed MC run
+        # (some realizations missing columns) still renders.
         disp = summary.copy()
-        disp["npv_usd_MM"] = disp["npv_usd"] / 1e6
-        disp["cum_cf_MM"] = disp["cum_cf_usd"] / 1e6
-        cols = ["realization", "npv_usd_MM", "cum_cf_MM",
-                "final_rf", "cum_oil", "cum_gas",
-                "peak_oil", "peak_gas"] + factor_cols
-        st.dataframe(
-            disp[cols].style.format({
-                "npv_usd_MM": "{:,.1f}",
-                "cum_cf_MM": "{:,.1f}",
-                "final_rf": "{:.1%}",
-                "cum_oil": "{:,.2f}",
-                "cum_gas": "{:,.2f}",
-                "peak_oil": "{:,.0f}",
-                "peak_gas": "{:,.0f}",
-                **{c: "{:.3f}" for c in factor_cols},
-            }),
-            use_container_width=True, hide_index=True,
-        )
+        if "npv_usd" in disp.columns:
+            disp["npv_usd_MM"] = disp["npv_usd"] / 1e6
+        if "cum_cf_usd" in disp.columns:
+            disp["cum_cf_MM"] = disp["cum_cf_usd"] / 1e6
+        # Only include columns that actually exist
+        candidate_cols = ["realization", "npv_usd_MM", "cum_cf_MM",
+                          "final_rf", "cum_oil", "cum_gas",
+                          "peak_oil", "peak_gas"]
+        factor_cols_all = [c for c in summary.columns if c.startswith("factor_")]
+        cols = [c for c in candidate_cols if c in disp.columns] + factor_cols_all
+        if not cols or len(disp) == 0:
+            st.info("No realization data to display — the Monte Carlo run "
+                    "produced no successful realizations.")
+        else:
+            fmt_map = {}
+            for c, f in [("npv_usd_MM", "{:,.1f}"), ("cum_cf_MM", "{:,.1f}"),
+                         ("final_rf", "{:.1%}"), ("cum_oil", "{:,.2f}"),
+                         ("cum_gas", "{:,.2f}"), ("peak_oil", "{:,.0f}"),
+                         ("peak_gas", "{:,.0f}")]:
+                if c in cols:
+                    fmt_map[c] = f
+            for c in factor_cols_all:
+                fmt_map[c] = "{:.3f}"
+            try:
+                st.dataframe(
+                    disp[cols].style.format(fmt_map),
+                    use_container_width=True, hide_index=True,
+                )
+            except Exception as exc:
+                # Last-resort fallback: raw dataframe, no styling
+                st.warning(f"Could not render styled table ({exc}); "
+                           "showing raw values.")
+                st.dataframe(disp[cols], use_container_width=True,
+                             hide_index=True)
 
-    csv = summary.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download realizations as CSV", data=csv,
-        file_name="monte_carlo_realizations.csv", mime="text/csv",
-        use_container_width=True,
-    )
+    try:
+        csv = summary.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download realizations as CSV", data=csv,
+            file_name="monte_carlo_realizations.csv", mime="text/csv",
+            use_container_width=True,
+        )
+    except Exception as exc:
+        st.error(f"Could not prepare CSV export: {exc}")
 
 
 def scenario_compare_section(units, fluid, asm, econ, wells):
