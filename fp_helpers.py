@@ -2394,6 +2394,28 @@ _ONSHORE_WELLPAD_PER_WELL = 2.5
 _ONSHORE_PIPELINE_PER_KM = 0.7
 _HOST_TIEIN_MOD = 45.0      # host facility modification for a tie-in
 
+# ---- New cost bases (added in v2) ----
+# Flowline thermal insulation — applied per km of insulated line. Driven by
+# wall coating thickness and material; ranges from simple polypropylene
+# coating to pipe-in-pipe (PIP) insulated systems.
+_INSULATION_MMUSD_PER_KM = {
+    "None":                            0.00,
+    "Polypropylene coating (basic)":   0.30,
+    "Multi-layer PP / syntactic":      0.65,
+    "Pipe-in-pipe (PIP)":              1.80,
+}
+# Subsea ancillary elements ($MM each, screening anchors)
+_RISER_BASE_COST = 7.5       # riser base / FRB at the seabed (per riser)
+_SSIV_COST = 4.0             # subsea isolation valve (per item)
+_JUMPER_COST = 1.2           # rigid/flexible jumper between tree & manifold (per item)
+_CONTROL_MODULE_COST = 2.5   # subsea control module (per well — usually 1:1)
+# Topside modification — alternative costing basis when the user prefers
+# weight + manhour decomposition over the lumped $MM number.
+_TOPSIDE_MOD_MMUSD_PER_TONNE = 0.060   # ≈ $60k per installed tonne for offshore mods
+# Offshore manpower — fully-loaded rate for a person-hour on an offshore mod
+# project (engineering + offshore execution blended).
+_OFFSHORE_MANHOUR_USD = 220.0          # ≈ $220/hr fully loaded
+
 
 def _flowline_cost_per_km(diameter_in: float, material: str,
                            water_depth_class: str) -> float:
@@ -2471,9 +2493,15 @@ def build_development_concept(spec: dict) -> dict:
     flowline_km = float(g("flowline_km", 0.0))
     flowline_diam = float(g("flowline_diameter_in", 10.0))
     flowline_material = g("flowline_material", "Carbon steel")
+    flowline_insulation = g("flowline_insulation", "None")
+    insulated_flowline_km = float(g("insulated_flowline_km", 0.0))
     umbilical_km = float(g("umbilical_km", 0.0))
     n_risers = int(g("n_risers", 0))
     riser_type = g("riser_type", "Flexible riser")
+    n_riser_bases = int(g("n_riser_bases", 0))
+    n_ssiv = int(g("n_ssiv", 0))               # subsea isolation valves
+    n_jumpers = int(g("n_jumpers", 0))         # rigid/flexible jumpers
+    n_control_modules = int(g("n_control_modules", 0))   # subsea control modules
     n_boosting = int(g("n_boosting_stations", 0))
     gas_lift = bool(g("gas_lift", False))
     n_gas_lift_wells = int(g("n_gas_lift_wells", 0))
@@ -2482,64 +2510,109 @@ def build_development_concept(spec: dict) -> dict:
     export_pipeline_km = float(g("export_pipeline_km", 0.0))
     export_pipeline_diam = float(g("export_pipeline_diameter_in", 16.0))
     host_distance_km = float(g("host_distance_km", 0.0))
+    # Topside modification by net weight (alternative basis to the lumped
+    # host modification $MM number)
+    topside_mod_tonnes = float(g("topside_mod_tonnes", 0.0))
+    topside_mod_rate_per_tonne_MM = float(g("topside_mod_rate_per_tonne_MM",
+                                              _TOPSIDE_MOD_MMUSD_PER_TONNE))
+    # Offshore manpower (hours × $/hr)
+    offshore_manhours = float(g("offshore_manhours", 0.0))
+    offshore_manhour_rate_usd = float(g("offshore_manhour_rate_usd",
+                                          _OFFSHORE_MANHOUR_USD))
+    # User overrides: a dict keyed by line label → amount_MMUSD that REPLACES
+    # the computed benchmark for that line. This is how the UI lets the user
+    # override any line item while keeping the rest benchmark-driven.
+    overrides = g("cost_overrides") or {}
 
     rows = []          # (offset_days, amount_MMUSD, label)
     warnings = []
     summary = []
 
+    def _push(offset_days, benchmark_amount, label):
+        """Append a cost row, applying any user override on the label."""
+        amt = overrides.get(label, benchmark_amount)
+        if amt is not None and amt > 0:
+            rows.append((offset_days, float(amt), label))
+
     # ---- Component costs --------------------------------------------------
     # Subsea templates / manifolds
     cost_templates = n_templates * _TEMPLATE_COST
-    if cost_templates > 0:
-        rows.append((0, cost_templates,
-                     f"{n_templates} × subsea template/manifold"))
+    _push(0, cost_templates, f"{n_templates} × subsea template/manifold")
 
     # Xmas trees
     cost_wet_trees = n_subsea_wells * _XMAS_TREE_COST["Wet (subsea) tree"]
     cost_dry_trees = n_dry_wells * _XMAS_TREE_COST["Dry (surface) tree"]
-    if cost_wet_trees > 0:
-        rows.append((90, cost_wet_trees,
-                     f"{n_subsea_wells} × wet (subsea) xmas trees"))
-    if cost_dry_trees > 0:
-        rows.append((90, cost_dry_trees,
-                     f"{n_dry_wells} × dry (surface) xmas trees"))
+    _push(90, cost_wet_trees, f"{n_subsea_wells} × wet (subsea) xmas trees")
+    _push(90, cost_dry_trees, f"{n_dry_wells} × dry (surface) xmas trees")
 
-    # Flowlines
+    # Flowlines (base)
     fl_per_km = _flowline_cost_per_km(flowline_diam, flowline_material,
                                        water_depth_class)
     cost_flowline = flowline_km * fl_per_km
-    if cost_flowline > 0:
-        rows.append((180, cost_flowline,
-                     f"Flowline {flowline_km:.0f} km × {flowline_diam:.0f}\" "
-                     f"{flowline_material} (${fl_per_km:.2f}MM/km)"))
+    _push(180, cost_flowline,
+          f"Flowline {flowline_km:.0f} km × {flowline_diam:.0f}\" "
+          f"{flowline_material} (${fl_per_km:.2f}MM/km)")
+
+    # Flowline insulation
+    ins_per_km = _INSULATION_MMUSD_PER_KM.get(flowline_insulation, 0.0)
+    cost_insulation = insulated_flowline_km * ins_per_km
+    _push(180, cost_insulation,
+          f"Flowline insulation: {flowline_insulation} — "
+          f"{insulated_flowline_km:.0f} km @ ${ins_per_km:.2f}MM/km")
+
+    # Riser bases
+    cost_riser_bases = n_riser_bases * _RISER_BASE_COST
+    _push(240, cost_riser_bases,
+          f"{n_riser_bases} × riser base / FRB (${_RISER_BASE_COST:.1f}MM each)")
+
+    # Subsea ancillaries: SSIVs, jumpers, control modules
+    cost_ssiv = n_ssiv * _SSIV_COST
+    _push(240, cost_ssiv,
+          f"{n_ssiv} × subsea isolation valve (${_SSIV_COST:.1f}MM each)")
+    cost_jumpers = n_jumpers * _JUMPER_COST
+    _push(240, cost_jumpers,
+          f"{n_jumpers} × subsea jumper (${_JUMPER_COST:.1f}MM each)")
+    cost_scm = n_control_modules * _CONTROL_MODULE_COST
+    _push(240, cost_scm,
+          f"{n_control_modules} × subsea control module "
+          f"(${_CONTROL_MODULE_COST:.1f}MM each)")
+
+    # Topside modification by net weight
+    cost_topside_weight = topside_mod_tonnes * topside_mod_rate_per_tonne_MM
+    _push(330, cost_topside_weight,
+          f"Topside modification — {topside_mod_tonnes:,.0f} tonnes "
+          f"× ${topside_mod_rate_per_tonne_MM*1000:.0f}k/tonne")
+
+    # Offshore manpower (manhours × rate)
+    cost_manpower = (offshore_manhours * offshore_manhour_rate_usd) / 1e6
+    _push(360, cost_manpower,
+          f"Offshore manpower — {offshore_manhours:,.0f} hrs "
+          f"× ${offshore_manhour_rate_usd:.0f}/hr")
 
     # Umbilicals
     cost_umbilical = umbilical_km * _UMBILICAL_MMUSD_PER_KM
-    if cost_umbilical > 0:
-        rows.append((180, cost_umbilical,
-                     f"Umbilical {umbilical_km:.0f} km "
-                     f"(${_UMBILICAL_MMUSD_PER_KM:.1f}MM/km)"))
+    _push(180, cost_umbilical,
+          f"Umbilical {umbilical_km:.0f} km "
+          f"(${_UMBILICAL_MMUSD_PER_KM:.1f}MM/km)")
 
     # Risers
     riser_unit = _RISER_COST.get(riser_type, 15.0)
     cost_risers = n_risers * riser_unit
-    if cost_risers > 0:
-        rows.append((270, cost_risers,
-                     f"{n_risers} × {riser_type} (${riser_unit:.0f}MM each)"))
+    _push(270, cost_risers,
+          f"{n_risers} × {riser_type} (${riser_unit:.0f}MM each)")
 
     # Subsea boosting
     cost_boosting = n_boosting * _BOOSTING_STATION_COST
-    if cost_boosting > 0:
-        rows.append((300, cost_boosting,
-                     f"{n_boosting} × subsea boosting station "
-                     f"(${_BOOSTING_STATION_COST:.0f}MM each)"))
+    _push(300, cost_boosting,
+          f"{n_boosting} × subsea boosting station "
+          f"(${_BOOSTING_STATION_COST:.0f}MM each)")
 
     # Gas lift
     cost_gas_lift = 0.0
     if gas_lift:
         cost_gas_lift = _GAS_LIFT_BASE_COST + n_gas_lift_wells * _GAS_LIFT_PER_WELL
-        rows.append((300, cost_gas_lift,
-                     f"Gas-lift system ({n_gas_lift_wells} wells)"))
+        _push(300, cost_gas_lift,
+              f"Gas-lift system ({n_gas_lift_wells} wells)")
 
     # Heating
     cost_heating = 0.0
@@ -2554,8 +2627,7 @@ def build_development_concept(spec: dict) -> dict:
         else:
             cost_heating = _HEATING_SYSTEM_COST.get(heating_type, 0.0)
             heat_label = heating_type
-        if cost_heating > 0:
-            rows.append((300, cost_heating, heat_label))
+        _push(300, cost_heating, heat_label)
 
     # ---- Concept-type-specific costs --------------------------------------
     cost_host_or_platform = 0.0
@@ -2567,17 +2639,15 @@ def build_development_concept(spec: dict) -> dict:
     if concept_type == "Subsea tie-in":
         # Host facility modifications
         cost_host_or_platform = _HOST_TIEIN_MOD
-        rows.append((0, cost_host_or_platform,
-                     "Host facility modifications (tie-in)"))
+        _push(0, cost_host_or_platform, "Host facility modifications (tie-in)")
         # Installation — heavy for subsea
         cost_install = 0.30 * (cost_templates + cost_flowline + cost_umbilical
                                + cost_risers + cost_wet_trees)
-        rows.append((360, cost_install,
-                     "Installation + hook-up + commissioning"))
+        _push(360, cost_install, "Installation + hook-up + commissioning")
         # Tie-in spool / connection at the host
         if host_distance_km > 0:
             tie_spool = 8.0 + 0.15 * host_distance_km
-            rows.append((330, tie_spool, "Tie-in spool + host connection"))
+            _push(330, tie_spool, "Tie-in spool + host connection")
 
     else:  # Standalone
         host_type = g("host_type", "Fixed steel jacket (shallow)")
@@ -2586,27 +2656,24 @@ def build_development_concept(spec: dict) -> dict:
             n_total_wells = int(g("n_total_wells",
                                    n_dry_wells + n_subsea_wells))
             cost_topsides = cap_kboed * _CPF_PER_KBOED
-            rows.append((120, cost_topsides,
-                         f"Central processing facility "
-                         f"({cap_kboed:.0f} kboe/d)"))
+            _push(120, cost_topsides,
+                  f"Central processing facility ({cap_kboed:.0f} kboe/d)")
             cost_onshore_extra = n_total_wells * _ONSHORE_WELLPAD_PER_WELL
-            rows.append((0, cost_onshore_extra,
-                         f"Well pads + access roads ({n_total_wells} wells)"))
+            _push(0, cost_onshore_extra,
+                  f"Well pads + access roads ({n_total_wells} wells)")
             cost_install = 0.18 * cost_topsides
-            rows.append((400, cost_install,
-                         "Construction + commissioning"))
+            _push(400, cost_install, "Construction + commissioning")
         else:
             cost_host_or_platform = _PLATFORM_BASE.get(host_type, 380.0)
-            rows.append((0, cost_host_or_platform * 0.4,
-                         f"{host_type} — fabrication milestone 1"))
-            rows.append((365, cost_host_or_platform * 0.6,
-                         f"{host_type} — fabrication milestone 2"))
+            _push(0, cost_host_or_platform * 0.4,
+                  f"{host_type} — fabrication milestone 1")
+            _push(365, cost_host_or_platform * 0.6,
+                  f"{host_type} — fabrication milestone 2")
             cost_topsides = cap_kboed * _TOPSIDES_PER_KBOED
-            rows.append((300, cost_topsides,
-                         f"Topsides + processing ({cap_kboed:.0f} kboe/d)"))
+            _push(300, cost_topsides,
+                  f"Topsides + processing ({cap_kboed:.0f} kboe/d)")
             cost_install = 0.22 * (cost_host_or_platform + cost_topsides)
-            rows.append((540, cost_install,
-                         "Installation + hook-up + commissioning"))
+            _push(540, cost_install, "Installation + hook-up + commissioning")
         # Export pipeline (offshore or onshore)
         if export_pipeline_km > 0:
             exp_per_km = _flowline_cost_per_km(export_pipeline_diam,
@@ -2616,9 +2683,9 @@ def build_development_concept(spec: dict) -> dict:
                                                 "Onshore central processing facility (CPF)"
                                                 else "Shallow (<150 m)")
             cost_export = export_pipeline_km * exp_per_km
-            rows.append((420, cost_export,
-                         f"Export pipeline {export_pipeline_km:.0f} km × "
-                         f"{export_pipeline_diam:.0f}\""))
+            _push(420, cost_export,
+                  f"Export pipeline {export_pipeline_km:.0f} km × "
+                  f"{export_pipeline_diam:.0f}\"")
 
     # ---- Cessation / P&A --------------------------------------------------
     capex_excl_cessation = sum(r[1] for r in rows)
@@ -3198,3 +3265,488 @@ def build_project_schedule(spec: dict, feed_start, durations: dict,
         "benchmark_key": bench_key,
         "benchmark": bench,
     }
+
+
+# =============================================================================
+# Documentation catalogue + live unit-conversion checks
+# =============================================================================
+# Two things in this section:
+#  1. FEATURE_DOCS — a structured catalogue of every feature, what it does,
+#     and the units it expects. Rendered as in-app reference docs.
+#  2. run_unit_checks() — a live self-test that exercises every unit
+#     conversion (round-trip + known-equivalence) so unit bugs are caught
+#     immediately rather than silently producing wrong numbers.
+
+FEATURE_DOCS = [
+    {
+        "category": "Production engine",
+        "items": [
+            {
+                "name": "Multi-rig drilling schedule",
+                "description":
+                    "Each producer and injector is assigned to a named rig. "
+                    "Wells on the same rig are drilled sequentially: "
+                    "spud → drill → complete → next well spuds. Rigs have "
+                    "their own available-from date, move-in / move-out days, "
+                    "and an annual maintenance allowance that introduces "
+                    "proportional gaps between wells.",
+                "inputs": [
+                    ("Rig start date", "calendar date", "When the rig is available."),
+                    ("Move-in days",   "days",          "Mobilization before first spud."),
+                    ("Move-out days",  "days",          "Demobilization after last well."),
+                    ("Maintenance days/year", "days/yr", "Annual rig downtime."),
+                    ("Rig day rate",   "$k/day",        "Drives move-in/out + maintenance cost (and rig-rate well costing)."),
+                ],
+            },
+            {
+                "name": "Per-well decline & water-cut",
+                "description":
+                    "Exponential / Harmonic / Hyperbolic Arps decline applied "
+                    "post-plateau, with a per-well water-cut ramp from initial "
+                    "to final WC over a ramp period. Wells abandon when their "
+                    "rate falls below the field-level abandonment threshold "
+                    "or the field water-cut exceeds the abandonment WC.",
+                "inputs": [
+                    ("qi_primary",  "stb/d or Mscf/d",    "Initial primary-phase rate (display in user units)."),
+                    ("qi_secondary","Mscf/d or stb/d",    "Initial secondary-phase rate."),
+                    ("di_annual",   "fraction/year",      "Decline rate (0.20 = 20%/yr)."),
+                    ("b_factor",    "dimensionless",      "Arps b-exponent (0 exp, 1 harm, 0.5 hyp typical)."),
+                    ("wc_initial / wc_final", "fraction", "Water-cut ramp endpoints (0.05 = 5%)."),
+                    ("wc_ramp_months", "months",          "Months from initial to final WC."),
+                    ("uptime",      "fraction",           "Per-well uptime (0.95 = 95%)."),
+                ],
+            },
+            {
+                "name": "PVT-aware MBE (material balance)",
+                "description":
+                    "Tank material-balance pressure tracking with Standing-Vasquez-Beggs "
+                    "correlations for Bo, Bg, μo, Rs. Supports Pot / Fetkovich / "
+                    "Carter-Tracy aquifers, gas-cap drive, and multi-reservoir "
+                    "fluid accounting.",
+                "inputs": [
+                    ("p_init",   "psi",   "Initial reservoir pressure."),
+                    ("t_res",    "°F",    "Reservoir temperature."),
+                    ("api",      "°API",  "Stock-tank oil gravity."),
+                    ("gas_sg",   "air=1", "Gas specific gravity."),
+                    ("rsi",      "scf/stb","Initial solution GOR."),
+                    ("p_bub",    "psi",   "Bubble-point pressure."),
+                    ("ooip / ogip", "MMstb / Bscf", "Oil/gas in place."),
+                ],
+            },
+            {
+                "name": "Surface capacity schedule (time-varying)",
+                "description":
+                    "Step-changing facility constraints over time: oil/gas/water/"
+                    "liquid capacities, plus injection capacities and a per-row "
+                    "production-efficiency factor. Wells are choked back when "
+                    "any capacity is binding.",
+                "inputs": [
+                    ("start_date", "calendar date", "Step starts on this date."),
+                    ("oil/gas/water/liquid", "stb/d or Mscf/d", "Surface capacity for each phase."),
+                    ("water_inj / gas_inj",  "stb/d or Mscf/d", "Injection capacity."),
+                    ("prod_eff",   "fraction",     "Time-varying production efficiency (0.95 = 95% on-stream)."),
+                ],
+            },
+        ],
+    },
+    {
+        "category": "Economics",
+        "items": [
+            {
+                "name": "Revenue / OPEX / CAPEX / Tax & Royalty",
+                "description":
+                    "Monthly cashflow built from production × prices, minus "
+                    "royalty (on gross revenue), tariffs (per-bbl / per-MMBtu), "
+                    "variable + fixed OPEX, well CAPEX, phased facility CAPEX, "
+                    "tax on positive pre-tax CF, and abandonment booked at "
+                    "field shut-in. PSC fiscal regime available as an "
+                    "alternative.",
+                "inputs": [
+                    ("oil_price",  "$/bbl",   "Always $/bbl regardless of unit system."),
+                    ("gas_price",  "$/MMBtu", "Always $/MMBtu (= $/Mscf with default heating value)."),
+                    ("opex_var",   "$/bbl",   "Variable OPEX per barrel of primary production."),
+                    ("opex_fixed", "$MM/yr",  "Fixed annual OPEX."),
+                    ("tariff_oil / tariff_gas", "$/bbl / $/MMBtu", "Processing / transport tariffs."),
+                    ("royalty_rate / tax_rate", "fraction", "0.10 = 10%."),
+                    ("discount_rate", "fraction/yr", "Annual discount rate (compounded monthly)."),
+                    ("abandonment_cost", "$MM", "Cessation / P&A lump sum."),
+                ],
+            },
+            {
+                "name": "Economic limit / cessation timing",
+                "description":
+                    "Two modes for when the field stops producing:\n"
+                    "(a) **Horizon mode** — produce through the full forecast; "
+                    "abandonment booked at the last producing month.\n"
+                    "(b) **Economic mode** — engine finds the month after which "
+                    "monthly operating cashflow (revenue − royalty − tariff − "
+                    "OPEX) stays negative for N consecutive months, shuts the "
+                    "field in there, and books cessation at that month. This is "
+                    "the self-consistent way to define field life — you don't "
+                    "produce at a loss.",
+                "inputs": [
+                    ("economic_cutoff_mode", "horizon | economic", "Cutoff style."),
+                    ("persistence", "months", "Consecutive negative-CF months required (6-12 typical)."),
+                ],
+            },
+            {
+                "name": "Pre-FOP investment timeline",
+                "description":
+                    "Facility CAPEX dated before production start is no longer "
+                    "collapsed into month 0. The economics dataframe prepends "
+                    "zero-production months back to the earliest investment "
+                    "date, with each pre-FOP CAPEX tranche booked in the "
+                    "correct month. NPV is then discounted from the first "
+                    "investment date — not from first oil.",
+                "inputs": [
+                    ("date", "calendar date", "Spend date; can be before start_date."),
+                    ("amount_MMUSD", "$MM", "Tranche amount."),
+                ],
+            },
+            {
+                "name": "Minimum economical volume + robustness case",
+                "description":
+                    "Bisection solver that scales the whole production profile "
+                    "by a multiplier to find either:\n"
+                    "(a) **Min economical volume** — the multiplier at which "
+                    "NPV = 0. Reports the headroom (how far production can "
+                    "drop before the project goes negative).\n"
+                    "(b) **Robustness case** — the multiplier at which the "
+                    "project's breakeven oil price equals a user-specified "
+                    "floor. Tells you how much volume you need so the project "
+                    "stays economic down to a given price.\n"
+                    "All volumes reported in **MMBOE** (oil 1:1, gas at 6 Mscf/boe).",
+                "inputs": [
+                    ("target_npv", "$",       "Target NPV (default 0)."),
+                    ("target_breakeven", "$/bbl", "Price floor for robustness mode."),
+                ],
+            },
+            {
+                "name": "CO2 emissions, intensity & power",
+                "description":
+                    "Engine tracks fuel + flare combustion CO2, methane slip "
+                    "from flaring, and routine venting (tonnes/month). "
+                    "Lifetime intensity (kg CO2-eq/boe) is benchmarked against "
+                    "published industry averages (best-in-class ≈ 7, global "
+                    "average ≈ 18, high-intensity ≈ 35+). Power consumption is "
+                    "a screening estimate: liquids handling 1.5 kWh/bbl, gas "
+                    "compression 3.0 kWh/Mscf, water injection 2.0 kWh/bbl. "
+                    "Both shown lifetime, annual, and intensity-per-boe.",
+                "inputs": [],
+            },
+        ],
+    },
+    {
+        "category": "Development concept builder",
+        "items": [
+            {
+                "name": "Concept costing engine",
+                "description":
+                    "Screening-grade CAPEX engine driven by engineering "
+                    "parameters: concept type (subsea tie-in vs standalone), "
+                    "host type (jacket / CGS / compliant tower / jack-up / "
+                    "FPSO / semi / spar / TLP / onshore CPF), water depth "
+                    "class, templates, wells (wet/dry trees), flowline length / "
+                    "diameter / material, umbilical, risers (flexible / SCR / "
+                    "TTR / hybrid), subsea boosting, gas lift, flow assurance "
+                    "(EHTF / DEH / hot-water), and export pipeline.",
+                "inputs": [
+                    ("flowline_diameter_in", "inches", "Nominal bore (6-30\" screening range)."),
+                    ("flowline_km", "km",   "Length of in-field / tie-back flowline."),
+                    ("processing_capacity_kboed", "thousand boe/d", "Topsides / CPF sizing basis."),
+                    ("host_distance_km", "km", "Tie-back distance (subsea tie-in only)."),
+                ],
+                "cost_bases": [
+                    ("Flowline (carbon steel)", "$0.9 - $6.5MM/km", "6\" - 30\" diameter, interpolated."),
+                    ("Flowline material multipliers", "1.00 / 1.85 / 3.20 / 2.40", "CS / CRA-clad / solid CRA / flexible."),
+                    ("Water-depth multipliers", "1.00 / 1.30 / 1.70 / 2.20", "shallow / mid / deep / ultra-deep."),
+                    ("Wet (subsea) tree", "$9MM each", ""),
+                    ("Dry (surface) tree", "$1.8MM each", ""),
+                    ("Subsea template", "$45MM each", ""),
+                    ("Risers", "$12 / $18 / $25 / $35MM", "flexible / SCR / TTR / hybrid."),
+                    ("Umbilical", "$1.6MM/km", ""),
+                    ("Subsea boosting station", "$75MM each", ""),
+                    ("Gas lift system", "$25MM + $1.2MM/well", ""),
+                    ("Topsides", "$6.5MM per kboe/d", "scales with processing capacity."),
+                    ("Onshore CPF", "$3.2MM per kboe/d", ""),
+                    ("Cessation", "10% of CAPEX + 15% of subsea + 5% of host", "minimum $10MM."),
+                ],
+            },
+            {
+                "name": "Engineering sanity checks",
+                "description":
+                    "Warnings fire when the concept is internally inconsistent: "
+                    "fixed structure in deep water, FPSO in shallow water, "
+                    "subsea wells with no risers, tie-back > 50 km, boosting "
+                    "on a very short flowline, heating selected with 0 km of "
+                    "heated line, flowline diameter outside 6-30\" range.",
+                "inputs": [],
+            },
+        ],
+    },
+    {
+        "category": "Project schedule builder",
+        "items": [
+            {
+                "name": "Milestone timeline",
+                "description":
+                    "Builds a dated milestone schedule from FEED start: "
+                    "FEED → DG3/sanction → long-lead items → fabrication → "
+                    "installation → hookup & commissioning → first oil. "
+                    "Long-lead and fabrication overlap is configurable. "
+                    "Defaults are concept-aware: subsea tie-in ~4 years, "
+                    "onshore CPF ~5 years, fixed platform ~6-7 years, "
+                    "floating host ~8-9 years FEED-to-first-oil at typical "
+                    "durations.",
+                "inputs": [
+                    ("FEED duration",         "months", "Engineering definition phase."),
+                    ("Long-lead duration",    "months", "FPSO hull, jacket steel, subsea trees."),
+                    ("Fabrication duration",  "months", "Main EPC build phase."),
+                    ("Installation duration", "months", "Offshore campaign."),
+                    ("Hookup & comm. duration","months","Mechanical completion to first oil."),
+                    ("Long-lead/fab overlap", "months", "0 = sequential; 6-12 typical."),
+                ],
+            },
+            {
+                "name": "Realism checks",
+                "description":
+                    "Every phase duration is checked against the concept's "
+                    "industry benchmark range. Warnings fire for: aggressive "
+                    "(below min) or conservative (above max) durations; "
+                    "total schedule < 60% of benchmark total; overlap > "
+                    "long-lead duration; long tie-back (>30 km) with <6 "
+                    "months installation.",
+                "inputs": [],
+            },
+        ],
+    },
+    {
+        "category": "Sensitivity & Monte Carlo",
+        "items": [
+            {
+                "name": "Tornado sensitivity",
+                "description":
+                    "Each driver (prices, OPEX, CAPEX, decline, water cut, "
+                    "etc.) is varied independently between low and high "
+                    "multipliers; NPV impact is ranked. Output is a tornado "
+                    "chart with the largest drivers at the top.",
+                "inputs": [],
+            },
+            {
+                "name": "Monte Carlo",
+                "description":
+                    "N realizations sampled from per-driver distributions "
+                    "(triangular / uniform / normal). Produces P10/P50/P90 "
+                    "fans for rate, RF, NPV; reserves distribution histograms "
+                    "(cum oil/gas + RF); driver-vs-NPV correlation bars; "
+                    "optional sampled-input distribution snapshots; full "
+                    "parameter correlation matrix heatmap.",
+                "inputs": [
+                    ("n_realizations", "count", "Number of MC runs (200-2000 typical)."),
+                    ("seed", "integer", "RNG seed for reproducibility."),
+                ],
+            },
+        ],
+    },
+    {
+        "category": "Case management & batch",
+        "items": [
+            {
+                "name": "Case save / load / duplicate / diff",
+                "description":
+                    "Cases persist as JSON files in ~/.field_prognosis_cases. "
+                    "The case manager handles save, load, duplicate, delete, "
+                    "and side-by-side diff of any two cases (scalar inputs, "
+                    "table sizes, last-summary KPIs).",
+                "inputs": [],
+            },
+            {
+                "name": "YAML import / export",
+                "description":
+                    "Human-readable YAML format mirroring the internal payload "
+                    "structure (`scalar:` + `tables:` sections). Tables in "
+                    "list-of-row-dicts form for readability. Export the "
+                    "current case or import a YAML file; validation warnings "
+                    "flag unknown table names, missing required columns, and "
+                    "suspicious values.",
+                "inputs": [],
+            },
+            {
+                "name": "Batch mode",
+                "description":
+                    "Multi-case YAML (`cases:` list) runs every case through "
+                    "the full engine. Results table shows KPIs per case; "
+                    "exports as CSV or as an API-style JSON payload "
+                    "(`schema_version`, `generated_at`, `n_cases`, `n_ok`, "
+                    "`cases[]` with per-case `kpis`).",
+                "inputs": [],
+            },
+            {
+                "name": "Scenario comparison",
+                "description":
+                    "Pick 2+ saved cases; runs each, then shows a summary "
+                    "table and a Δ table (ΔNPV, ΔBreakeven, ΔCost, ΔCum "
+                    "production) vs the first/reference case, color-coded "
+                    "green/red.",
+                "inputs": [],
+            },
+        ],
+    },
+]
+
+
+# Unit-conversion reference table for the docs UI. Each row: (kind, field
+# label, metric label, conversion factor M→F, equivalence example).
+UNIT_REFERENCE_TABLE = [
+    ("oil_rate",   "stb/d",   "Sm³/d",   6.2898,
+     "1 Sm³/d = 6.2898 stb/d (oil & water)"),
+    ("gas_rate",   "Mscf/d",  "kSm³/d",  35.3147,
+     "1 kSm³/d = 35.3147 Mscf/d"),
+    ("oil_vol",    "MMstb",   "MSm³",    6.2898,
+     "1 MSm³ = 6.2898 MMstb"),
+    ("gas_vol",    "Bscf",    "GSm³",    35.3147,
+     "1 GSm³ = 35.3147 Bscf"),
+    ("pressure",   "psi",     "bar",     14.5038,
+     "1 bar = 14.5038 psi"),
+    ("temp",       "°F",      "°C",      None,
+     "T(°F) = T(°C)×9/5 + 32"),
+    ("depth",      "ft",      "m",       3.28084,
+     "1 m = 3.28084 ft"),
+    ("gor",        "scf/stb", "Sm³/Sm³", 5.6146,
+     "1 Sm³/Sm³ = 5.6146 scf/stb"),
+    ("price_oil",  "$/bbl",   "$/Sm³",   1.0/6.2898,
+     "1 $/Sm³ = 0.159 $/bbl  (gross-up by 6.29)"),
+    ("price_gas",  "$/Mscf",  "$/kSm³",  1.0/35.3147,
+     "1 $/kSm³ = 0.0283 $/Mscf  (gross-up by 35.3)"),
+]
+
+
+# Additional fixed conversion factors used elsewhere in the engine
+ENGINE_CONSTANTS = [
+    ("BOE conversion",      "6 Mscf gas = 1 boe",
+     "Industry-standard energy-equivalence. Used by the MEV solver "
+     "and CO2 intensity benchmarking."),
+    ("MMBtu per Mscf",      "1 Mscf ≈ 1 MMBtu",
+     "Default heating-value assumption — gas price input as $/MMBtu "
+     "is treated as $/Mscf internally. Override if working with "
+     "non-standard heating values."),
+    ("Stock-tank barrel",   "1 stb = 5.615 cu ft",
+     "Standard oil-industry definition."),
+    ("Months per year",     "12 (calendar) ; 30.4375 days/month for schedule arithmetic", ""),
+    ("Discount-rate basis", "Annual rate compounded monthly: r_m = (1+r_y)^(1/12) − 1", ""),
+    ("Power intensities",   "Liquids 1.5 kWh/bbl, gas 3.0 kWh/Mscf, water-inj 2.0 kWh/bbl",
+     "Screening assumptions; offshore facilities typically 5-30 kWh/boe."),
+]
+
+
+def run_unit_checks(to_field_fn, from_field_fn) -> list[dict]:
+    """Live self-test of every unit conversion.
+
+    Exercises round-trip (field → metric → field), forward conversions
+    against the published reference equivalences, and engine-internal
+    invariants. Returns a list of result dicts ready for tabular display:
+
+        [{check: str, expected: str, got: str, status: "OK" | "FAIL"}]
+
+    `to_field_fn` and `from_field_fn` are passed in because the actual
+    conversion functions live in field_prognosis_app.py, not here — this
+    avoids a circular import and means the docs verify the live functions.
+    """
+    results = []
+
+    def _record(check, expected, got, ok):
+        results.append({
+            "check": check,
+            "expected": str(expected),
+            "got": str(got),
+            "status": "OK" if ok else "FAIL",
+        })
+
+    # ---- Round-trip checks: field → metric → field for every kind --------
+    test_values = {
+        "oil_rate":   5000.0,
+        "gas_rate":   100.0,
+        "water_rate": 8000.0,
+        "oil_vol":    50.0,
+        "gas_vol":    25.0,
+        "water_vol":  120.0,
+        "pressure":   3000.0,
+        "temp":       180.0,
+        "depth":      8000.0,
+        "gor":        700.0,
+        "price_oil":  75.0,
+        "price_gas":  3.5,
+    }
+    for kind, field_val in test_values.items():
+        metric = from_field_fn(field_val, kind, "metric")
+        field_back = to_field_fn(metric, kind, "metric")
+        ok = abs(field_back - field_val) < 1e-6 * max(1.0, abs(field_val))
+        _record(f"Round-trip {kind}", f"{field_val}",
+                f"{field_val} → {metric:.4f} → {field_back:.4f}", ok)
+
+    # ---- Known forward equivalences --------------------------------------
+    # 1 bar → 14.5038 psi (going metric→field)
+    got = to_field_fn(1.0, "pressure", "metric")
+    _record("1 bar = X psi", 14.5038, f"{got:.4f}", abs(got - 14.5038) < 1e-3)
+    # 1 Sm³/d → 6.2898 stb/d
+    got = to_field_fn(1.0, "oil_rate", "metric")
+    _record("1 Sm³/d = X stb/d", 6.2898, f"{got:.4f}",
+            abs(got - 6.2898) < 1e-3)
+    # 1 kSm³/d → 35.3147 Mscf/d
+    got = to_field_fn(1.0, "gas_rate", "metric")
+    _record("1 kSm³/d = X Mscf/d", 35.3147, f"{got:.4f}",
+            abs(got - 35.3147) < 1e-3)
+    # 1 m → 3.28084 ft
+    got = to_field_fn(1.0, "depth", "metric")
+    _record("1 m = X ft", 3.28084, f"{got:.5f}",
+            abs(got - 3.28084) < 1e-4)
+    # Temperature: 0°C = 32°F, 100°C = 212°F
+    _record("0 °C = X °F", 32, f"{to_field_fn(0, 'temp', 'metric')}",
+            to_field_fn(0, "temp", "metric") == 32)
+    _record("100 °C = X °F", 212, f"{to_field_fn(100, 'temp', 'metric')}",
+            to_field_fn(100, "temp", "metric") == 212)
+    # In field mode, conversions are identity
+    _record("Field-mode identity (oil_rate)",
+            "5000 → 5000", f"{to_field_fn(5000, 'oil_rate', 'field')}",
+            to_field_fn(5000, "oil_rate", "field") == 5000)
+
+    # ---- BOE conversion -------------------------------------------------
+    # 6 Mscf gas + 1 stb oil = 2 boe
+    boe = 1.0 + 6.0 / 6.0
+    _record("BOE: 1 stb oil + 6 Mscf gas", 2.0, f"{boe:.2f}",
+            abs(boe - 2.0) < 1e-9)
+    # 6000 Mscf gas alone = 1000 boe
+    boe2 = 6000.0 / 6.0
+    _record("BOE: 6000 Mscf gas alone", 1000.0, f"{boe2:.1f}",
+            abs(boe2 - 1000.0) < 1e-6)
+
+    # ---- Discount rate ---------------------------------------------------
+    r_y = 0.10
+    r_m = (1 + r_y) ** (1.0/12.0) - 1
+    annualized = (1 + r_m) ** 12 - 1
+    _record("Discount rate: 10%/yr → monthly → annualized round-trip",
+            r_y, f"{annualized:.6f}",
+            abs(annualized - r_y) < 1e-9)
+
+    # ---- Price-volume invariance ----------------------------------------
+    # Revenue must be unit-system-invariant: oil_price × volume should be the
+    # same dollar amount whether computed in field or metric.
+    # Field: 5000 stb/d × 30 days × $75/bbl = $11.25 MM/month
+    field_rev = 5000.0 * 30.0 * 75.0
+    # Metric: convert rate to Sm³/d, price to $/Sm³, multiply.
+    rate_metric = from_field_fn(5000.0, "oil_rate", "metric")
+    price_metric = from_field_fn(75.0, "price_oil", "metric")
+    metric_rev = rate_metric * 30.0 * price_metric
+    _record("Revenue invariance (field vs metric)",
+            f"${field_rev:,.0f}",
+            f"${metric_rev:,.0f}",
+            abs(field_rev - metric_rev) / field_rev < 1e-6)
+
+    return results
+
+
+def unit_checks_summary(results: list[dict]) -> tuple[int, int]:
+    """Return (n_passed, n_total) from a unit-check results list."""
+    n_total = len(results)
+    n_passed = sum(1 for r in results if r["status"] == "OK")
+    return n_passed, n_total

@@ -454,13 +454,30 @@ class EconInputs:
     co2_factor_flare_inefficiency: float = 0.02  # methane slip (CH4 has 28× GWP100)
     co2_factor_oil_routine: float = 0.5   # kg CO2-eq per bbl oil produced (vented + ops)
     # ---- Fiscal regime ----
-    fiscal_regime: str = "Tax/Royalty"   # or "PSC"
+    fiscal_regime: str = "Tax/Royalty"   # or "PSC" or "NCS"
     # PSC parameters (only used when fiscal_regime == "PSC")
     psc_cost_recovery_ceiling: float = 0.50  # max share of revenue recoverable per period
     psc_profit_oil_share_contractor: float = 0.40  # contractor's share of profit oil
     psc_govt_participation: float = 0.0   # carried equity (0 = no, 0.20 = 20%)
     psc_psc_tax_rate: float = 0.30         # tax on contractor's profit oil share
     psc_signature_bonus_MM: float = 0.0    # one-off, paid at first month
+    # NCS parameters (only used when fiscal_regime == "NCS")
+    # Norwegian Continental Shelf petroleum-tax regime: CIT + Special
+    # Petroleum Tax with an "uplift" capital allowance.
+    ncs_cit_rate: float = 0.22             # corporate income tax 22%
+    ncs_spt_rate: float = 0.718            # special petroleum tax 71.8%
+    ncs_uplift_rate: float = 0.1769        # uplift allowance: 17.69% × capex
+                                            # in year of spend, deducted from
+                                            # the SPT base only
+    # ---- Money basis: nominal vs real ----
+    # "real":    costs & revenues kept in today's $ (no inflation applied);
+    #            discount_rate is interpreted as a REAL discount rate.
+    # "nominal": all future cashflows are escalated by `inflation_rate`/yr;
+    #            discount_rate is interpreted as a NOMINAL discount rate.
+    # The two are economically equivalent if discount_rate_nom = (1 + r_real)
+    # × (1 + infl) − 1, but reporting in real $ is usually cleaner.
+    money_basis: str = "real"
+    inflation_rate: float = 0.025          # annual, applied if money_basis == "nominal"
     # ---- Well cost model ----
     # Two modes for capex_per_well:
     #   "fixed": classic $MM/well number (legacy behavior; uses capex_per_well above)
@@ -1744,10 +1761,31 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["cum_cashflow"] = cf.cumsum()
         df_e["cum_co2_tonnes"] = co2_total_t.cumsum()
     else:
-        # Standard Tax/Royalty
+        # Standard Tax/Royalty OR NCS (Norwegian Continental Shelf)
+        ncs = (regime == "NCS")
         pretax = net_revenue - opex - capex - aban_cost - co2_cost
-        tax = np.where(pretax > 0, pretax * econ.tax_rate, 0.0)
-        cf = pretax - tax
+        if ncs:
+            # NCS regime (screening simplification):
+            # - Corporate income tax (CIT): 22% on positive pre-tax CF
+            # - Special petroleum tax (SPT): 71.8% on positive pre-tax CF
+            #   AFTER an "uplift" allowance — an extra deduction = uplift_rate
+            #   × investment, booked in the year of the investment, that
+            #   reduces the SPT base only.
+            # Defaults follow current NCS rules; both rates and the uplift
+            # are configurable via EconInputs.ncs_* fields.
+            cit_rate = float(getattr(econ, "ncs_cit_rate", 0.22))
+            spt_rate = float(getattr(econ, "ncs_spt_rate", 0.718))
+            uplift_rate = float(getattr(econ, "ncs_uplift_rate", 0.1769))
+            # Uplift is computed on facility + well CAPEX in the year of spend
+            uplift = uplift_rate * (capex_well + capex_fac)
+            cit = np.where(pretax > 0, pretax * cit_rate, 0.0)
+            spt_base = pretax - uplift
+            spt = np.where(spt_base > 0, spt_base * spt_rate, 0.0)
+            tax = cit + spt
+            cf = pretax - tax
+        else:
+            tax = np.where(pretax > 0, pretax * econ.tax_rate, 0.0)
+            cf = pretax - tax
 
         df_e = df.copy()
         df_e["revenue_oil"] = rev_oil
@@ -1766,9 +1804,33 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["power_mwh"] = power_mwh
         df_e["co2_cost"] = co2_cost
         df_e["tax"] = tax
+        if ncs:
+            df_e["ncs_cit"] = cit
+            df_e["ncs_spt"] = spt
+            df_e["ncs_uplift"] = uplift
         df_e["cashflow"] = cf
         df_e["cum_cashflow"] = cf.cumsum()
         df_e["cum_co2_tonnes"] = co2_total_t.cumsum()
+    # ---- Money basis (nominal vs real) ----
+    # In "nominal" mode, every monthly cashflow column is escalated by the
+    # inflation rate compounded monthly. In "real" mode this is a no-op.
+    money_basis = getattr(econ, "money_basis", "real")
+    inflation_rate = float(getattr(econ, "inflation_rate", 0.0))
+    if money_basis == "nominal" and inflation_rate > 0:
+        infl_m = (1 + inflation_rate) ** (1.0/12.0) - 1
+        infl_factor = (1 + infl_m) ** np.arange(len(df_e))
+        # Apply to every dollar-denominated column so internal consistency holds
+        for col in ["revenue", "revenue_oil", "revenue_gas",
+                    "revenue_condensate", "revenue_ngl", "royalty", "tariff",
+                    "opex", "capex_well", "capex_facility", "abandonment",
+                    "tax", "co2_cost", "ncs_cit", "ncs_spt", "ncs_uplift"]:
+            if col in df_e.columns:
+                df_e[col] = df_e[col].values * infl_factor
+        # Rebuild cashflow + cum_cashflow from the inflated columns
+        if "cashflow" in df_e.columns:
+            df_e["cashflow"] = df_e["cashflow"].values * infl_factor
+            df_e["cum_cashflow"] = df_e["cashflow"].cumsum()
+
     r_m = (1 + econ.discount_rate) ** (1 / 12) - 1
     disc = (1 + r_m) ** np.arange(len(df_e))
     df_e["discounted_cf"] = df_e["cashflow"].values / disc
@@ -4379,21 +4441,86 @@ def economics_section(units, start_date):
                  "value rides through transient dips (e.g. a maintenance "
                  "month or a price trough); 6–12 months is typical.")
 
-    # ---- Fiscal regime (Tax/Royalty vs PSC) ----
+    # ---- Money basis (nominal vs real) ----
+    st.markdown("**Money basis**")
+    mb_col1, mb_col2 = st.columns([2, 1])
+    money_basis = mb_col1.radio(
+        "All cashflows in", ["Real (today's $)", "Nominal (escalated $)"],
+        horizontal=True, key="money_basis_label", on_change=mark_stale,
+        help="**Real**: costs and revenues remain in today's $. The discount "
+             "rate above is then a REAL discount rate (e.g. 7-10% typical).\n\n"
+             "**Nominal**: future cashflows are escalated by inflation each "
+             "year. The discount rate above is then a NOMINAL discount rate "
+             "(e.g. 10-13% typical). The two approaches give equivalent NPVs "
+             "if the discount rates and inflation are consistent — most "
+             "screening work uses real $.")
+    money_basis_for_engine = ("nominal"
+                               if money_basis.startswith("Nominal")
+                               else "real")
+    inflation_rate = 0.0
+    if money_basis_for_engine == "nominal":
+        inflation_rate = mb_col2.number_input(
+            "Inflation rate (%/yr)", min_value=0.0, max_value=15.0, value=2.5,
+            step=0.5, key="inflation_rate", on_change=mark_stale,
+            help="Annual inflation applied to every monthly cashflow "
+                 "(compounded monthly). 2-3% is typical for developed "
+                 "economies; 5-10% may be appropriate for high-inflation "
+                 "environments.") / 100.0
+
+    # ---- Fiscal regime (Tax/Royalty / PSC / NCS) ----
     st.markdown("**Fiscal regime**")
     regime = st.radio(
-        "Regime", ["Tax/Royalty", "PSC"],
+        "Regime", ["Tax/Royalty", "PSC", "NCS (Norwegian shelf)"],
         horizontal=True, key="fiscal_regime", on_change=mark_stale,
-        help="Tax/Royalty: simple regime — royalty on gross revenue, tax on positive pre-tax CF. "
-             "PSC: Production Sharing Contract — cost recovery, profit oil split between "
-             "contractor and government, contractor tax on its profit oil share, optional "
-             "carried government participation, signature bonus.",
+        help="Tax/Royalty: simple regime — royalty on gross revenue, tax on positive pre-tax CF.\n\n"
+             "PSC: Production Sharing Contract — cost recovery, profit-oil "
+             "split between contractor and government, contractor tax on its "
+             "profit-oil share, optional carried-government participation.\n\n"
+             "NCS: Norwegian Continental Shelf — Corporate Income Tax (22%) "
+             "+ Special Petroleum Tax (71.8%) = ~78% effective on petroleum "
+             "profits, with an 'uplift' allowance (17.69% of capex booked in "
+             "the year of spend, deductible from the SPT base only) "
+             "compensating for non-deductibility of financing in SPT.",
     )
+    # Normalize regime label for the engine
+    if regime == "NCS (Norwegian shelf)":
+        regime_for_engine = "NCS"
+    else:
+        regime_for_engine = regime
     psc_cost_recovery_ceiling = 0.50
     psc_profit_oil_share_contractor = 0.40
     psc_govt_participation = 0.0
     psc_psc_tax_rate = 0.30
     psc_signature_bonus_MM = 0.0
+    ncs_cit_rate = 0.22
+    ncs_spt_rate = 0.718
+    ncs_uplift_rate = 0.1769
+    if regime == "NCS (Norwegian shelf)":
+        with st.expander("NCS parameters", expanded=True):
+            nc1, nc2, nc3 = st.columns(3)
+            ncs_cit_rate = nc1.slider(
+                "Corporate income tax (CIT)", 0.10, 0.40, 0.22, 0.01,
+                key="ncs_cit", on_change=mark_stale,
+                help="Standard Norwegian corporate income tax. Currently 22%. "
+                     "Applies to positive pre-tax cashflow.")
+            ncs_spt_rate = nc2.slider(
+                "Special Petroleum Tax (SPT)", 0.40, 0.90, 0.718, 0.01,
+                key="ncs_spt", on_change=mark_stale,
+                help="Additional petroleum-sector tax on top of CIT. "
+                     "Currently 71.8%. Combined effective rate ≈ 78% on "
+                     "petroleum profits.")
+            ncs_uplift_rate = nc3.slider(
+                "Uplift allowance (× capex)", 0.00, 0.30, 0.1769, 0.01,
+                key="ncs_uplift", on_change=mark_stale,
+                help="Capital uplift booked in the YEAR of the investment. "
+                     "Reduces the SPT base only (not CIT). Currently 17.69%. "
+                     "Designed to compensate for the fact that financing "
+                     "costs are not deductible in SPT.")
+            st.caption(
+                f"Combined effective rate on petroleum profits ≈ "
+                f"**{(ncs_cit_rate + ncs_spt_rate)*100:.0f}%**. "
+                f"Uplift of {ncs_uplift_rate*100:.2f}% × capex offsets the "
+                f"SPT base.")
     if regime == "PSC":
         with st.expander("PSC parameters", expanded=True):
             pc1, pc2, pc3 = st.columns(3)
@@ -4555,6 +4682,26 @@ def economics_section(units, start_date):
                  "CRA-clad / solid CRA: corrosion-resistant alloy for sour "
                  "or corrosive fluids (1.85× / 3.2× cost). Flexible pipe: "
                  "easier installation, 2.4× cost.")
+        # Insulation row
+        in1, in2 = st.columns(2)
+        flowline_insulation = in1.selectbox(
+            "Flowline thermal insulation",
+            ["None", "Polypropylene coating (basic)",
+             "Multi-layer PP / syntactic", "Pipe-in-pipe (PIP)"],
+            key="dc_flowline_insulation",
+            help="Required for waxy/viscous crude and to manage hydrate "
+                 "formation. Cost: polypropylene 0.30MM/km, multi-layer "
+                 "0.65MM/km, pipe-in-pipe 1.80MM/km. PIP is highest cost but "
+                 "also highest U-value — chosen for long deep-water tie-backs.")
+        insulated_flowline_km = 0.0
+        if flowline_insulation != "None":
+            insulated_flowline_km = in2.number_input(
+                "Insulated flowline length (km)", min_value=0.0,
+                value=float(flowline_km), step=1.0, key="dc_insulated_km",
+                help="Length of flowline that needs thermal insulation — "
+                     "typically the whole flowline for waxy crude or long "
+                     "tie-backs.")
+
         fl4, fl5, fl6 = st.columns(3)
         umbilical_km = fl4.number_input(
             "Umbilical length (km)", min_value=0.0, value=16.0, step=1.0,
@@ -4571,6 +4718,62 @@ def economics_section(units, start_date):
             "Export pipeline diameter (inches)", min_value=4.0, max_value=48.0,
             value=16.0, step=2.0, key="dc_export_diam",
             help="Nominal bore of the export line.")
+
+        # Subsea ancillary elements
+        st.markdown("**Subsea ancillary elements**")
+        sa1, sa2, sa3, sa4 = st.columns(4)
+        n_riser_bases = sa1.number_input(
+            "Riser bases (FRBs)", min_value=0, value=int(n_risers), step=1,
+            key="dc_n_riser_bases",
+            help="Riser base / FRB seated on the seabed at the foot of each "
+                 "riser ($7.5MM each). Usually one per riser.")
+        n_ssiv = sa2.number_input(
+            "Subsea isolation valves (SSIV)", min_value=0, value=0, step=1,
+            key="dc_n_ssiv",
+            help="Subsea isolation valves between the field and the host "
+                 "($4MM each). Required by safety case for long tie-backs.")
+        n_jumpers = sa3.number_input(
+            "Subsea jumpers", min_value=0, value=int(n_subsea_wells), step=1,
+            key="dc_n_jumpers",
+            help="Rigid or flexible spools connecting trees to manifolds "
+                 "or manifolds to flowlines ($1.2MM each).")
+        n_control_modules = sa4.number_input(
+            "Subsea control modules (SCMs)", min_value=0,
+            value=int(n_subsea_wells), step=1,
+            key="dc_n_scm",
+            help="One control module per subsea well ($2.5MM each).")
+
+        # Topside modification + offshore manpower
+        st.markdown("**Topside modification & manpower**")
+        tm1, tm2, tm3 = st.columns(3)
+        topside_mod_tonnes = tm1.number_input(
+            "Topside mod — net installed weight (tonnes)",
+            min_value=0.0, value=0.0, step=50.0,
+            key="dc_topside_tonnes",
+            help="Alternative basis to a lumped $MM number for host "
+                 "modifications: enter the total net new/modified topside "
+                 "weight (tonnes) and the cost rate per tonne. Set to 0 to "
+                 "use the default lumped tie-in modification cost.")
+        topside_mod_rate_per_tonne_kUSD = tm2.number_input(
+            "Cost rate ($k per installed tonne)", min_value=0.0,
+            value=60.0, step=5.0, key="dc_topside_rate_k",
+            help="Fully-loaded $/tonne for offshore brownfield mods. "
+                 "Screening default $60k/tonne; high-spec mods can run "
+                 "$100k+/tonne.")
+        # Convert k$/tonne → $MM/tonne for the engine
+        topside_mod_rate_per_tonne_MM = topside_mod_rate_per_tonne_kUSD / 1000.0
+        offshore_manhours = tm3.number_input(
+            "Offshore manhours", min_value=0.0, value=0.0, step=1000.0,
+            key="dc_manhours",
+            help="Total offshore execution + engineering manhours (set to 0 "
+                 "if already covered by the topside weight or installation "
+                 "rows). Useful when you have a manhour estimate from a "
+                 "pre-FEED study.")
+        offshore_manhour_rate_usd = st.number_input(
+            "Manhour rate ($/hr)", min_value=0.0, value=220.0, step=10.0,
+            key="dc_manhour_rate",
+            help="Fully-loaded $/hr for offshore manhours (engineering + "
+                 "offshore execution blended). Screening default $220/hr.")
 
         st.markdown("**Artificial lift & flow assurance**")
         al1, al2 = st.columns(2)
@@ -4606,6 +4809,10 @@ def economics_section(units, start_date):
                 help="Length of flowline that needs active heating — often "
                      "the whole tie-back for long deep-water lines.")
 
+        # Pull any saved cost overrides from session state. Persists across
+        # reruns so the user's edits aren't lost.
+        cost_overrides = st.session_state.get("dc_cost_overrides", {})
+
         # Assemble the spec and build the concept
         dc_spec = {
             "concept_type": concept_type,
@@ -4619,9 +4826,15 @@ def economics_section(units, start_date):
             "flowline_km": flowline_km,
             "flowline_diameter_in": flowline_diameter,
             "flowline_material": flowline_material,
+            "flowline_insulation": flowline_insulation,
+            "insulated_flowline_km": insulated_flowline_km,
             "umbilical_km": umbilical_km,
             "n_risers": n_risers,
             "riser_type": riser_type,
+            "n_riser_bases": n_riser_bases,
+            "n_ssiv": n_ssiv,
+            "n_jumpers": n_jumpers,
+            "n_control_modules": n_control_modules,
             "n_boosting_stations": n_boosting,
             "gas_lift": gas_lift,
             "n_gas_lift_wells": n_gas_lift_wells,
@@ -4630,6 +4843,11 @@ def economics_section(units, start_date):
             "export_pipeline_km": export_pipeline_km,
             "export_pipeline_diameter_in": export_pipeline_diameter,
             "host_distance_km": host_distance_km,
+            "topside_mod_tonnes": topside_mod_tonnes,
+            "topside_mod_rate_per_tonne_MM": topside_mod_rate_per_tonne_MM,
+            "offshore_manhours": offshore_manhours,
+            "offshore_manhour_rate_usd": offshore_manhour_rate_usd,
+            "cost_overrides": cost_overrides,
             "start_date": start_date,
             "horizon_years": st.session_state.get("horizon", 20),
         }
@@ -4662,22 +4880,154 @@ def economics_section(units, start_date):
                     st.success("No engineering red flags — the concept is "
                                "internally consistent.")
 
-            # CAPEX breakdown preview
-            st.markdown("**Generated CAPEX schedule (preview)**")
-            preview_df = pd.DataFrame(concept["capex_rows"])
-            preview_df["date"] = pd.to_datetime(preview_df["date"]).dt.date
-            st.dataframe(
-                preview_df.rename(columns={
-                    "date": "Spend date", "amount_MMUSD": "Amount ($MM)",
-                    "label": "Component"}),
-                use_container_width=True, hide_index=True,
+            # ---- Editable cost table ----------------------------------
+            # The engine produces benchmark costs per line; the user can
+            # override any line by editing the "Override ($MM)" column.
+            # Overrides persist across reruns via session state.
+            st.markdown("**Generated CAPEX schedule — editable**")
+            st.caption(
+                "Each row shows the benchmark cost from the cost model. "
+                "To override any line, type a value into the **Override ($MM)** "
+                "column and click **✓ Apply cost edits**. Leave the cell empty "
+                "to keep using the benchmark. Click **🔄 Reset all to benchmark** "
+                "to clear every override."
             )
+            # Build a buffer dataframe combining benchmarks + any active
+            # overrides. The label is the lookup key.
+            edit_rows = []
+            for r in concept["capex_rows"]:
+                lbl = r["label"]
+                override_val = cost_overrides.get(lbl, None)
+                edit_rows.append({
+                    "Spend date": pd.to_datetime(r["date"]).date(),
+                    "Component": lbl,
+                    "Benchmark ($MM)": float(r["amount_MMUSD"])
+                        if override_val is None
+                        else None,   # benchmark is the engine output when no override
+                    "Override ($MM)": float(override_val) if override_val is not None else None,
+                    "In effect ($MM)": float(r["amount_MMUSD"]),
+                })
+            # For rows that already have an override, the engine's amount_MMUSD
+            # IS the overridden value — so the "Benchmark" column needs the
+            # un-overridden value. Recompute by calling the engine with no
+            # overrides to get the pure benchmark.
+            try:
+                _bench_spec = dict(dc_spec)
+                _bench_spec["cost_overrides"] = {}
+                _bench_concept = fh.build_development_concept(_bench_spec)
+                _bench_lookup = {r["label"]: r["amount_MMUSD"]
+                                  for r in _bench_concept["capex_rows"]}
+                for row in edit_rows:
+                    row["Benchmark ($MM)"] = float(
+                        _bench_lookup.get(row["Component"], row["In effect ($MM)"]))
+            except Exception:
+                pass
+            edit_df = pd.DataFrame(edit_rows)
+
+            edit_buf = st.data_editor(
+                edit_df, use_container_width=True, hide_index=True,
+                disabled=["Spend date", "Component", "Benchmark ($MM)",
+                          "In effect ($MM)"],
+                column_config={
+                    "Spend date": st.column_config.DateColumn("Spend date"),
+                    "Component":  st.column_config.TextColumn("Component", width="large"),
+                    "Benchmark ($MM)": st.column_config.NumberColumn(
+                        "Benchmark ($MM)", format="%.1f",
+                        help="The screening-grade cost from the engine's "
+                             "benchmark model (read-only)."),
+                    "Override ($MM)": st.column_config.NumberColumn(
+                        "Override ($MM)", format="%.1f", min_value=0.0,
+                        help="Type a value here to override the benchmark for "
+                             "this line. Empty = use benchmark."),
+                    "In effect ($MM)": st.column_config.NumberColumn(
+                        "In effect ($MM)", format="%.1f",
+                        help="The cost currently used in calculations "
+                             "(override if set, else benchmark)."),
+                },
+                key="dc_cost_editor",
+            )
+
+            eba, ebb, _ebc = st.columns([1, 1, 3])
+            if eba.button("✓ Apply cost edits", key="dc_apply_overrides",
+                           type="primary"):
+                # Read the buffer; any non-null Override values become the new
+                # overrides dict, keyed by Component label.
+                new_overrides = {}
+                for _, row in edit_buf.iterrows():
+                    lbl = row.get("Component")
+                    ov = row.get("Override ($MM)")
+                    if lbl and ov is not None and not pd.isna(ov) \
+                            and float(ov) > 0:
+                        new_overrides[lbl] = float(ov)
+                st.session_state["dc_cost_overrides"] = new_overrides
+                mark_stale()
+                if new_overrides:
+                    st.success(f"Applied {len(new_overrides)} override(s). "
+                               "The CAPEX schedule below is now based on your "
+                               "edited costs.")
+                else:
+                    st.info("All overrides cleared — every line back to its "
+                            "benchmark.")
+                st.rerun()
+            if ebb.button("🔄 Reset all to benchmark", key="dc_reset_overrides"):
+                st.session_state["dc_cost_overrides"] = {}
+                mark_stale()
+                st.rerun()
+
             t = concept["totals"]
             st.caption(
                 f"**CAPEX excl. cessation: ${t['capex_excl_cessation']:,.0f}MM**  •  "
                 f"Cessation / P&A: ${t['cessation']:,.0f}MM  •  "
                 f"**Grand total: ${t['grand_total']:,.0f}MM**"
             )
+            if cost_overrides:
+                # Show how the overrides shift the total vs benchmark
+                try:
+                    _bench_total = sum(_bench_lookup.values()) \
+                        + _bench_concept["totals"]["cessation"]
+                    delta = t["grand_total"] - _bench_total
+                    st.caption(
+                        f":blue[{len(cost_overrides)} override(s) active.] "
+                        f"Benchmark grand total: ${_bench_total:,.0f}MM  •  "
+                        f"With overrides: ${t['grand_total']:,.0f}MM  •  "
+                        f"**Δ {delta:+,.0f}MM** "
+                        f"({delta/_bench_total*100:+.1f}%).")
+                except Exception:
+                    pass
+
+            # Cost distribution pie chart (uses the effective costs — overrides
+            # included if any are active)
+            st.markdown("**Cost distribution**")
+            pie_df = pd.DataFrame(concept["capex_rows"])[
+                ["label", "amount_MMUSD"]].rename(
+                columns={"amount_MMUSD": "amount"})
+            tot_amt = pie_df["amount"].sum()
+            if tot_amt > 0:
+                threshold = 0.025 * tot_amt   # group anything < 2.5% as Other
+                big = pie_df[pie_df["amount"] >= threshold].copy()
+                small_sum = pie_df[pie_df["amount"] < threshold]["amount"].sum()
+                if small_sum > 0:
+                    big = pd.concat([big, pd.DataFrame(
+                        [{"label": "Other (small items)", "amount": small_sum}]
+                    )], ignore_index=True)
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=big["label"], values=big["amount"],
+                    hole=0.42, sort=True, direction="clockwise",
+                    textposition="outside", textinfo="label+percent",
+                    hovertemplate="<b>%{label}</b><br>$%{value:,.0f}MM<br>"
+                                   "%{percent}<extra></extra>",
+                    marker=dict(line=dict(color="#fff", width=2)),
+                )])
+                fig_pie.update_layout(
+                    title=f"CAPEX breakdown — total ${tot_amt:,.0f}MM",
+                    height=420, showlegend=True,
+                    legend=dict(orientation="v", x=1.02, y=0.5),
+                    margin=dict(t=60, b=20, l=10, r=150),
+                )
+                st.plotly_chart(fh.apply_plot_template(fig_pie),
+                                use_container_width=True)
+                st.caption("Items under 2.5% of total are grouped as 'Other' "
+                           "to keep the chart readable.")
 
             if st.button("⚙️ Generate CAPEX schedule from this concept",
                           key="dc_generate", type="primary"):
@@ -4774,9 +5124,10 @@ def economics_section(units, start_date):
             st.error(f"Could not build schedule: {exc}")
 
         if sched is not None:
-            # Gantt chart
-            import plotly.express as _px_unused  # noqa — make sure available
-            fig_g = go.Figure()
+            # Gantt chart — use px.timeline which is the proper Plotly Gantt
+            # primitive and handles dates natively (avoids the int-vs-date
+            # mixing that breaks add_vline on some Plotly versions).
+            import plotly.express as px
             phase_colors = {
                 "FEED":            "#5b8def",
                 "Long-lead":       "#9c7ad6",
@@ -4784,43 +5135,53 @@ def economics_section(units, start_date):
                 "Installation":    "#d65a5a",
                 "Hookup & comm.":  "#3ba776",
             }
-            for ph in sched["phases"]:
-                fig_g.add_trace(go.Bar(
-                    y=[ph["phase"]],
-                    x=[(ph["end"] - ph["start"]).days],
-                    base=[ph["start"]],
-                    orientation="h",
-                    marker_color=phase_colors.get(ph["phase"], "#888"),
-                    name=ph["phase"],
-                    hovertemplate=(f"<b>{ph['phase']}</b><br>"
-                                    f"{ph['start']} → {ph['end']}<br>"
-                                    f"{ph['duration_months']} months<extra></extra>"),
-                    showlegend=False,
-                ))
-            # Milestone markers
+            gantt_df = pd.DataFrame([
+                {"Phase": ph["phase"],
+                 "Start": pd.Timestamp(ph["start"]),
+                 "Finish": pd.Timestamp(ph["end"]),
+                 "Duration_mo": ph["duration_months"]}
+                for ph in sched["phases"]
+            ])
+            fig_g = px.timeline(
+                gantt_df, x_start="Start", x_end="Finish", y="Phase",
+                color="Phase", color_discrete_map=phase_colors,
+                hover_data={"Duration_mo": True,
+                            "Start": "|%Y-%m-%d", "Finish": "|%Y-%m-%d",
+                            "Phase": False},
+            )
+            fig_g.update_yaxes(autorange="reversed",
+                                categoryorder="array",
+                                categoryarray=[ph["phase"]
+                                               for ph in sched["phases"]])
+            fig_g.update_traces(marker_line_width=0)
+
+            # Milestone markers — convert everything to pd.Timestamp so
+            # Plotly's internal axis-mean call sees uniform types.
             for label, mdate in sched["milestones"]:
+                mts = pd.Timestamp(mdate)
                 fig_g.add_vline(
-                    x=mdate, line=dict(color="#333", dash="dot", width=1),
+                    x=mts, line=dict(color="#333", dash="dot", width=1),
                     annotation_text=label,
                     annotation_position="top",
-                    annotation_textangle=-60,
-                    annotation_font=dict(size=9, color="#333"),
+                    annotation_textangle=-45,
+                    annotation_font=dict(size=9, color="#444"),
                 )
-            # First-oil emphasis
+            # First-oil emphasis — green thick line
+            fo_ts = pd.Timestamp(sched["first_oil_date"])
             fig_g.add_vline(
-                x=sched["first_oil_date"],
-                line=dict(color="#2ca02c", width=3),
+                x=fo_ts, line=dict(color="#2ca02c", width=3),
                 annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
                 annotation_position="bottom",
-                annotation_font=dict(size=11, color="#2ca02c"),
+                annotation_font=dict(size=12, color="#2ca02c"),
             )
             fig_g.update_layout(
-                title=f"Project schedule — {sched['total_months']} months "
-                      f"FEED to first oil",
-                height=360,
+                title=(f"Project schedule — {sched['total_months']} months "
+                       f"FEED to first oil"),
+                height=380,
                 xaxis_title="Date",
-                yaxis=dict(autorange="reversed"),
-                margin=dict(t=80, b=40, l=10, r=10),
+                showlegend=False,
+                margin=dict(t=90, b=50, l=10, r=10),
+                plot_bgcolor="rgba(245,247,250,0.6)",
                 bargap=0.35,
             )
             st.plotly_chart(fh.apply_plot_template(fig_g),
@@ -4924,12 +5285,17 @@ def economics_section(units, start_date):
         tariff_gas=tariff_gas_mmbtu * MMBTU_PER_MCF,  # $/MMBtu → $/Mscf
         abandonment_cost_MM=aban_cost,
         facility_capex=CapexSchedule(df=fac_df.copy()),
-        fiscal_regime=regime,
+        fiscal_regime=regime_for_engine,
         psc_cost_recovery_ceiling=psc_cost_recovery_ceiling,
         psc_profit_oil_share_contractor=psc_profit_oil_share_contractor,
         psc_govt_participation=psc_govt_participation,
         psc_psc_tax_rate=psc_psc_tax_rate,
         psc_signature_bonus_MM=psc_signature_bonus_MM,
+        ncs_cit_rate=ncs_cit_rate,
+        ncs_spt_rate=ncs_spt_rate,
+        ncs_uplift_rate=ncs_uplift_rate,
+        money_basis=money_basis_for_engine,
+        inflation_rate=inflation_rate,
         well_cost_mode=well_cost_mode,
         rig_day_rate_kUSD=rig_day_rate_kUSD,
         completion_day_rate_kUSD=completion_day_rate_kUSD,
