@@ -12,6 +12,11 @@ import json
 import math
 import os
 import re
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
 from dataclasses import asdict, is_dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -474,13 +479,44 @@ def co2_intensity_benchmark(df_e, df, is_oil) -> dict:
         Global upstream average                                ~ 18
         High-intensity (heavy oil, mature, high-flaring)        ~ 35+
     Returns a dict with intensity, total emissions, band, and benchmark set.
+
+    Defensive: tolerates df_e / df that are None, missing columns, or not
+    DataFrames — returns zeros rather than raising, so the UI degrades
+    gracefully instead of crashing.
     """
     MSCF_PER_BOE = 6.0
-    total_co2_t = float(df_e["cum_co2_tonnes"].iloc[-1]) \
-        if "cum_co2_tonnes" in df_e.columns and len(df_e) else 0.0
-    # BOE produced over life
-    cum_oil_stb = float(df["cum_oil"].iloc[-1]) * 1e6 if "cum_oil" in df.columns else 0.0
-    cum_gas_mscf = float(df["cum_gas"].iloc[-1]) * 1e6 if "cum_gas" in df.columns else 0.0
+
+    def _safe_last(frame, col):
+        """Last value of a column, or 0.0 if anything is missing/odd."""
+        try:
+            if frame is None or not hasattr(frame, "columns"):
+                return 0.0
+            if col not in frame.columns or len(frame) == 0:
+                return 0.0
+            return float(frame[col].iloc[-1])
+        except Exception:
+            return 0.0
+
+    def _safe_sum(frame, col):
+        try:
+            if frame is None or not hasattr(frame, "columns"):
+                return 0.0
+            if col not in frame.columns:
+                return 0.0
+            return float(frame[col].sum())
+        except Exception:
+            return 0.0
+
+    total_co2_t = _safe_last(df_e, "cum_co2_tonnes")
+    # Some paths name it differently — fall back to summing the monthly column
+    if total_co2_t == 0.0:
+        total_co2_t = _safe_sum(df_e, "co2_emissions_tonnes")
+    if total_co2_t == 0.0:
+        total_co2_t = _safe_sum(df_e, "co2_total_t")
+
+    # BOE produced over life — cum_oil is MMstb, cum_gas is Bscf in the engine
+    cum_oil_stb = _safe_last(df, "cum_oil") * 1e6
+    cum_gas_mscf = _safe_last(df, "cum_gas") * 1e6
     cum_boe = cum_oil_stb + cum_gas_mscf / MSCF_PER_BOE
     intensity = (total_co2_t * 1000.0 / cum_boe) if cum_boe > 0 else 0.0  # kg/boe
 
@@ -498,9 +534,7 @@ def co2_intensity_benchmark(df_e, df, is_oil) -> dict:
     else:
         band = "High — well above average; significant decarbonization opportunity"
 
-    # Total power
-    total_power_mwh = float(df_e["power_mwh"].sum()) \
-        if "power_mwh" in df_e.columns else 0.0
+    total_power_mwh = _safe_sum(df_e, "power_mwh")
     power_intensity = (total_power_mwh * 1000.0 / cum_boe) if cum_boe > 0 else 0.0  # kWh/boe
 
     return {
@@ -1889,3 +1923,1278 @@ def deliverable_rate(p_res: float, p_wh: float, depth_ft: float,
     if q_decline_target > 0 and q > q_decline_target:
         return {"rate": q_decline_target, "p_bhp": p_bhp, "limited_by": "decline"}
     return {"rate": q, "p_bhp": p_bhp, "limited_by": "ipr"}
+
+
+# =============================================================================
+# YAML case import / export + batch mode
+# =============================================================================
+# A YAML case file is a human-friendly representation of the internal case
+# payload. The payload has two top-level sections:
+#
+#   scalar:   flat key/value pairs (units, fluid, prices, fiscal terms, etc.)
+#   tables:   named tables, each a dict-of-lists (rigs, producers, injectors,
+#             capacities, facility CAPEX, reservoirs, well-reservoir links)
+#
+# The YAML schema mirrors this exactly, so a YAML file is just:
+#
+#   meta:
+#     name: "My case"
+#     description: "..."
+#   scalar:
+#     units: field
+#     fluid: "Oil with associated gas"
+#     start_date: "2027-01-01"
+#     oil_price_bbl: 75
+#     ...
+#   tables:
+#     producers_df:
+#       - {name: P1, rig: Rig-A, drill_days: 25, ...}
+#       - {name: P2, rig: Rig-A, drill_days: 25, ...}
+#     cap_df:
+#       - {start_date: "2027-01-01", oil: 50000, gas: 150, ...}
+#     ...
+#
+# Tables can be written as a list-of-row-dicts (most readable) OR as the
+# internal dict-of-lists form — the loader accepts both.
+
+YAML_SCHEMA_VERSION = "1.0"
+
+# Canonical table names and their expected columns (for validation + docs)
+YAML_TABLE_SCHEMA = {
+    "rigs_df": ["rig", "start_date", "move_in_days", "move_out_days",
+                "maintenance_days_per_year", "day_rate_kUSD"],
+    "producers_df": ["name", "rig", "drill_days", "completion_days",
+                     "qi_primary", "qi_secondary", "decline_model",
+                     "di_annual", "b_factor", "wc_initial", "wc_final",
+                     "wc_ramp_months", "scale_factor", "uptime",
+                     "derive_qi_from_pi", "well_pi_override", "fluid",
+                     "ipr_mode", "wellhead_pressure_psi", "tubing_depth_ft",
+                     "fluid_gradient_psi_per_ft", "friction_psi_per_kbpd"],
+    "injectors_df": ["name", "rig", "drill_days", "completion_days",
+                     "inj_rate", "scale_factor", "uptime"],
+    "cap_df": ["start_date", "oil", "gas", "water", "liquid",
+               "water_inj", "gas_inj", "prod_eff"],
+    "fac_df": ["date", "amount_MMUSD", "label"],
+    "reservoirs_df": ["id", "name", "fluid_system", "strategy",
+                      "ooip_oil_MMstb", "ogip_gas_Bscf", "rf_target",
+                      "p_init", "t_res", "api", "gas_sg", "rs_init", "p_bub",
+                      "aquifer_active", "gas_cap_active", "vrr",
+                      "well_pi", "min_bhp"],
+    "well_reservoir_df": ["well", "reservoir", "fraction"],
+}
+
+
+def _table_to_rows(tbl: Any) -> list[dict]:
+    """Normalize a table from either dict-of-lists or list-of-dicts to
+    list-of-row-dicts."""
+    if tbl is None:
+        return []
+    if isinstance(tbl, list):
+        # already list-of-dicts
+        return [dict(r) for r in tbl if isinstance(r, dict)]
+    if isinstance(tbl, dict):
+        # dict-of-lists → list-of-dicts
+        if not tbl:
+            return []
+        keys = list(tbl.keys())
+        n = max((len(v) for v in tbl.values() if isinstance(v, list)), default=0)
+        rows = []
+        for i in range(n):
+            row = {}
+            for k in keys:
+                v = tbl[k]
+                row[k] = v[i] if isinstance(v, list) and i < len(v) else None
+            rows.append(row)
+        return rows
+    return []
+
+
+def _rows_to_dict_of_lists(rows: list[dict]) -> dict:
+    """Inverse of _table_to_rows: list-of-dicts → dict-of-lists (the internal
+    payload table format)."""
+    if not rows:
+        return {}
+    cols = []
+    for r in rows:
+        for k in r.keys():
+            if k not in cols:
+                cols.append(k)
+    return {c: [r.get(c) for r in rows] for c in cols}
+
+
+def payload_to_yaml(payload: dict, meta: dict | None = None) -> str:
+    """Serialize an internal case payload to a YAML string.
+
+    Tables are written as list-of-row-dicts (the readable form).
+    """
+    if not _HAS_YAML:
+        raise RuntimeError("PyYAML is not installed — cannot export YAML.")
+    out = {
+        "schema_version": YAML_SCHEMA_VERSION,
+        "meta": meta or {"name": "Untitled case", "description": ""},
+        "scalar": dict(payload.get("scalar", {})),
+        "tables": {},
+    }
+    for tname, tbl in payload.get("tables", {}).items():
+        out["tables"][tname] = _table_to_rows(tbl)
+    return yaml.safe_dump(out, sort_keys=False, default_flow_style=False,
+                          allow_unicode=True)
+
+
+def yaml_to_payload(yaml_text: str) -> tuple[dict, dict]:
+    """Parse a YAML case file into (payload, meta).
+
+    payload = {"scalar": {...}, "tables": {name: dict-of-lists}}
+    meta    = {"name": ..., "description": ...}
+
+    Raises ValueError with a clear message on malformed input.
+    """
+    if not _HAS_YAML:
+        raise RuntimeError("PyYAML is not installed — cannot import YAML.")
+    try:
+        doc = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"YAML parse error: {e}")
+    if not isinstance(doc, dict):
+        raise ValueError("YAML root must be a mapping with 'scalar' and "
+                         "'tables' sections.")
+    meta = doc.get("meta", {}) or {}
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("name", "Imported case")
+    meta.setdefault("description", "")
+    scalar = doc.get("scalar", {}) or {}
+    if not isinstance(scalar, dict):
+        raise ValueError("'scalar' section must be a mapping of key: value.")
+    tables_in = doc.get("tables", {}) or {}
+    if not isinstance(tables_in, dict):
+        raise ValueError("'tables' section must be a mapping of table_name: rows.")
+    tables = {}
+    for tname, tbl in tables_in.items():
+        rows = _table_to_rows(tbl)
+        tables[tname] = _rows_to_dict_of_lists(rows)
+    return {"scalar": scalar, "tables": tables}, meta
+
+
+def validate_yaml_payload(payload: dict, meta: dict) -> list[str]:
+    """Return a list of human-readable warnings about a parsed YAML payload.
+
+    Non-fatal: the caller can still run the case, but these flag likely
+    mistakes (unknown table names, missing required columns, suspicious
+    scalar values).
+    """
+    warnings = []
+    scalar = payload.get("scalar", {})
+    tables = payload.get("tables", {})
+
+    # Required-ish scalars
+    if "units" not in scalar:
+        warnings.append("scalar.units not set — defaulting to 'field'.")
+    elif scalar["units"] not in ("field", "metric"):
+        warnings.append(f"scalar.units = '{scalar['units']}' is not "
+                        "'field' or 'metric'.")
+    if "fluid" not in scalar:
+        warnings.append("scalar.fluid not set — the fluid system is required.")
+    if "start_date" not in scalar:
+        warnings.append("scalar.start_date not set — defaulting to today.")
+
+    # Unknown tables
+    for tname in tables:
+        if tname not in YAML_TABLE_SCHEMA:
+            warnings.append(f"Unknown table '{tname}' — will be ignored. "
+                            f"Known tables: {', '.join(YAML_TABLE_SCHEMA)}.")
+
+    # Producers table sanity
+    prod = tables.get("producers_df", {})
+    prod_rows = _table_to_rows(prod)
+    if not prod_rows:
+        warnings.append("No producers defined (tables.producers_df is empty) "
+                        "— the case will have no production.")
+    else:
+        for i, r in enumerate(prod_rows):
+            if not r.get("name"):
+                warnings.append(f"producers_df row {i+1}: missing 'name'.")
+            qi = r.get("qi_primary")
+            if qi is not None and isinstance(qi, (int, float)) and qi <= 0:
+                if not r.get("derive_qi_from_pi"):
+                    warnings.append(f"producers_df row {i+1} ({r.get('name')}): "
+                                    "qi_primary ≤ 0 and PI mode is off — "
+                                    "this well will produce nothing.")
+
+    # Capacity table sanity
+    cap_rows = _table_to_rows(tables.get("cap_df", {}))
+    if not cap_rows:
+        warnings.append("No capacity rows (tables.cap_df is empty) — capacities "
+                        "default to unconstrained.")
+
+    return warnings
+
+
+def run_case_headless(payload: dict, meta: dict,
+                       run_simulation_fn, compute_economics_fn,
+                       build_asm_fn, build_wells_fn, build_econ_fn,
+                       fluid_systems: dict) -> dict:
+    """Run a single case from a payload, with NO Streamlit dependency.
+
+    This is the engine entry point for batch mode. The caller injects the
+    builder functions (so this module stays Streamlit-free).
+
+    Args:
+        payload, meta            : as returned by yaml_to_payload
+        run_simulation_fn        : run_simulation(wells, asm) -> (df, per_well, per_res)
+        compute_economics_fn     : compute_economics(df, is_oil, econ, wells) -> df_e
+        build_asm_fn             : (payload) -> FieldAssumptions
+        build_wells_fn           : (payload) -> list[WellSpec]
+        build_econ_fn            : (payload) -> EconInputs
+        fluid_systems            : the FLUID_SYSTEMS dict (for is_oil lookup)
+
+    Returns a dict with:
+        name, ok, error,
+        kpis: {npv_MM, irr, payback_yrs, cum_oil, cum_gas, final_rf, peak_rate},
+        df, df_e   (the full result frames, for CSV export)
+    """
+    name = meta.get("name", "Unnamed case")
+    result = {"name": name, "ok": False, "error": None,
+              "kpis": {}, "df": None, "df_e": None}
+    try:
+        wells = build_wells_fn(payload)
+        asm = build_asm_fn(payload)
+        econ = build_econ_fn(payload)
+        fluid = payload.get("scalar", {}).get("fluid", "Oil with associated gas")
+        is_oil = fluid_systems.get(fluid, {}).get("primary", "oil") == "oil"
+
+        df, per_well, per_res = run_simulation_fn(wells, asm)
+        df_e = compute_economics_fn(df, is_oil, econ, wells)
+
+        # KPIs
+        npv_MM = float(df_e["npv"].iloc[-1]) / 1e6 if "npv" in df_e.columns else 0.0
+        cum_oil = float(df["cum_oil"].iloc[-1]) if "cum_oil" in df.columns else 0.0
+        cum_gas = float(df["cum_gas"].iloc[-1]) if "cum_gas" in df.columns else 0.0
+        final_rf = float(df["recovery_factor"].iloc[-1]) \
+            if "recovery_factor" in df.columns else 0.0
+        peak_rate = float(df["primary_rate"].max()) \
+            if "primary_rate" in df.columns else 0.0
+        # IRR + payback (best-effort)
+        irr = None
+        payback_yrs = None
+        try:
+            cf = df_e["cashflow"].values if "cashflow" in df_e.columns else None
+            if cf is not None:
+                # local IRR bisection (annualized from monthly)
+                cf = np.asarray(cf, dtype=float)
+                if np.isfinite(cf).all() and cf.sum() > 0:
+                    def _npv(r):
+                        disc = (1 + r) ** np.arange(len(cf))
+                        return float((cf / disc).sum())
+                    lo, hi = 0.0, 1.0
+                    if _npv(lo) > 0:
+                        tries = 0
+                        while _npv(hi) > 0 and tries < 8:
+                            hi *= 2; tries += 1
+                        if _npv(hi) < 0:
+                            for _ in range(80):
+                                mid = 0.5 * (lo + hi)
+                                if _npv(mid) > 0:
+                                    lo = mid
+                                else:
+                                    hi = mid
+                            monthly = 0.5 * (lo + hi)
+                            irr = (1 + monthly) ** 12 - 1
+            if "cum_cashflow" in df_e.columns:
+                cum = df_e["cum_cashflow"].values
+                for i, v in enumerate(cum):
+                    if v >= 0:
+                        payback_yrs = i / 12.0
+                        break
+        except Exception:
+            pass
+
+        result["kpis"] = {
+            "npv_MM": npv_MM,
+            "irr": irr,
+            "payback_yrs": payback_yrs,
+            "cum_oil": cum_oil,
+            "cum_gas": cum_gas,
+            "final_rf": final_rf,
+            "peak_rate": peak_rate,
+        }
+        result["df"] = df
+        result["df_e"] = df_e
+        result["ok"] = True
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+    return result
+
+
+def parse_batch_yaml(yaml_text: str) -> list[tuple[dict, dict]]:
+    """Parse a batch YAML file containing multiple cases.
+
+    Batch file format:
+
+        schema_version: "1.0"
+        cases:
+          - meta: {name: "Case A", description: "..."}
+            scalar: {...}
+            tables: {...}
+          - meta: {name: "Case B"}
+            scalar: {...}
+            tables: {...}
+
+    Also accepts a single-case file (no 'cases' key) — returns a 1-element list.
+    Returns a list of (payload, meta) tuples.
+    """
+    if not _HAS_YAML:
+        raise RuntimeError("PyYAML is not installed — cannot import YAML.")
+    try:
+        doc = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        raise ValueError(f"YAML parse error: {e}")
+    if not isinstance(doc, dict):
+        raise ValueError("Batch YAML root must be a mapping.")
+    out = []
+    if "cases" in doc and isinstance(doc["cases"], list):
+        for i, case in enumerate(doc["cases"]):
+            if not isinstance(case, dict):
+                raise ValueError(f"cases[{i}] is not a mapping.")
+            meta = case.get("meta", {}) or {}
+            meta.setdefault("name", f"Case {i+1}")
+            meta.setdefault("description", "")
+            scalar = case.get("scalar", {}) or {}
+            tables_in = case.get("tables", {}) or {}
+            tables = {}
+            for tname, tbl in tables_in.items():
+                tables[tname] = _rows_to_dict_of_lists(_table_to_rows(tbl))
+            out.append(({"scalar": scalar, "tables": tables}, meta))
+    else:
+        # single case
+        payload, meta = yaml_to_payload(yaml_text)
+        out.append((payload, meta))
+    return out
+
+
+def batch_results_to_csv(batch_results: list[dict]) -> str:
+    """Flatten a list of run_case_headless results into a KPI summary CSV."""
+    rows = []
+    for r in batch_results:
+        k = r.get("kpis", {})
+        rows.append({
+            "case": r.get("name", ""),
+            "status": "OK" if r.get("ok") else "FAILED",
+            "error": r.get("error") or "",
+            "npv_MM": k.get("npv_MM"),
+            "irr": k.get("irr"),
+            "payback_yrs": k.get("payback_yrs"),
+            "cum_oil_MMstb": k.get("cum_oil"),
+            "cum_gas_Bscf": k.get("cum_gas"),
+            "final_rf": k.get("final_rf"),
+            "peak_primary_rate": k.get("peak_rate"),
+        })
+    return pd.DataFrame(rows).to_csv(index=False)
+
+
+def batch_results_to_json(batch_results: list[dict]) -> str:
+    """Serialize batch KPI results as a JSON string (API-style payload)."""
+    payload = {
+        "schema_version": YAML_SCHEMA_VERSION,
+        "generated_at": datetime.now().isoformat(),
+        "n_cases": len(batch_results),
+        "n_ok": sum(1 for r in batch_results if r.get("ok")),
+        "cases": [
+            {
+                "name": r.get("name"),
+                "status": "ok" if r.get("ok") else "failed",
+                "error": r.get("error"),
+                "kpis": r.get("kpis", {}),
+            }
+            for r in batch_results
+        ],
+    }
+    return json.dumps(payload, indent=2, default=str)
+
+
+# =============================================================================
+# Development concept builder
+# =============================================================================
+# A robust, screening-grade concept costing engine. The caller assembles a
+# `spec` dict describing the development concept; build_development_concept()
+# returns a phased CAPEX schedule, a human-readable concept summary, a list of
+# engineering warnings (sanity checks), and a simple SVG schematic.
+#
+# All cost models are SCREENING-LEVEL — order-of-magnitude, suitable for
+# concept-select / pre-FEED. Real cost estimates need a quantity surveyor.
+# Unit basis is stated explicitly for every parameter so there is no ambiguity.
+
+# ---- Screening cost bases (all in $MM unless noted) -------------------------
+# Flowline cost is $MM per km, indexed by nominal diameter (inches) and
+# material. Carbon steel is the baseline; corrosion-resistant alloy (CRA) and
+# flexible pipe carry multipliers.
+_FLOWLINE_BASE_MMUSD_PER_KM = {   # carbon steel, rigid, installed
+    6:  0.9, 8:  1.1, 10: 1.4, 12: 1.7, 14: 2.1,
+    16: 2.5, 18: 3.0, 20: 3.6, 24: 4.8, 30: 6.5,
+}
+_FLOWLINE_MATERIAL_MULT = {
+    "Carbon steel":        1.00,
+    "CRA-clad":            1.85,   # corrosion-resistant alloy clad
+    "Solid CRA":           3.20,
+    "Flexible pipe":       2.40,
+}
+_FLOWLINE_WATERDEPTH_MULT = {      # installation difficulty by water depth
+    "Shallow (<150 m)":    1.00,
+    "Mid (150-600 m)":     1.30,
+    "Deep (600-1500 m)":   1.70,
+    "Ultra-deep (>1500 m)": 2.20,
+}
+# Xmas tree unit cost ($MM each)
+_XMAS_TREE_COST = {
+    "Dry (surface) tree":      1.8,
+    "Wet (subsea) tree":       9.0,
+}
+# Riser unit cost ($MM each), by type
+_RISER_COST = {
+    "Steel catenary riser (SCR)":  18.0,
+    "Flexible riser":              12.0,
+    "Top-tensioned riser (TTR)":   25.0,
+    "Hybrid riser tower segment":  35.0,
+}
+# Subsea template / manifold unit cost ($MM each)
+_TEMPLATE_COST = 45.0
+# Umbilical cost ($MM per km)
+_UMBILICAL_MMUSD_PER_KM = 1.6
+# Subsea boosting (multiphase pump station) — $MM per station
+_BOOSTING_STATION_COST = 75.0
+# Gas lift system — $MM (compression + distribution), scales with well count
+_GAS_LIFT_BASE_COST = 25.0
+_GAS_LIFT_PER_WELL = 1.2
+# Heating (for waxy/viscous crude or hydrate management) — $MM
+_HEATING_SYSTEM_COST = {
+    "None":                      0.0,
+    "Electrically heated flowline (EHTF)": 0.0,   # priced per km below
+    "Direct electric heating (DEH)":       0.0,   # priced per km below
+    "Hot-water / glycol circulation":      18.0,
+}
+_EHTF_MMUSD_PER_KM = 1.1   # added on top of base flowline for heated lines
+_DEH_MMUSD_PER_KM = 0.7
+
+# Platform / host fixed costs ($MM) — very rough screening anchors
+_PLATFORM_BASE = {
+    "Fixed steel jacket (shallow)":  220.0,
+    "Fixed steel jacket (mid)":      380.0,
+    "Concrete gravity structure":    650.0,
+    "Compliant tower":               480.0,
+    "Jack-up production unit":       180.0,
+    "FPSO (leased — capitalised)":   450.0,
+    "FPSO (owned)":                  1100.0,
+    "Semi-submersible FPU":          900.0,
+    "Spar":                          850.0,
+    "TLP (tension-leg platform)":    780.0,
+}
+_TOPSIDES_PER_KBOED = 6.5   # $MM per thousand boe/d of processing capacity
+_CPF_PER_KBOED = 3.2        # onshore central processing facility $MM per kboe/d
+_ONSHORE_WELLPAD_PER_WELL = 2.5
+_ONSHORE_PIPELINE_PER_KM = 0.7
+_HOST_TIEIN_MOD = 45.0      # host facility modification for a tie-in
+
+
+def _flowline_cost_per_km(diameter_in: float, material: str,
+                           water_depth_class: str) -> float:
+    """Screening flowline cost ($MM/km) for a given diameter, material and
+    water-depth installation class. Interpolates diameter on the cost base."""
+    diams = sorted(_FLOWLINE_BASE_MMUSD_PER_KM.keys())
+    d = max(diams[0], min(diameter_in, diams[-1]))
+    # linear interpolation between bracketing diameters
+    lo = max([x for x in diams if x <= d], default=diams[0])
+    hi = min([x for x in diams if x >= d], default=diams[-1])
+    if lo == hi:
+        base = _FLOWLINE_BASE_MMUSD_PER_KM[lo]
+    else:
+        f = (d - lo) / (hi - lo)
+        base = (_FLOWLINE_BASE_MMUSD_PER_KM[lo] * (1 - f)
+                + _FLOWLINE_BASE_MMUSD_PER_KM[hi] * f)
+    mat_mult = _FLOWLINE_MATERIAL_MULT.get(material, 1.0)
+    wd_mult = _FLOWLINE_WATERDEPTH_MULT.get(water_depth_class, 1.0)
+    return base * mat_mult * wd_mult
+
+
+def build_development_concept(spec: dict) -> dict:
+    """Build a development concept from a spec dict.
+
+    The spec dict keys depend on `concept_type`:
+
+      concept_type: "Subsea tie-in" | "Standalone"
+      For "Standalone":
+        host_type:           one of _PLATFORM_BASE keys, or
+                             "Onshore central processing facility (CPF)"
+        processing_capacity_kboed: float  (plant sizing basis)
+      Common:
+        water_depth_class:   one of _FLOWLINE_WATERDEPTH_MULT keys
+        n_templates:         int   (subsea templates / manifolds)
+        n_subsea_wells:      int   (wells on wet trees)
+        n_dry_wells:         int   (wells on dry / surface trees)
+        flowline_km:         float (tie-back or in-field flowline length)
+        flowline_diameter_in:float
+        flowline_material:   one of _FLOWLINE_MATERIAL_MULT keys
+        umbilical_km:        float
+        n_risers:            int
+        riser_type:          one of _RISER_COST keys
+        n_boosting_stations: int   (subsea multiphase boosting)
+        gas_lift:            bool
+        n_gas_lift_wells:    int
+        heating_type:        one of _HEATING_SYSTEM_COST keys
+        heated_flowline_km:  float (length of flowline requiring heating)
+        export_pipeline_km:  float
+        export_pipeline_diameter_in: float
+        host_distance_km:    float (tie-in only — distance to host)
+        n_total_wells:       int   (for onshore wellpad costing / sanity)
+        start_date:          date  (anchor for the phased schedule)
+        horizon_years:       int   (for cessation timing)
+
+    Returns dict:
+      capex_rows : list[dict]  (date, amount_MMUSD, label)
+      summary    : list[(label, value_str)]  — concept overview
+      warnings   : list[str]   — engineering sanity checks
+      schematic  : str         — an SVG string
+      totals     : dict        — {capex_excl_cessation, cessation, grand_total}
+    """
+    from datetime import date as _date, timedelta as _td
+
+    def g(key, default=None):
+        return spec.get(key, default)
+
+    concept_type = g("concept_type", "Subsea tie-in")
+    water_depth_class = g("water_depth_class", "Shallow (<150 m)")
+    start_date = g("start_date") or _date.today()
+    horizon_years = int(g("horizon_years", 20))
+
+    n_templates = int(g("n_templates", 0))
+    n_subsea_wells = int(g("n_subsea_wells", 0))
+    n_dry_wells = int(g("n_dry_wells", 0))
+    flowline_km = float(g("flowline_km", 0.0))
+    flowline_diam = float(g("flowline_diameter_in", 10.0))
+    flowline_material = g("flowline_material", "Carbon steel")
+    umbilical_km = float(g("umbilical_km", 0.0))
+    n_risers = int(g("n_risers", 0))
+    riser_type = g("riser_type", "Flexible riser")
+    n_boosting = int(g("n_boosting_stations", 0))
+    gas_lift = bool(g("gas_lift", False))
+    n_gas_lift_wells = int(g("n_gas_lift_wells", 0))
+    heating_type = g("heating_type", "None")
+    heated_flowline_km = float(g("heated_flowline_km", 0.0))
+    export_pipeline_km = float(g("export_pipeline_km", 0.0))
+    export_pipeline_diam = float(g("export_pipeline_diameter_in", 16.0))
+    host_distance_km = float(g("host_distance_km", 0.0))
+
+    rows = []          # (offset_days, amount_MMUSD, label)
+    warnings = []
+    summary = []
+
+    # ---- Component costs --------------------------------------------------
+    # Subsea templates / manifolds
+    cost_templates = n_templates * _TEMPLATE_COST
+    if cost_templates > 0:
+        rows.append((0, cost_templates,
+                     f"{n_templates} × subsea template/manifold"))
+
+    # Xmas trees
+    cost_wet_trees = n_subsea_wells * _XMAS_TREE_COST["Wet (subsea) tree"]
+    cost_dry_trees = n_dry_wells * _XMAS_TREE_COST["Dry (surface) tree"]
+    if cost_wet_trees > 0:
+        rows.append((90, cost_wet_trees,
+                     f"{n_subsea_wells} × wet (subsea) xmas trees"))
+    if cost_dry_trees > 0:
+        rows.append((90, cost_dry_trees,
+                     f"{n_dry_wells} × dry (surface) xmas trees"))
+
+    # Flowlines
+    fl_per_km = _flowline_cost_per_km(flowline_diam, flowline_material,
+                                       water_depth_class)
+    cost_flowline = flowline_km * fl_per_km
+    if cost_flowline > 0:
+        rows.append((180, cost_flowline,
+                     f"Flowline {flowline_km:.0f} km × {flowline_diam:.0f}\" "
+                     f"{flowline_material} (${fl_per_km:.2f}MM/km)"))
+
+    # Umbilicals
+    cost_umbilical = umbilical_km * _UMBILICAL_MMUSD_PER_KM
+    if cost_umbilical > 0:
+        rows.append((180, cost_umbilical,
+                     f"Umbilical {umbilical_km:.0f} km "
+                     f"(${_UMBILICAL_MMUSD_PER_KM:.1f}MM/km)"))
+
+    # Risers
+    riser_unit = _RISER_COST.get(riser_type, 15.0)
+    cost_risers = n_risers * riser_unit
+    if cost_risers > 0:
+        rows.append((270, cost_risers,
+                     f"{n_risers} × {riser_type} (${riser_unit:.0f}MM each)"))
+
+    # Subsea boosting
+    cost_boosting = n_boosting * _BOOSTING_STATION_COST
+    if cost_boosting > 0:
+        rows.append((300, cost_boosting,
+                     f"{n_boosting} × subsea boosting station "
+                     f"(${_BOOSTING_STATION_COST:.0f}MM each)"))
+
+    # Gas lift
+    cost_gas_lift = 0.0
+    if gas_lift:
+        cost_gas_lift = _GAS_LIFT_BASE_COST + n_gas_lift_wells * _GAS_LIFT_PER_WELL
+        rows.append((300, cost_gas_lift,
+                     f"Gas-lift system ({n_gas_lift_wells} wells)"))
+
+    # Heating
+    cost_heating = 0.0
+    if heating_type and heating_type != "None":
+        if heating_type == "Electrically heated flowline (EHTF)":
+            cost_heating = heated_flowline_km * _EHTF_MMUSD_PER_KM
+            heat_label = (f"Electrically heated flowline "
+                          f"{heated_flowline_km:.0f} km")
+        elif heating_type == "Direct electric heating (DEH)":
+            cost_heating = heated_flowline_km * _DEH_MMUSD_PER_KM
+            heat_label = f"Direct electric heating {heated_flowline_km:.0f} km"
+        else:
+            cost_heating = _HEATING_SYSTEM_COST.get(heating_type, 0.0)
+            heat_label = heating_type
+        if cost_heating > 0:
+            rows.append((300, cost_heating, heat_label))
+
+    # ---- Concept-type-specific costs --------------------------------------
+    cost_host_or_platform = 0.0
+    cost_topsides = 0.0
+    cost_export = 0.0
+    cost_install = 0.0
+    cost_onshore_extra = 0.0
+
+    if concept_type == "Subsea tie-in":
+        # Host facility modifications
+        cost_host_or_platform = _HOST_TIEIN_MOD
+        rows.append((0, cost_host_or_platform,
+                     "Host facility modifications (tie-in)"))
+        # Installation — heavy for subsea
+        cost_install = 0.30 * (cost_templates + cost_flowline + cost_umbilical
+                               + cost_risers + cost_wet_trees)
+        rows.append((360, cost_install,
+                     "Installation + hook-up + commissioning"))
+        # Tie-in spool / connection at the host
+        if host_distance_km > 0:
+            tie_spool = 8.0 + 0.15 * host_distance_km
+            rows.append((330, tie_spool, "Tie-in spool + host connection"))
+
+    else:  # Standalone
+        host_type = g("host_type", "Fixed steel jacket (shallow)")
+        cap_kboed = float(g("processing_capacity_kboed", 50.0))
+        if host_type == "Onshore central processing facility (CPF)":
+            n_total_wells = int(g("n_total_wells",
+                                   n_dry_wells + n_subsea_wells))
+            cost_topsides = cap_kboed * _CPF_PER_KBOED
+            rows.append((120, cost_topsides,
+                         f"Central processing facility "
+                         f"({cap_kboed:.0f} kboe/d)"))
+            cost_onshore_extra = n_total_wells * _ONSHORE_WELLPAD_PER_WELL
+            rows.append((0, cost_onshore_extra,
+                         f"Well pads + access roads ({n_total_wells} wells)"))
+            cost_install = 0.18 * cost_topsides
+            rows.append((400, cost_install,
+                         "Construction + commissioning"))
+        else:
+            cost_host_or_platform = _PLATFORM_BASE.get(host_type, 380.0)
+            rows.append((0, cost_host_or_platform * 0.4,
+                         f"{host_type} — fabrication milestone 1"))
+            rows.append((365, cost_host_or_platform * 0.6,
+                         f"{host_type} — fabrication milestone 2"))
+            cost_topsides = cap_kboed * _TOPSIDES_PER_KBOED
+            rows.append((300, cost_topsides,
+                         f"Topsides + processing ({cap_kboed:.0f} kboe/d)"))
+            cost_install = 0.22 * (cost_host_or_platform + cost_topsides)
+            rows.append((540, cost_install,
+                         "Installation + hook-up + commissioning"))
+        # Export pipeline (offshore or onshore)
+        if export_pipeline_km > 0:
+            exp_per_km = _flowline_cost_per_km(export_pipeline_diam,
+                                                "Carbon steel",
+                                                water_depth_class
+                                                if host_type !=
+                                                "Onshore central processing facility (CPF)"
+                                                else "Shallow (<150 m)")
+            cost_export = export_pipeline_km * exp_per_km
+            rows.append((420, cost_export,
+                         f"Export pipeline {export_pipeline_km:.0f} km × "
+                         f"{export_pipeline_diam:.0f}\""))
+
+    # ---- Cessation / P&A --------------------------------------------------
+    capex_excl_cessation = sum(r[1] for r in rows)
+    # Cessation scales with the facility footprint — heavier for subsea-rich
+    # and floating concepts
+    subsea_intensity = (cost_templates + cost_wet_trees + cost_flowline
+                        + cost_risers + cost_umbilical)
+    cessation = (0.10 * capex_excl_cessation
+                 + 0.15 * subsea_intensity
+                 + 0.05 * (cost_host_or_platform + cost_topsides))
+    cessation = max(cessation, 10.0)   # floor
+
+    # ---- Build the dated schedule -----------------------------------------
+    capex_rows = []
+    for offset_days, amount, label in rows:
+        if amount <= 0:
+            continue
+        capex_rows.append({
+            "date": start_date + _td(days=int(offset_days)),
+            "amount_MMUSD": round(amount, 1),
+            "label": label,
+        })
+    # Cessation at end of horizon
+    cessation_date = start_date + _td(days=int(horizon_years * 365) - 30)
+    capex_rows.append({
+        "date": cessation_date,
+        "amount_MMUSD": round(cessation, 1),
+        "label": "Cessation / P&A / restoration",
+    })
+
+    grand_total = capex_excl_cessation + cessation
+
+    # ---- Summary ----------------------------------------------------------
+    summary.append(("Concept type", concept_type))
+    if concept_type == "Standalone":
+        summary.append(("Host / facility", g("host_type", "—")))
+        summary.append(("Processing capacity",
+                        f"{g('processing_capacity_kboed', 0):.0f} kboe/d"))
+    else:
+        summary.append(("Tie-back distance to host",
+                        f"{host_distance_km:.0f} km"))
+    summary.append(("Water depth class", water_depth_class))
+    if n_templates:
+        summary.append(("Subsea templates / manifolds", f"{n_templates}"))
+    if n_subsea_wells:
+        summary.append(("Wells on wet (subsea) trees", f"{n_subsea_wells}"))
+    if n_dry_wells:
+        summary.append(("Wells on dry (surface) trees", f"{n_dry_wells}"))
+    if flowline_km:
+        summary.append(("Flowline",
+                        f"{flowline_km:.0f} km × {flowline_diam:.0f}\" "
+                        f"{flowline_material}"))
+    if umbilical_km:
+        summary.append(("Umbilical", f"{umbilical_km:.0f} km"))
+    if n_risers:
+        summary.append(("Risers", f"{n_risers} × {riser_type}"))
+    if n_boosting:
+        summary.append(("Subsea boosting", f"{n_boosting} station(s)"))
+    if gas_lift:
+        summary.append(("Artificial lift",
+                        f"Gas lift ({n_gas_lift_wells} wells)"))
+    if heating_type and heating_type != "None":
+        summary.append(("Flow assurance — heating", heating_type))
+    if export_pipeline_km:
+        summary.append(("Export pipeline",
+                        f"{export_pipeline_km:.0f} km × "
+                        f"{export_pipeline_diam:.0f}\""))
+    summary.append(("CAPEX excl. cessation", f"${capex_excl_cessation:,.0f}MM"))
+    summary.append(("Cessation / P&A", f"${cessation:,.0f}MM"))
+    summary.append(("Grand total CAPEX", f"${grand_total:,.0f}MM"))
+
+    # ---- Engineering sanity checks ---------------------------------------
+    total_wells = n_subsea_wells + n_dry_wells
+    if total_wells == 0:
+        warnings.append("No wells specified in the concept — add subsea "
+                        "and/or dry wells.")
+    if concept_type == "Subsea tie-in":
+        if host_distance_km <= 0:
+            warnings.append("Tie-in concept but tie-back distance to host is "
+                            "0 km — set the distance to the host facility.")
+        if flowline_km <= 0:
+            warnings.append("Tie-in concept with no flowline — a tie-back "
+                            "needs a flowline to the host.")
+        if host_distance_km > 50:
+            warnings.append(f"Tie-back distance {host_distance_km:.0f} km is "
+                            "long — beyond ~30-50 km, flow assurance "
+                            "(hydrates, heating, slugging) and pressure "
+                            "support become major issues; a standalone "
+                            "facility may be more robust.")
+        if n_subsea_wells == 0 and n_dry_wells > 0:
+            warnings.append("Tie-in concept usually implies subsea wells — "
+                            "dry trees need a platform.")
+    else:
+        host_type = g("host_type", "")
+        if "FPSO" in host_type or "Semi" in host_type or "Spar" in host_type \
+                or "TLP" in host_type:
+            if water_depth_class == "Shallow (<150 m)":
+                warnings.append(f"{host_type} is a deep-water solution but "
+                                "water depth is set to shallow — a fixed "
+                                "platform is normally cheaper in shallow water.")
+        if "jacket" in host_type.lower() or "gravity" in host_type.lower():
+            if water_depth_class in ("Deep (600-1500 m)",
+                                      "Ultra-deep (>1500 m)"):
+                warnings.append(f"{host_type} is a fixed structure — fixed "
+                                "platforms are not feasible beyond "
+                                "~400-500 m water depth. Use a floating "
+                                "host (FPSO / semi / spar / TLP).")
+        if n_dry_wells == 0 and "Onshore" not in host_type:
+            warnings.append("Standalone platform with no dry wells — if all "
+                            "wells are subsea, a tie-in to an existing host "
+                            "(if one is nearby) could be more capital-"
+                            "efficient.")
+    # Riser / well consistency
+    if n_risers > 0 and (n_subsea_wells + n_templates) == 0:
+        warnings.append("Risers specified but no subsea wells/templates to "
+                        "connect them to.")
+    if n_subsea_wells > 0 and n_risers == 0 and concept_type == "Standalone":
+        warnings.append("Subsea wells on a standalone host but no risers — "
+                        "subsea production needs risers to reach the host.")
+    # Boosting sanity
+    if n_boosting > 0 and flowline_km < 5:
+        warnings.append("Subsea boosting specified for a very short flowline "
+                        "— boosting is normally justified by long tie-backs "
+                        "or low reservoir energy.")
+    # Heating sanity
+    if heating_type in ("Electrically heated flowline (EHTF)",
+                         "Direct electric heating (DEH)") \
+            and heated_flowline_km <= 0:
+        warnings.append(f"{heating_type} selected but heated flowline length "
+                        "is 0 km — set the length of line to be heated.")
+    # Diameter sanity
+    if flowline_diam < 6 or flowline_diam > 30:
+        warnings.append(f"Flowline diameter {flowline_diam:.0f}\" is outside "
+                        "the typical 6-30\" screening range — check the value.")
+
+    # ---- Schematic SVG ----------------------------------------------------
+    schematic = _concept_schematic_svg(spec, concept_type)
+
+    return {
+        "capex_rows": capex_rows,
+        "summary": summary,
+        "warnings": warnings,
+        "schematic": schematic,
+        "totals": {
+            "capex_excl_cessation": capex_excl_cessation,
+            "cessation": cessation,
+            "grand_total": grand_total,
+        },
+    }
+
+
+def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
+    """Generate a simple SVG schematic of the development concept.
+
+    Deliberately schematic — boxes, lines and labels, not to scale. Gives the
+    user a quick visual sense-check of what they have specified.
+    """
+    def g(key, default=None):
+        return spec.get(key, default)
+
+    n_subsea = int(g("n_subsea_wells", 0))
+    n_dry = int(g("n_dry_wells", 0))
+    n_templates = int(g("n_templates", 0))
+    n_risers = int(g("n_risers", 0))
+    n_boosting = int(g("n_boosting_stations", 0))
+    gas_lift = bool(g("gas_lift", False))
+    heating = g("heating_type", "None")
+    flowline_km = float(g("flowline_km", 0.0))
+    host_distance_km = float(g("host_distance_km", 0.0))
+    export_km = float(g("export_pipeline_km", 0.0))
+
+    W, H = 720, 380
+    sea = 90          # sea-surface y
+    seabed = 300      # seabed y
+    parts = []
+    parts.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
+                 f'height="{H}" viewBox="0 0 {W} {H}" font-family="sans-serif">')
+    # Sky / sea / seabed bands
+    parts.append(f'<rect x="0" y="0" width="{W}" height="{sea}" fill="#dCEcF7"/>')
+    parts.append(f'<rect x="0" y="{sea}" width="{W}" height="{seabed-sea}" '
+                 f'fill="#bcdcef"/>')
+    parts.append(f'<rect x="0" y="{seabed}" width="{W}" height="{H-seabed}" '
+                 f'fill="#d8c9a8"/>')
+    parts.append(f'<line x1="0" y1="{sea}" x2="{W}" y2="{sea}" '
+                 f'stroke="#5a9bcf" stroke-width="2"/>')
+    parts.append(f'<text x="8" y="{sea-6}" font-size="11" fill="#33648a">'
+                 f'Sea surface</text>')
+    parts.append(f'<text x="8" y="{seabed+16}" font-size="11" fill="#7a6a45">'
+                 f'Seabed</text>')
+
+    is_onshore = (concept_type == "Standalone" and
+                  "Onshore" in str(g("host_type", "")))
+
+    if is_onshore:
+        # Onshore: wellpads + CPF on the surface
+        parts.append(f'<rect x="0" y="0" width="{W}" height="{seabed}" '
+                     f'fill="#e8e2d0"/>')
+        parts.append(f'<rect x="0" y="{seabed}" width="{W}" height="{H-seabed}" '
+                     f'fill="#cdbf9a"/>')
+        # CPF
+        parts.append(f'<rect x="500" y="170" width="150" height="90" '
+                     f'fill="#8a8a8a" stroke="#333" stroke-width="2"/>')
+        parts.append(f'<text x="575" y="220" font-size="12" fill="white" '
+                     f'text-anchor="middle">Central</text>')
+        parts.append(f'<text x="575" y="236" font-size="12" fill="white" '
+                     f'text-anchor="middle">Processing</text>')
+        # wellpads
+        n_pads = max(1, n_dry + n_subsea)
+        for i in range(min(n_pads, 6)):
+            x = 60 + i * 65
+            parts.append(f'<rect x="{x}" y="235" width="34" height="20" '
+                         f'fill="#5a8f3a" stroke="#333"/>')
+            parts.append(f'<line x1="{x+17}" y1="235" x2="{x+17}" y2="200" '
+                         f'stroke="#333" stroke-width="3"/>')  # derrick
+            parts.append(f'<line x1="{x+34}" y1="245" x2="500" y2="230" '
+                         f'stroke="#946" stroke-width="2"/>')  # gathering line
+        parts.append(f'<text x="200" y="285" font-size="11" '
+                     f'fill="#333">Well pads + gathering lines</text>')
+        if export_km > 0:
+            parts.append(f'<line x1="650" y1="215" x2="710" y2="215" '
+                         f'stroke="#246" stroke-width="4"/>')
+            parts.append(f'<text x="600" y="150" font-size="11" fill="#246">'
+                         f'Export pipeline {export_km:.0f} km →</text>')
+        parts.append('</svg>')
+        return "".join(parts)
+
+    # Offshore concepts
+    if concept_type == "Subsea tie-in":
+        # Host platform on the right
+        hx = 600
+        parts.append(f'<rect x="{hx}" y="{sea-50}" width="80" height="50" '
+                     f'fill="#7a7a7a" stroke="#333" stroke-width="2"/>')
+        parts.append(f'<line x1="{hx+12}" y1="{sea}" x2="{hx+12}" y2="{seabed}" '
+                     f'stroke="#555" stroke-width="4"/>')
+        parts.append(f'<line x1="{hx+68}" y1="{sea}" x2="{hx+68}" y2="{seabed}" '
+                     f'stroke="#555" stroke-width="4"/>')
+        parts.append(f'<text x="{hx+40}" y="{sea-58}" font-size="11" '
+                     f'fill="#333" text-anchor="middle">Host facility</text>')
+        # Subsea template + wells on the left
+        tx = 90
+        parts.append(f'<rect x="{tx}" y="{seabed-14}" width="90" height="16" '
+                     f'fill="#c46" stroke="#333" stroke-width="2"/>')
+        parts.append(f'<text x="{tx+45}" y="{seabed+28}" font-size="11" '
+                     f'fill="#333" text-anchor="middle">'
+                     f'{max(1,n_templates)} template(s), {n_subsea} wells</text>')
+        for i in range(min(max(1, n_subsea), 6)):
+            wx = tx + 8 + i * 14
+            parts.append(f'<line x1="{wx}" y1="{seabed}" x2="{wx}" '
+                         f'y2="{seabed+30}" stroke="#333" stroke-width="3"/>')
+        # Flowline template → host
+        parts.append(f'<line x1="{tx+90}" y1="{seabed-6}" x2="{hx}" '
+                     f'y2="{seabed-6}" stroke="#246" stroke-width="4"/>')
+        midx = (tx + 90 + hx) / 2
+        parts.append(f'<text x="{midx}" y="{seabed-14}" font-size="11" '
+                     f'fill="#246" text-anchor="middle">'
+                     f'Flowline {flowline_km:.0f} km '
+                     f'(tie-back {host_distance_km:.0f} km)</text>')
+        # Boosting station
+        if n_boosting > 0:
+            bx = midx
+            parts.append(f'<circle cx="{bx}" cy="{seabed-6}" r="9" '
+                         f'fill="#fa3" stroke="#333" stroke-width="2"/>')
+            parts.append(f'<text x="{bx}" y="{seabed+18}" font-size="10" '
+                         f'fill="#a60" text-anchor="middle">'
+                         f'Boosting ×{n_boosting}</text>')
+        # Risers up the host
+        if n_risers > 0:
+            parts.append(f'<path d="M {hx} {seabed-6} Q {hx-30} '
+                         f'{(seabed+sea)/2} {hx+12} {sea}" fill="none" '
+                         f'stroke="#19a" stroke-width="3"/>')
+            parts.append(f'<text x="{hx-50}" y="{(seabed+sea)/2}" '
+                         f'font-size="10" fill="#19a">{n_risers} riser(s)</text>')
+        # Heating annotation
+        if heating and heating != "None":
+            parts.append(f'<text x="{midx}" y="{seabed+2}" font-size="10" '
+                         f'fill="#d33" text-anchor="middle">⚡ heated line</text>')
+
+    else:  # Standalone offshore
+        # Standalone host in the centre
+        hx = 320
+        host_type = str(g("host_type", ""))
+        floating = any(k in host_type for k in
+                       ("FPSO", "Semi", "Spar", "TLP", "Compliant"))
+        if floating:
+            # floating hull
+            parts.append(f'<rect x="{hx}" y="{sea-12}" width="140" height="28" '
+                         f'rx="8" fill="#7a7a7a" stroke="#333" '
+                         f'stroke-width="2"/>')
+            parts.append(f'<rect x="{hx+30}" y="{sea-42}" width="80" '
+                         f'height="30" fill="#9a9a9a" stroke="#333"/>')
+            # mooring lines
+            parts.append(f'<line x1="{hx}" y1="{sea+10}" x2="{hx-90}" '
+                         f'y2="{seabed}" stroke="#555" stroke-width="2"/>')
+            parts.append(f'<line x1="{hx+140}" y1="{sea+10}" x2="{hx+230}" '
+                         f'y2="{seabed}" stroke="#555" stroke-width="2"/>')
+            parts.append(f'<text x="{hx+70}" y="{sea-48}" font-size="11" '
+                         f'fill="#333" text-anchor="middle">'
+                         f'{host_type}</text>')
+        else:
+            # fixed platform
+            parts.append(f'<rect x="{hx+20}" y="{sea-46}" width="100" '
+                         f'height="46" fill="#7a7a7a" stroke="#333" '
+                         f'stroke-width="2"/>')
+            parts.append(f'<line x1="{hx+30}" y1="{sea}" x2="{hx+45}" '
+                         f'y2="{seabed}" stroke="#555" stroke-width="4"/>')
+            parts.append(f'<line x1="{hx+110}" y1="{sea}" x2="{hx+95}" '
+                         f'y2="{seabed}" stroke="#555" stroke-width="4"/>')
+            parts.append(f'<text x="{hx+70}" y="{sea-52}" font-size="11" '
+                         f'fill="#333" text-anchor="middle">{host_type}</text>')
+        # Dry wells down through the platform
+        if n_dry > 0:
+            for i in range(min(n_dry, 6)):
+                wx = hx + 35 + i * 12
+                parts.append(f'<line x1="{wx}" y1="{seabed}" x2="{wx}" '
+                             f'y2="{seabed+30}" stroke="#284" '
+                             f'stroke-width="3"/>')
+            parts.append(f'<text x="{hx+70}" y="{seabed+44}" font-size="10" '
+                         f'fill="#284" text-anchor="middle">'
+                         f'{n_dry} dry well(s)</text>')
+        # Subsea wells + template on the left, tied back
+        if n_subsea > 0:
+            tx = 70
+            parts.append(f'<rect x="{tx}" y="{seabed-14}" width="80" '
+                         f'height="16" fill="#c46" stroke="#333" '
+                         f'stroke-width="2"/>')
+            for i in range(min(n_subsea, 5)):
+                wx = tx + 8 + i * 14
+                parts.append(f'<line x1="{wx}" y1="{seabed}" x2="{wx}" '
+                             f'y2="{seabed+28}" stroke="#333" '
+                             f'stroke-width="3"/>')
+            parts.append(f'<text x="{tx+40}" y="{seabed+42}" font-size="10" '
+                         f'fill="#333" text-anchor="middle">'
+                         f'{n_subsea} subsea well(s)</text>')
+            parts.append(f'<line x1="{tx+80}" y1="{seabed-6}" x2="{hx+20}" '
+                         f'y2="{seabed-6}" stroke="#246" stroke-width="4"/>')
+            if n_risers > 0:
+                parts.append(f'<path d="M {hx+20} {seabed-6} Q {hx} '
+                             f'{(seabed+sea)/2} {hx+30} {sea}" fill="none" '
+                             f'stroke="#19a" stroke-width="3"/>')
+        # Export pipeline
+        if export_km > 0:
+            parts.append(f'<line x1="{hx+120}" y1="{sea-20}" x2="{W-10}" '
+                         f'y2="{sea-20}" stroke="#246" stroke-width="4"/>')
+            parts.append(f'<text x="{hx+200}" y="{sea-26}" font-size="10" '
+                         f'fill="#246">Export {export_km:.0f} km →</text>')
+
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+# =============================================================================
+# Project schedule builder — concept-aware milestone timeline + realism checks
+# =============================================================================
+# A project schedule is a milestone timeline from FEED through to first oil.
+# Phase durations depend strongly on the chosen development concept: a
+# subsea tie-in can reach first oil in ~2 years from sanction, while a
+# greenfield deep-water FPSO typically needs 4-6 years.
+#
+# The builder takes (a) the concept spec from build_development_concept and
+# (b) per-phase durations from the user. It produces a dated milestone
+# schedule + warnings if any phase is outside realistic industry bounds.
+#
+# Phase definitions (industry-standard):
+#   FEED           : front-end engineering & design (the "definition" phase)
+#   Sanction (DG3) : final investment decision — a milestone, not a duration
+#   Long-lead      : fabrication of long-lead items (FPSO hull, jacket steel,
+#                    subsea trees) begins, typically overlapping with EPC
+#   Fabrication    : main EPC build phase (topsides, hull, jacket, subsea)
+#   Installation   : offshore campaign — pipelay, heavy lift, riser pull-in
+#   Hookup & comm. : mechanical completion, commissioning, performance testing
+#   First oil      : production startup (the goal milestone)
+
+# Industry benchmark phase durations (months) — screening-level ranges drawn
+# from published project case studies and IOGP / industry surveys. Tuples are
+# (typical_min, typical, typical_max). A duration outside the (min, max)
+# range fires a realism warning.
+_SCHEDULE_BENCHMARKS = {
+    # Subsea tie-in to an existing host — the fastest concept
+    ("Subsea tie-in", "any"): {
+        "FEED":           ( 6,  9, 15),
+        "Long-lead":      ( 6, 10, 16),
+        "Fabrication":    ( 9, 15, 24),
+        "Installation":   ( 3,  6, 10),
+        "Hookup & comm.": ( 3,  5,  9),
+    },
+    # Standalone onshore — generally the next-fastest
+    ("Standalone", "Onshore central processing facility (CPF)"): {
+        "FEED":           ( 9, 14, 22),
+        "Long-lead":      ( 6, 12, 18),
+        "Fabrication":    (12, 20, 30),
+        "Installation":   ( 6, 10, 15),
+        "Hookup & comm.": ( 4,  7, 12),
+    },
+    # Standalone fixed platform (jacket / gravity / compliant tower)
+    ("Standalone", "fixed"): {
+        "FEED":           (12, 18, 26),
+        "Long-lead":      (12, 18, 28),
+        "Fabrication":    (18, 28, 42),
+        "Installation":   ( 6, 10, 18),
+        "Hookup & comm.": ( 6, 10, 15),
+    },
+    # Standalone floating (FPSO / semi / spar / TLP) — the longest schedules
+    ("Standalone", "floating"): {
+        "FEED":           (15, 22, 32),
+        "Long-lead":      (18, 28, 42),
+        "Fabrication":    (24, 36, 54),
+        "Installation":   ( 8, 14, 22),
+        "Hookup & comm.": ( 8, 14, 22),
+    },
+}
+
+
+def _concept_benchmark_key(spec: dict) -> tuple:
+    """Pick the right benchmark family for this concept."""
+    concept_type = spec.get("concept_type", "Subsea tie-in")
+    host_type = str(spec.get("host_type", "") or "")
+    if concept_type == "Subsea tie-in":
+        return ("Subsea tie-in", "any")
+    if "Onshore" in host_type:
+        return ("Standalone", "Onshore central processing facility (CPF)")
+    if any(k in host_type for k in ("FPSO", "Semi", "Spar", "TLP")):
+        return ("Standalone", "floating")
+    return ("Standalone", "fixed")
+
+
+def default_schedule_durations(spec: dict) -> dict:
+    """Return the typical phase durations (months) for a given concept spec,
+    used to pre-populate the schedule UI."""
+    key = _concept_benchmark_key(spec)
+    bench = _SCHEDULE_BENCHMARKS.get(key,
+                                       _SCHEDULE_BENCHMARKS[("Subsea tie-in",
+                                                              "any")])
+    return {phase: typical for phase, (_lo, typical, _hi) in bench.items()}
+
+
+def build_project_schedule(spec: dict, feed_start, durations: dict,
+                            overlap_longlead_months: int = 0) -> dict:
+    """Build a dated milestone schedule.
+
+    Args:
+        spec                       : the development concept spec (used for
+                                     benchmark realism checks).
+        feed_start                 : start date of FEED (anchors the timeline).
+        durations                  : {"FEED": months, "Long-lead": months,
+                                     "Fabrication": months,
+                                     "Installation": months,
+                                     "Hookup & comm.": months}
+        overlap_longlead_months    : months by which long-lead overlaps
+                                     fabrication start. 0 = sequential;
+                                     6-12 is common when long-lead items are
+                                     ordered before fabrication completes.
+
+    Returns dict:
+        phases           : list of {phase, start, end, duration_months}
+        milestones       : list of (label, date)
+        first_oil_date   : date (computed end of hookup & commissioning)
+        total_months     : int
+        warnings         : list[str] (realism flags)
+        benchmark_key    : tuple   (for display: which family was used)
+    """
+    from datetime import date as _date, timedelta as _td
+    if not isinstance(feed_start, _date):
+        feed_start = _date.today()
+
+    def _add_months(d, m):
+        # Approximate month addition — sufficient for screening schedules.
+        days = int(round(m * 30.4375))
+        return d + _td(days=days)
+
+    # Order matters
+    sequence = ["FEED", "Long-lead", "Fabrication", "Installation",
+                "Hookup & comm."]
+    durs = {p: max(0, int(round(durations.get(p, 0)))) for p in sequence}
+
+    phases = []
+    # FEED: starts at feed_start
+    feed_end = _add_months(feed_start, durs["FEED"])
+    phases.append({"phase": "FEED", "start": feed_start, "end": feed_end,
+                    "duration_months": durs["FEED"]})
+
+    # Sanction / DG3 is a milestone at FEED end
+    sanction_date = feed_end
+
+    # Long-lead: from sanction
+    ll_start = sanction_date
+    ll_end = _add_months(ll_start, durs["Long-lead"])
+    phases.append({"phase": "Long-lead", "start": ll_start, "end": ll_end,
+                    "duration_months": durs["Long-lead"]})
+
+    # Fabrication: can start while long-lead is still running (overlap)
+    fab_start = _add_months(ll_start,
+                             max(0, durs["Long-lead"] - overlap_longlead_months))
+    fab_end = _add_months(fab_start, durs["Fabrication"])
+    phases.append({"phase": "Fabrication", "start": fab_start, "end": fab_end,
+                    "duration_months": durs["Fabrication"]})
+
+    # Installation: starts when both long-lead and fabrication are done
+    inst_start = max(ll_end, fab_end)
+    inst_end = _add_months(inst_start, durs["Installation"])
+    phases.append({"phase": "Installation", "start": inst_start,
+                    "end": inst_end, "duration_months": durs["Installation"]})
+
+    # Hookup & commissioning
+    huc_start = inst_end
+    huc_end = _add_months(huc_start, durs["Hookup & comm."])
+    phases.append({"phase": "Hookup & comm.", "start": huc_start,
+                    "end": huc_end, "duration_months": durs["Hookup & comm."]})
+
+    first_oil_date = huc_end
+    total_months = sum(durs.values())  # nominal duration (excl. overlap)
+    actual_months = (first_oil_date - feed_start).days / 30.4375
+
+    # Milestones
+    milestones = [
+        ("Concept select / pre-FEED start", feed_start),
+        ("DG3 / Sanction / FID",           sanction_date),
+        ("Long-lead items committed",       ll_start),
+        ("Major fabrication starts",        fab_start),
+        ("Offshore campaign starts",        inst_start),
+        ("Mechanical completion",           inst_end),
+        ("First oil",                       first_oil_date),
+    ]
+
+    # ---- Realism warnings -------------------------------------------------
+    warnings = []
+    bench_key = _concept_benchmark_key(spec)
+    bench = _SCHEDULE_BENCHMARKS.get(bench_key,
+                                      _SCHEDULE_BENCHMARKS[("Subsea tie-in",
+                                                             "any")])
+    for phase, (lo, typ, hi) in bench.items():
+        d = durs.get(phase, 0)
+        if d == 0:
+            warnings.append(
+                f"{phase}: duration is 0 months — every project needs some "
+                f"{phase.lower()} time. Typical for this concept: {typ} months "
+                f"(range {lo}-{hi}).")
+        elif d < lo:
+            warnings.append(
+                f"{phase}: {d} months is below the realistic minimum of "
+                f"{lo} months for this concept (typical {typ}, range {lo}-{hi}). "
+                f"This is aggressive — execution risk is high.")
+        elif d > hi:
+            warnings.append(
+                f"{phase}: {d} months is above the typical maximum of "
+                f"{hi} months for this concept (typical {typ}, range {lo}-{hi}). "
+                f"This is conservative — check whether it can be compressed.")
+
+    # Total-duration sanity: sum of typical for the concept
+    typ_total = sum(typ for _lo, typ, _hi in bench.values())
+    if actual_months < 0.6 * typ_total:
+        warnings.append(
+            f"Total schedule of {actual_months:.0f} months is well below the "
+            f"benchmark total of {typ_total:.0f} months for this concept — "
+            "the overall timeline looks unrealistic. Check the phase "
+            "durations.")
+    if overlap_longlead_months > durs["Long-lead"]:
+        warnings.append(
+            f"Long-lead/fabrication overlap of {overlap_longlead_months} "
+            f"months exceeds the long-lead duration of {durs['Long-lead']} "
+            "months — overlap cannot be larger than the phase itself.")
+
+    # Subsea-specific check: a long tie-back implies longer install
+    if spec.get("concept_type") == "Subsea tie-in":
+        tieback = float(spec.get("host_distance_km", 0) or 0)
+        if tieback > 30 and durs.get("Installation", 0) < 6:
+            warnings.append(
+                f"Tie-back distance is {tieback:.0f} km but installation is "
+                f"only {durs['Installation']} months — long tie-backs need "
+                "an extended pipelay / installation window.")
+
+    return {
+        "phases": phases,
+        "milestones": milestones,
+        "first_oil_date": first_oil_date,
+        "total_months": int(round(actual_months)),
+        "warnings": warnings,
+        "benchmark_key": bench_key,
+        "benchmark": bench,
+    }

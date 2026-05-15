@@ -4110,6 +4110,14 @@ def _clean_table_buffer(edited_df: pd.DataFrame, fallback_df: pd.DataFrame,
     return out
 
 
+def _svg_to_data_uri(svg_string: str) -> str:
+    """Convert an SVG string to a base64 data URI so st.image can render it
+    inline. Streamlit's st.image accepts data: URIs directly."""
+    import base64
+    b64 = base64.b64encode(svg_string.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{b64}"
+
+
 def _duplicate_last_row(df: pd.DataFrame) -> pd.DataFrame:
     """Append a copy of the last row to a DataFrame. If the DataFrame is empty,
     returns it unchanged."""
@@ -4421,141 +4429,458 @@ def economics_section(units, start_date):
 
     st.markdown("**Facility CAPEX**")
 
-    # ---- CAPEX recipe builder ----
-    with st.expander("🏗️ CAPEX recipe builder — generate phased CAPEX from a development concept",
+    # ---- Development concept builder ----
+    with st.expander("🏗️ Development concept builder — design the concept & generate CAPEX",
                      expanded=False):
         st.caption(
-            "Pick a development concept and enter component costs. Clicking "
-            "**Generate CAPEX schedule** overwrites the phased table below with "
-            "rows derived from your recipe. You can then fine-tune dates/amounts "
-            "directly in the table."
+            "Specify a development concept in engineering terms (host type, "
+            "water depth, templates, flowlines, risers, trees, boosting, "
+            "artificial lift, flow assurance). The builder produces a phased "
+            "CAPEX schedule, a concept summary, engineering sanity-check "
+            "warnings, and a schematic. Clicking **Generate CAPEX schedule** "
+            "overwrites the phased table below. All cost models are "
+            "screening-level — order-of-magnitude, for concept select."
         )
-        concept = st.radio(
-            "Development concept",
-            ["Subsea tie-in", "Standalone offshore (shallow water)",
-             "Standalone offshore (deep water)", "Standalone onshore"],
-            key="capex_concept",
-            help="Subsea tie-in: wells tied back to existing host facility. "
-                 "Standalone: dedicated production facility "
-                 "(platform/FPSO offshore, processing plant onshore).",
-        )
-        rc1, rc2, rc3 = st.columns(3)
-        recipe_rows = []
-        fop = start_date  # first facility spend anchor
 
-        if concept == "Subsea tie-in":
-            tmpl_cost = rc1.number_input("Subsea template / manifold ($MM)",
-                                          value=80.0, min_value=0.0, step=5.0,
-                                          key="cx_tie_template")
-            flowline_cost = rc2.number_input("Flowline + umbilical ($MM)",
-                                              value=120.0, min_value=0.0, step=5.0,
-                                              key="cx_tie_flowline",
-                                              help="Includes tie-in spool, riser, controls.")
-            install_cost = rc3.number_input("Installation + hookup ($MM)",
-                                             value=60.0, min_value=0.0, step=5.0,
-                                             key="cx_tie_install")
-            host_mod_cost = rc1.number_input("Host facility modifications ($MM)",
-                                              value=40.0, min_value=0.0, step=5.0,
-                                              key="cx_tie_hostmod",
-                                              help="Topsides tie-in, capacity upgrades on the host.")
-            cessation_cost = rc2.number_input("Cessation / P&A ($MM)",
-                                               value=30.0, min_value=0.0, step=5.0,
-                                               key="cx_tie_cessation",
-                                               help="Booked at end of field life.")
-            recipe_rows = [
-                (fop, tmpl_cost, "Subsea template / manifold"),
-                (fop, host_mod_cost, "Host facility modifications"),
-                (fop + timedelta(days=180), flowline_cost, "Flowline + umbilical"),
-                (fop + timedelta(days=300), install_cost, "Installation + hookup"),
+        dc1, dc2 = st.columns(2)
+        concept_type = dc1.radio(
+            "Concept type",
+            ["Subsea tie-in", "Standalone"],
+            key="dc_concept_type",
+            help="Subsea tie-in: wells tied back to an EXISTING host facility "
+                 "— lowest CAPEX, but limited by tie-back distance and host "
+                 "ullage.\n\nStandalone: a DEDICATED production facility "
+                 "(platform / FPSO offshore, or a central processing "
+                 "facility onshore).")
+        water_depth_class = dc2.selectbox(
+            "Water depth class",
+            ["Shallow (<150 m)", "Mid (150-600 m)", "Deep (600-1500 m)",
+             "Ultra-deep (>1500 m)"],
+            key="dc_water_depth",
+            help="Drives installation-difficulty multipliers on flowlines, "
+                 "risers and subsea hardware, and constrains the feasible "
+                 "host types (fixed structures are not feasible beyond "
+                 "~400-500 m).")
+
+        host_type = None
+        processing_capacity = 50.0
+        host_distance_km = 0.0
+        if concept_type == "Standalone":
+            host_options = [
+                "Fixed steel jacket (shallow)", "Fixed steel jacket (mid)",
+                "Concrete gravity structure", "Compliant tower",
+                "Jack-up production unit",
+                "FPSO (leased — capitalised)", "FPSO (owned)",
+                "Semi-submersible FPU", "Spar", "TLP (tension-leg platform)",
+                "Onshore central processing facility (CPF)",
             ]
-        elif concept == "Standalone offshore (shallow water)":
-            jacket = rc1.number_input("Jacket + piles ($MM)", value=150.0,
-                                       min_value=0.0, step=10.0, key="cx_sh_jacket")
-            topsides = rc2.number_input("Topsides + processing ($MM)", value=400.0,
-                                         min_value=0.0, step=10.0, key="cx_sh_topsides")
-            subsea = rc3.number_input("Wells + subsea ($MM)", value=120.0,
-                                       min_value=0.0, step=10.0, key="cx_sh_subsea")
-            pipeline = rc1.number_input("Export pipeline ($MM)", value=180.0,
-                                         min_value=0.0, step=10.0, key="cx_sh_pipeline")
-            install = rc2.number_input("Installation + commissioning ($MM)", value=100.0,
-                                        min_value=0.0, step=10.0, key="cx_sh_install")
-            cessation = rc3.number_input("Cessation / P&A ($MM)", value=120.0,
-                                          min_value=0.0, step=10.0, key="cx_sh_cessation")
-            recipe_rows = [
-                (fop, jacket, "Jacket + piles"),
-                (fop + timedelta(days=180), topsides, "Topsides + processing"),
-                (fop + timedelta(days=360), subsea, "Wells + subsea"),
-                (fop + timedelta(days=360), pipeline, "Export pipeline"),
-                (fop + timedelta(days=540), install, "Installation + commissioning"),
-            ]
-        elif concept == "Standalone offshore (deep water)":
-            fpso = rc1.number_input("FPSO hull + topsides ($MM)", value=1200.0,
-                                     min_value=0.0, step=50.0, key="cx_dw_fpso")
-            subsea = rc2.number_input("Subsea production system ($MM)", value=600.0,
-                                       min_value=0.0, step=50.0, key="cx_dw_subsea",
-                                       help="Trees, manifolds, jumpers, controls.")
-            risers = rc3.number_input("Risers + flowlines + umbilicals ($MM)", value=450.0,
-                                       min_value=0.0, step=50.0, key="cx_dw_risers")
-            install = rc1.number_input("Installation (heavy-lift / pipelay) ($MM)", value=350.0,
-                                        min_value=0.0, step=50.0, key="cx_dw_install")
-            mooring = rc2.number_input("Mooring + station-keeping ($MM)", value=200.0,
-                                        min_value=0.0, step=25.0, key="cx_dw_mooring")
-            cessation = rc3.number_input("Cessation / P&A ($MM)", value=300.0,
-                                          min_value=0.0, step=25.0, key="cx_dw_cessation")
-            recipe_rows = [
-                (fop, fpso * 0.4, "FPSO — milestone 1 (order)"),
-                (fop + timedelta(days=365), fpso * 0.6, "FPSO — milestone 2 (delivery)"),
-                (fop + timedelta(days=180), subsea, "Subsea production system"),
-                (fop + timedelta(days=540), risers, "Risers + flowlines + umbilicals"),
-                (fop + timedelta(days=540), mooring, "Mooring + station-keeping"),
-                (fop + timedelta(days=700), install, "Installation"),
-            ]
-        else:  # Standalone onshore
-            wellpads = rc1.number_input("Well pads + access roads ($MM)", value=40.0,
-                                         min_value=0.0, step=5.0, key="cx_on_pads")
-            cpf = rc2.number_input("Central processing facility ($MM)", value=250.0,
-                                    min_value=0.0, step=10.0, key="cx_on_cpf")
-            pipelines = rc3.number_input("Gathering + export pipelines ($MM)", value=120.0,
-                                          min_value=0.0, step=10.0, key="cx_on_pipe")
-            utilities = rc1.number_input("Utilities + infrastructure ($MM)", value=60.0,
-                                          min_value=0.0, step=5.0, key="cx_on_util")
-            install = rc2.number_input("Construction + commissioning ($MM)", value=80.0,
-                                        min_value=0.0, step=5.0, key="cx_on_install")
-            cessation = rc3.number_input("Cessation / restoration ($MM)", value=50.0,
-                                          min_value=0.0, step=5.0, key="cx_on_cessation")
-            recipe_rows = [
-                (fop, wellpads, "Well pads + access roads"),
-                (fop + timedelta(days=120), cpf, "Central processing facility"),
-                (fop + timedelta(days=240), pipelines, "Gathering + export pipelines"),
-                (fop + timedelta(days=240), utilities, "Utilities + infrastructure"),
-                (fop + timedelta(days=400), install, "Construction + commissioning"),
-            ]
-        # Pull the cessation value out of whichever branch ran
-        _cessation_val = locals().get("cessation_cost",
-                                       locals().get("cessation", 0.0))
-        total_recipe = sum(r[1] for r in recipe_rows) + _cessation_val
+            hc1, hc2 = st.columns(2)
+            host_type = hc1.selectbox(
+                "Host / facility type", host_options, key="dc_host_type",
+                help="Fixed structures (jacket, gravity, compliant tower, "
+                     "jack-up): shallow-to-mid water only. Floating hosts "
+                     "(FPSO, semi, spar, TLP): mid-to-ultra-deep. Onshore "
+                     "CPF: land developments.")
+            processing_capacity = hc2.number_input(
+                "Processing capacity (kboe/d)", min_value=1.0, value=50.0,
+                step=5.0, key="dc_proc_cap",
+                help="Plant throughput sizing basis. Topsides / CPF cost "
+                     "scales with this. Set it to roughly your expected "
+                     "plateau rate in thousand boe/d.")
+        else:
+            host_distance_km = st.number_input(
+                "Tie-back distance to host facility (km)",
+                min_value=0.0, value=15.0, step=1.0, key="dc_host_dist",
+                help="Distance from the field to the existing host. Beyond "
+                     "~30-50 km, flow assurance and pressure support become "
+                     "major issues — the builder will warn you.")
+
+        st.markdown("**Wells & subsea hardware**")
+        ws1, ws2, ws3, ws4 = st.columns(4)
+        n_templates = ws1.number_input(
+            "Subsea templates / manifolds", min_value=0, value=1, step=1,
+            key="dc_n_templates",
+            help="Subsea structures that host and tie together multiple "
+                 "wells. ~$45MM each (screening).")
+        n_subsea_wells = ws2.number_input(
+            "Wells on wet (subsea) trees", min_value=0, value=4, step=1,
+            key="dc_n_subsea_wells",
+            help="Wells completed with subsea xmas trees on the seabed "
+                 "(~$9MM/tree). Standard for tie-ins and floating hosts.")
+        n_dry_wells = ws3.number_input(
+            "Wells on dry (surface) trees", min_value=0, value=0, step=1,
+            key="dc_n_dry_wells",
+            help="Wells completed with surface xmas trees on a platform "
+                 "deck (~$1.8MM/tree). Only possible with a fixed platform "
+                 "or a dry-tree-capable floater (spar / TLP).")
+        n_risers = ws4.number_input(
+            "Number of risers", min_value=0, value=2, step=1,
+            key="dc_n_risers",
+            help="Pipes carrying fluids from the seabed up to a floating or "
+                 "fixed host. Subsea production needs risers; dry-tree wells "
+                 "do not.")
+        rs1, rs2 = st.columns(2)
+        riser_type = rs1.selectbox(
+            "Riser type",
+            ["Flexible riser", "Steel catenary riser (SCR)",
+             "Top-tensioned riser (TTR)", "Hybrid riser tower segment"],
+            key="dc_riser_type",
+            help="Flexible: most common, mid-cost. SCR: rigid, deep water. "
+                 "TTR: dry-tree floaters (spar/TLP). Hybrid riser tower: "
+                 "ultra-deep, highest cost.")
+        n_boosting = rs2.number_input(
+            "Subsea boosting stations", min_value=0, value=0, step=1,
+            key="dc_n_boosting",
+            help="Multiphase pump stations on the seabed to boost production "
+                 "over long tie-backs or from low-energy reservoirs "
+                 "(~$75MM/station).")
+
+        st.markdown("**Flowlines, umbilicals & export**")
+        fl1, fl2, fl3 = st.columns(3)
+        flowline_km = fl1.number_input(
+            "Flowline length (km)", min_value=0.0, value=15.0, step=1.0,
+            key="dc_flowline_km",
+            help="In-field flowline, or tie-back flowline to the host. For a "
+                 "tie-in this is normally ≈ the tie-back distance.")
+        flowline_diameter = fl2.number_input(
+            "Flowline diameter (inches)", min_value=4.0, max_value=36.0,
+            value=10.0, step=2.0, key="dc_flowline_diam",
+            help="Nominal bore. Larger diameter → higher cost per km but "
+                 "lower pressure drop. Typical screening range 6-30\".")
+        flowline_material = fl3.selectbox(
+            "Flowline material",
+            ["Carbon steel", "CRA-clad", "Solid CRA", "Flexible pipe"],
+            key="dc_flowline_material",
+            help="Carbon steel: cheapest, needs corrosion management. "
+                 "CRA-clad / solid CRA: corrosion-resistant alloy for sour "
+                 "or corrosive fluids (1.85× / 3.2× cost). Flexible pipe: "
+                 "easier installation, 2.4× cost.")
+        fl4, fl5, fl6 = st.columns(3)
+        umbilical_km = fl4.number_input(
+            "Umbilical length (km)", min_value=0.0, value=16.0, step=1.0,
+            key="dc_umbilical_km",
+            help="Bundle carrying hydraulic / electric / chemical lines to "
+                 "subsea equipment (~$1.6MM/km). Usually ≈ flowline length.")
+        export_pipeline_km = fl5.number_input(
+            "Export pipeline length (km)", min_value=0.0, value=0.0, step=1.0,
+            key="dc_export_km",
+            help="Pipeline carrying processed product from the host to "
+                 "shore / a terminal / a trunkline. 0 if exporting via an "
+                 "existing nearby tie-in.")
+        export_pipeline_diameter = fl6.number_input(
+            "Export pipeline diameter (inches)", min_value=4.0, max_value=48.0,
+            value=16.0, step=2.0, key="dc_export_diam",
+            help="Nominal bore of the export line.")
+
+        st.markdown("**Artificial lift & flow assurance**")
+        al1, al2 = st.columns(2)
+        gas_lift = al1.checkbox(
+            "Gas lift system", value=False, key="dc_gas_lift",
+            help="Injects gas into the production tubing to lighten the "
+                 "fluid column and sustain rates as reservoir pressure "
+                 "declines. ~$25MM base + $1.2MM/well.")
+        n_gas_lift_wells = 0
+        if gas_lift:
+            n_gas_lift_wells = al2.number_input(
+                "Wells on gas lift", min_value=0,
+                value=int(n_subsea_wells + n_dry_wells), step=1,
+                key="dc_n_gas_lift_wells")
+        ha1, ha2 = st.columns(2)
+        heating_type = ha1.selectbox(
+            "Flowline heating / flow assurance",
+            ["None", "Electrically heated flowline (EHTF)",
+             "Direct electric heating (DEH)",
+             "Hot-water / glycol circulation"],
+            key="dc_heating_type",
+            help="For waxy / viscous crude or hydrate management. EHTF / DEH "
+                 "are priced per km of heated line; hot-water/glycol is a "
+                 "fixed-cost circulation system. 'None' relies on "
+                 "insulation + chemical inhibition alone.")
+        heated_flowline_km = 0.0
+        if heating_type in ("Electrically heated flowline (EHTF)",
+                             "Direct electric heating (DEH)"):
+            heated_flowline_km = ha2.number_input(
+                "Heated flowline length (km)", min_value=0.0,
+                value=float(flowline_km), step=1.0,
+                key="dc_heated_km",
+                help="Length of flowline that needs active heating — often "
+                     "the whole tie-back for long deep-water lines.")
+
+        # Assemble the spec and build the concept
+        dc_spec = {
+            "concept_type": concept_type,
+            "host_type": host_type,
+            "processing_capacity_kboed": processing_capacity,
+            "water_depth_class": water_depth_class,
+            "n_templates": n_templates,
+            "n_subsea_wells": n_subsea_wells,
+            "n_dry_wells": n_dry_wells,
+            "n_total_wells": n_subsea_wells + n_dry_wells,
+            "flowline_km": flowline_km,
+            "flowline_diameter_in": flowline_diameter,
+            "flowline_material": flowline_material,
+            "umbilical_km": umbilical_km,
+            "n_risers": n_risers,
+            "riser_type": riser_type,
+            "n_boosting_stations": n_boosting,
+            "gas_lift": gas_lift,
+            "n_gas_lift_wells": n_gas_lift_wells,
+            "heating_type": heating_type,
+            "heated_flowline_km": heated_flowline_km,
+            "export_pipeline_km": export_pipeline_km,
+            "export_pipeline_diameter_in": export_pipeline_diameter,
+            "host_distance_km": host_distance_km,
+            "start_date": start_date,
+            "horizon_years": st.session_state.get("horizon", 20),
+        }
+        try:
+            concept = fh.build_development_concept(dc_spec)
+        except Exception as exc:
+            concept = None
+            st.error(f"Could not build the concept: {exc}")
+
+        if concept is not None:
+            # Schematic
+            st.markdown("**Concept schematic**")
+            st.image(_svg_to_data_uri(concept["schematic"]),
+                     use_container_width=True)
+
+            # Summary + warnings side by side
+            sum_col, warn_col = st.columns([1, 1])
+            with sum_col:
+                st.markdown("**Concept summary**")
+                summary_df = pd.DataFrame(concept["summary"],
+                                           columns=["Item", "Value"])
+                st.dataframe(summary_df, use_container_width=True,
+                             hide_index=True)
+            with warn_col:
+                st.markdown("**Engineering checks**")
+                if concept["warnings"]:
+                    for w in concept["warnings"]:
+                        st.warning(w)
+                else:
+                    st.success("No engineering red flags — the concept is "
+                               "internally consistent.")
+
+            # CAPEX breakdown preview
+            st.markdown("**Generated CAPEX schedule (preview)**")
+            preview_df = pd.DataFrame(concept["capex_rows"])
+            preview_df["date"] = pd.to_datetime(preview_df["date"]).dt.date
+            st.dataframe(
+                preview_df.rename(columns={
+                    "date": "Spend date", "amount_MMUSD": "Amount ($MM)",
+                    "label": "Component"}),
+                use_container_width=True, hide_index=True,
+            )
+            t = concept["totals"]
+            st.caption(
+                f"**CAPEX excl. cessation: ${t['capex_excl_cessation']:,.0f}MM**  •  "
+                f"Cessation / P&A: ${t['cessation']:,.0f}MM  •  "
+                f"**Grand total: ${t['grand_total']:,.0f}MM**"
+            )
+
+            if st.button("⚙️ Generate CAPEX schedule from this concept",
+                          key="dc_generate", type="primary"):
+                st.session_state.fac_df = pd.DataFrame(concept["capex_rows"])
+                mark_stale()
+                st.success(f"Generated {len(concept['capex_rows'])} CAPEX "
+                           f"line(s) from the '{concept_type}' concept. "
+                           "Edit the table below to fine-tune.")
+                st.rerun()
+
+        # Stash the spec so the schedule builder can use it
+        st.session_state["_dc_spec"] = dc_spec
+
+    # ---- Project schedule builder ----
+    with st.expander("📅 Project schedule builder — milestones, durations, "
+                     "realism checks", expanded=False):
         st.caption(
-            f"**Total CAPEX (excl. cessation): ${sum(r[1] for r in recipe_rows):,.0f}MM**  •  "
-            f"Cessation: ${_cessation_val:,.0f}MM  •  "
-            f"**Grand total: ${total_recipe:,.0f}MM**. "
-            "Cessation is added at the end of the forecast horizon."
+            "Build a milestone timeline from **FEED → DG3/sanction → "
+            "long-lead → fabrication → installation → hookup → first oil**. "
+            "Default durations are pre-filled based on the concept above. "
+            "The builder flags any phase that's outside realistic industry "
+            "bounds for that concept family. You can optionally push the "
+            "field's production start date to match the computed first-oil "
+            "date."
         )
-        if st.button("⚙️ Generate CAPEX schedule", key="capex_recipe_gen",
-                      type="primary"):
-            # Cessation booked near end of forecast
-            horizon_yrs = st.session_state.get("horizon", 20)
-            cessation_date = start_date + timedelta(days=int(horizon_yrs * 365) - 30)
-            rows_out = [{"date": d, "amount_MMUSD": amt, "label": lbl}
-                        for (d, amt, lbl) in recipe_rows]
-            if _cessation_val > 0:
-                rows_out.append({"date": cessation_date,
-                                  "amount_MMUSD": _cessation_val,
-                                  "label": "Cessation / P&A"})
-            st.session_state.fac_df = pd.DataFrame(rows_out)
-            mark_stale()
-            st.success(f"Generated {len(rows_out)} CAPEX line(s) from the "
-                       f"'{concept}' recipe. Edit the table below to fine-tune.")
-            st.rerun()
+        dc_spec_now = st.session_state.get("_dc_spec", {
+            "concept_type": "Subsea tie-in", "host_type": "",
+            "host_distance_km": 0,
+        })
+        bench_key_preview = fh._concept_benchmark_key(dc_spec_now)
+        st.caption(f"Benchmark family: **{bench_key_preview[0]} — "
+                   f"{bench_key_preview[1]}** (concept-aware defaults).")
+
+        feed_start = st.date_input(
+            "FEED / pre-FEED start date",
+            value=st.session_state.get("sched_feed_start", start_date),
+            key="sched_feed_start",
+            help="Anchor date for the schedule. This is when the engineering "
+                 "definition phase begins — well before sanction.")
+
+        defaults = fh.default_schedule_durations(dc_spec_now)
+        sc1, sc2, sc3 = st.columns(3)
+        feed_months = sc1.number_input(
+            "FEED duration (months)", min_value=0, max_value=60,
+            value=int(defaults["FEED"]), step=1, key="sched_feed_months",
+            help="Front-end engineering & design. Major engineering / cost "
+                 "definition. Typical: subsea tie-in 6-15 mo; onshore CPF "
+                 "9-22 mo; fixed platform 12-26 mo; floating host 15-32 mo.")
+        ll_months = sc2.number_input(
+            "Long-lead items (months)", min_value=0, max_value=60,
+            value=int(defaults["Long-lead"]), step=1, key="sched_ll_months",
+            help="Manufacturing time for long-lead items (FPSO hull, jacket "
+                 "steel, subsea trees, large compressors). Typically starts "
+                 "at sanction. Can overlap with fabrication (see below).")
+        fab_months = sc3.number_input(
+            "Fabrication / EPC (months)", min_value=0, max_value=72,
+            value=int(defaults["Fabrication"]), step=1,
+            key="sched_fab_months",
+            help="Main engineering, procurement and construction phase — "
+                 "topsides, hull, jacket, subsea hardware all built.")
+        sc4, sc5, sc6 = st.columns(3)
+        inst_months = sc4.number_input(
+            "Installation (months)", min_value=0, max_value=36,
+            value=int(defaults["Installation"]), step=1,
+            key="sched_inst_months",
+            help="Offshore installation campaign — heavy lift, pipelay, "
+                 "riser pull-in, subsea connections. Bounded by weather "
+                 "windows in many regions.")
+        huc_months = sc5.number_input(
+            "Hookup & commissioning (months)", min_value=0, max_value=24,
+            value=int(defaults["Hookup & comm."]), step=1,
+            key="sched_huc_months",
+            help="Mechanical completion, system commissioning, performance "
+                 "testing, ramp-up to first oil.")
+        overlap_months = sc6.number_input(
+            "Long-lead / fabrication overlap (months)", min_value=0,
+            max_value=36, value=int(min(12, ll_months)),
+            step=1, key="sched_overlap",
+            help="Long-lead items typically start in parallel with "
+                 "fabrication. 0 = strictly sequential; 6-12 months overlap "
+                 "is common. Cannot exceed the long-lead duration.")
+
+        durations = {
+            "FEED": feed_months, "Long-lead": ll_months,
+            "Fabrication": fab_months, "Installation": inst_months,
+            "Hookup & comm.": huc_months,
+        }
+        try:
+            sched = fh.build_project_schedule(dc_spec_now, feed_start,
+                                                durations,
+                                                overlap_longlead_months=overlap_months)
+        except Exception as exc:
+            sched = None
+            st.error(f"Could not build schedule: {exc}")
+
+        if sched is not None:
+            # Gantt chart
+            import plotly.express as _px_unused  # noqa — make sure available
+            fig_g = go.Figure()
+            phase_colors = {
+                "FEED":            "#5b8def",
+                "Long-lead":       "#9c7ad6",
+                "Fabrication":     "#e8a23a",
+                "Installation":    "#d65a5a",
+                "Hookup & comm.":  "#3ba776",
+            }
+            for ph in sched["phases"]:
+                fig_g.add_trace(go.Bar(
+                    y=[ph["phase"]],
+                    x=[(ph["end"] - ph["start"]).days],
+                    base=[ph["start"]],
+                    orientation="h",
+                    marker_color=phase_colors.get(ph["phase"], "#888"),
+                    name=ph["phase"],
+                    hovertemplate=(f"<b>{ph['phase']}</b><br>"
+                                    f"{ph['start']} → {ph['end']}<br>"
+                                    f"{ph['duration_months']} months<extra></extra>"),
+                    showlegend=False,
+                ))
+            # Milestone markers
+            for label, mdate in sched["milestones"]:
+                fig_g.add_vline(
+                    x=mdate, line=dict(color="#333", dash="dot", width=1),
+                    annotation_text=label,
+                    annotation_position="top",
+                    annotation_textangle=-60,
+                    annotation_font=dict(size=9, color="#333"),
+                )
+            # First-oil emphasis
+            fig_g.add_vline(
+                x=sched["first_oil_date"],
+                line=dict(color="#2ca02c", width=3),
+                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
+                annotation_position="bottom",
+                annotation_font=dict(size=11, color="#2ca02c"),
+            )
+            fig_g.update_layout(
+                title=f"Project schedule — {sched['total_months']} months "
+                      f"FEED to first oil",
+                height=360,
+                xaxis_title="Date",
+                yaxis=dict(autorange="reversed"),
+                margin=dict(t=80, b=40, l=10, r=10),
+                bargap=0.35,
+            )
+            st.plotly_chart(fh.apply_plot_template(fig_g),
+                            use_container_width=True)
+
+            # Milestone table
+            ms_col, w_col = st.columns([1, 1])
+            with ms_col:
+                st.markdown("**Key milestones**")
+                ms_df = pd.DataFrame(sched["milestones"],
+                                      columns=["Milestone", "Date"])
+                ms_df["Date"] = pd.to_datetime(ms_df["Date"]).dt.date
+                st.dataframe(ms_df, use_container_width=True, hide_index=True)
+            with w_col:
+                st.markdown("**Realism checks**")
+                if sched["warnings"]:
+                    for w in sched["warnings"]:
+                        st.warning(w)
+                else:
+                    st.success("All phase durations are within realistic "
+                               "industry bounds for this concept family.")
+
+            # Benchmark reference table
+            with st.expander("📊 Industry benchmark ranges for this concept",
+                             expanded=False):
+                bench_rows = []
+                for phase, (lo, typ, hi) in sched["benchmark"].items():
+                    bench_rows.append({
+                        "Phase": phase,
+                        "Min (months)": lo,
+                        "Typical (months)": typ,
+                        "Max (months)": hi,
+                        "Your value": durations.get(phase, 0),
+                    })
+                st.dataframe(pd.DataFrame(bench_rows),
+                             use_container_width=True, hide_index=True)
+                st.caption(
+                    "Benchmark ranges are screening-level, drawn from "
+                    "published industry project case studies. Real projects "
+                    "vary widely — these flag obvious over/under-estimates "
+                    "rather than dictating a single right answer.")
+
+            # Push first oil date to the field's start_date
+            push_col1, push_col2 = st.columns([3, 2])
+            push_col1.caption(
+                f"The computed first-oil date is "
+                f"**{sched['first_oil_date']}**. Currently the field's "
+                f"production start date is set to **{start_date}**.")
+            if push_col2.button("📌 Use first oil date as production start",
+                                 key="sched_push_fop",
+                                 help="Updates the field's production start "
+                                      "date to match the computed first-oil "
+                                      "milestone, so the economics and "
+                                      "production forecast align with the "
+                                      "schedule."):
+                st.session_state["start_date"] = sched["first_oil_date"]
+                mark_stale()
+                st.success(f"Production start date set to "
+                           f"{sched['first_oil_date']}. Re-run to refresh.")
+                st.rerun()
 
     st.markdown("**Phased facility CAPEX**")
     if "fac_df" not in st.session_state:
@@ -5712,74 +6037,81 @@ def main():
 
         # ---- CO2 emissions, intensity & benchmarking + power ----
         with st.expander("🌍 Emissions, carbon intensity & power", expanded=False):
-            bm = fh.co2_intensity_benchmark(df_e, df, is_oil)
-            ec1, ec2, ec3 = st.columns(3)
-            ec1.metric("Lifetime CO₂-eq emissions",
-                       f"{bm['total_co2_tonnes']/1e3:,.0f} kt")
-            ec2.metric("Carbon intensity",
-                       f"{bm['intensity_kg_per_boe']:,.1f} kg/boe")
-            ec3.metric("Production basis",
-                       f"{bm['cum_boe']/1e6:,.1f} MMBOE")
-            st.caption(f"**Assessment:** {bm['band']}")
+            try:
+                bm = fh.co2_intensity_benchmark(df_e, df, is_oil)
+            except Exception as _co2_exc:
+                bm = None
+                st.warning(f"Could not compute the emissions benchmark "
+                           f"({_co2_exc}). The rest of the economics is "
+                           "unaffected.")
+            if bm is not None:
+                ec1, ec2, ec3 = st.columns(3)
+                ec1.metric("Lifetime CO₂-eq emissions",
+                           f"{bm['total_co2_tonnes']/1e3:,.0f} kt")
+                ec2.metric("Carbon intensity",
+                           f"{bm['intensity_kg_per_boe']:,.1f} kg/boe")
+                ec3.metric("Production basis",
+                           f"{bm['cum_boe']/1e6:,.1f} MMBOE")
+                st.caption(f"**Assessment:** {bm['band']}")
 
-            # Benchmark bar chart
-            fig_bm = go.Figure()
-            bench_names = list(bm["benchmarks"].keys())
-            bench_vals = list(bm["benchmarks"].values())
-            fig_bm.add_trace(go.Bar(
-                y=bench_names, x=bench_vals, orientation="h",
-                marker_color=["#2ca02c", "#ff7f0e", "#d62728"],
-                name="Benchmark", opacity=0.55,
-                hovertemplate="%{y}: %{x:.0f} kg/boe<extra></extra>",
-            ))
-            fig_bm.add_vline(
-                x=bm["intensity_kg_per_boe"],
-                line=dict(color="#1f77b4", width=3),
-                annotation_text=f"This project: {bm['intensity_kg_per_boe']:.1f}",
-                annotation_position="top",
-            )
-            fig_bm.update_layout(
-                title="Carbon intensity vs industry benchmarks (kg CO₂-eq/boe)",
-                height=280, xaxis_title="kg CO₂-eq per boe",
-                showlegend=False, margin=dict(t=50, b=40),
-            )
-            st.plotly_chart(fh.apply_plot_template(fig_bm), use_container_width=True)
-            st.caption(
-                "Benchmarks are screening-level Scope 1+2 upstream averages "
-                "from published industry reporting (IOGP / OGCI / national "
-                "data). Best-in-class ≈ 7, global average ≈ 18, "
-                "high-intensity ≈ 35+ kg CO₂-eq/boe. This project's intensity "
-                "is the blue line. CO₂ here covers fuel + flare combustion, "
-                "methane slip from flaring, and routine operational venting."
-            )
-
-            st.divider()
-            pc1, pc2 = st.columns(2)
-            pc1.metric("Lifetime power consumption",
-                       f"{bm['total_power_mwh']/1e3:,.1f} GWh")
-            pc2.metric("Power intensity",
-                       f"{bm['power_intensity_kwh_per_boe']:,.1f} kWh/boe")
-            if "power_mwh" in df_e.columns:
-                annual_power = df_e.groupby(df_e["year"])["power_mwh"].sum().reset_index()
-                fig_pw = go.Figure()
-                fig_pw.add_trace(go.Bar(
-                    x=annual_power["year"], y=annual_power["power_mwh"]/1e3,
-                    marker_color="#9467bd", name="Power",
+                # Benchmark bar chart
+                fig_bm = go.Figure()
+                bench_names = list(bm["benchmarks"].keys())
+                bench_vals = list(bm["benchmarks"].values())
+                fig_bm.add_trace(go.Bar(
+                    y=bench_names, x=bench_vals, orientation="h",
+                    marker_color=["#2ca02c", "#ff7f0e", "#d62728"],
+                    name="Benchmark", opacity=0.55,
+                    hovertemplate="%{y}: %{x:.0f} kg/boe<extra></extra>",
                 ))
-                fig_pw.update_layout(
-                    title="Annual power consumption (GWh/yr)",
-                    height=280, yaxis_title="GWh/yr", showlegend=False,
+                fig_bm.add_vline(
+                    x=bm["intensity_kg_per_boe"],
+                    line=dict(color="#1f77b4", width=3),
+                    annotation_text=f"This project: {bm['intensity_kg_per_boe']:.1f}",
+                    annotation_position="top",
                 )
-                st.plotly_chart(fh.apply_plot_template(fig_pw),
-                                use_container_width=True)
-            st.caption(
-                "Power consumption is a screening estimate from production "
-                "throughput: liquids handling ≈ 1.5 kWh/bbl, gas compression "
-                "≈ 3.0 kWh/Mscf, water injection ≈ 2.0 kWh/bbl. A detailed "
-                "facility power study would refine this — typical offshore "
-                "intensities run 5–30 kWh/boe depending on gas handling and "
-                "artificial lift."
-            )
+                fig_bm.update_layout(
+                    title="Carbon intensity vs industry benchmarks (kg CO₂-eq/boe)",
+                    height=280, xaxis_title="kg CO₂-eq per boe",
+                    showlegend=False, margin=dict(t=50, b=40),
+                )
+                st.plotly_chart(fh.apply_plot_template(fig_bm), use_container_width=True)
+                st.caption(
+                    "Benchmarks are screening-level Scope 1+2 upstream averages "
+                    "from published industry reporting (IOGP / OGCI / national "
+                    "data). Best-in-class ≈ 7, global average ≈ 18, "
+                    "high-intensity ≈ 35+ kg CO₂-eq/boe. This project's intensity "
+                    "is the blue line. CO₂ here covers fuel + flare combustion, "
+                    "methane slip from flaring, and routine operational venting."
+                )
+
+                st.divider()
+                pc1, pc2 = st.columns(2)
+                pc1.metric("Lifetime power consumption",
+                           f"{bm['total_power_mwh']/1e3:,.1f} GWh")
+                pc2.metric("Power intensity",
+                           f"{bm['power_intensity_kwh_per_boe']:,.1f} kWh/boe")
+                if "power_mwh" in df_e.columns:
+                    annual_power = df_e.groupby(df_e["year"])["power_mwh"].sum().reset_index()
+                    fig_pw = go.Figure()
+                    fig_pw.add_trace(go.Bar(
+                        x=annual_power["year"], y=annual_power["power_mwh"]/1e3,
+                        marker_color="#9467bd", name="Power",
+                    ))
+                    fig_pw.update_layout(
+                        title="Annual power consumption (GWh/yr)",
+                        height=280, yaxis_title="GWh/yr", showlegend=False,
+                    )
+                    st.plotly_chart(fh.apply_plot_template(fig_pw),
+                                    use_container_width=True)
+                st.caption(
+                    "Power consumption is a screening estimate from production "
+                    "throughput: liquids handling ≈ 1.5 kWh/bbl, gas compression "
+                    "≈ 3.0 kWh/Mscf, water injection ≈ 2.0 kWh/bbl. A detailed "
+                    "facility power study would refine this — typical offshore "
+                    "intensities run 5–30 kWh/boe depending on gas handling and "
+                    "artificial lift."
+                )
 
         # Well-cost breakdown (rig-rate or fixed)
         breakdown = df_e.attrs.get("well_cost_breakdown", [])
@@ -6002,6 +6334,8 @@ def main():
         )
 
     scenario_compare_section(units, fluid, asm, econ, wells)
+
+    batch_mode_section(units, fluid)
 
     # ---- Footer ----
     st.markdown(
@@ -6240,6 +6574,60 @@ def case_management_section():
                     case_a = fh.load_case(next(c["filename"] for c in cases if c["name"] == a_name))
                     case_b = fh.load_case(next(c["filename"] for c in cases if c["name"] == b_name))
                     _render_case_diff(case_a, case_b)
+
+        # --- YAML import / export ---
+        with st.expander("📄 YAML import / export", expanded=False):
+            st.caption(
+                "Export the current case as a human-editable YAML file, or "
+                "import a YAML case to load it into the inputs. The YAML "
+                "schema mirrors the internal case structure: a `scalar:` "
+                "section for settings and a `tables:` section for wells, "
+                "rigs, capacities, CAPEX, and reservoirs."
+            )
+            # Export
+            try:
+                cur_payload = collect_inputs_payload()
+                cur_meta = {
+                    "name": st.session_state.get("current_case_name", "Untitled case"),
+                    "description": "",
+                }
+                yaml_text = fh.payload_to_yaml(cur_payload, cur_meta)
+                st.download_button(
+                    "⬇️ Export current case as YAML",
+                    data=yaml_text.encode("utf-8"),
+                    file_name=f"{cur_meta['name'].replace(' ', '_')}.yaml",
+                    mime="text/yaml", use_container_width=True,
+                    key="yaml_export_btn",
+                )
+            except Exception as exc:
+                st.warning(f"YAML export unavailable: {exc}")
+
+            st.divider()
+            # Import
+            up = st.file_uploader("Import a YAML case file", type=["yaml", "yml"],
+                                   key="yaml_import_uploader")
+            if up is not None:
+                try:
+                    yaml_text = up.read().decode("utf-8")
+                    payload, meta = fh.yaml_to_payload(yaml_text)
+                    warnings = fh.validate_yaml_payload(payload, meta)
+                    st.success(f"Parsed '{meta.get('name', 'case')}' "
+                               f"({len(payload.get('tables', {}))} tables, "
+                               f"{len(payload.get('scalar', {}))} settings).")
+                    if warnings:
+                        with st.container():
+                            st.warning("Validation notes:\n" +
+                                       "\n".join(f"- {w}" for w in warnings))
+                    if st.button("Load this YAML case into inputs",
+                                  key="yaml_load_btn", use_container_width=True):
+                        restore_inputs_payload(payload)
+                        st.session_state["current_case_name"] = meta.get(
+                            "name", "Imported case")
+                        st.success(f"Loaded '{meta.get('name')}'. "
+                                   "Review the inputs and click Run.")
+                        st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not import YAML: {exc}")
 
         # Show currently loaded case
         cur_case = st.session_state.get("current_case_name", "Untitled case")
@@ -6550,6 +6938,82 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
     except Exception as e:
         st.error(f"PDF generation error: {e}")
         return None
+
+
+def run_payload_case(payload: dict, default_start_date,
+                      default_units: str = "field") -> dict:
+    """Run a single case from a payload dict (the same structure produced by
+    collect_inputs_payload / yaml_to_payload). Streamlit-free except that it
+    calls run_simulation / compute_economics which are themselves pure.
+
+    Returns a result dict:
+        ok, error, name, df, df_e, kpis{...}
+    Used by both the YAML single-run and the batch runner.
+    """
+    scalar = payload.get("scalar", {})
+    name = payload.get("_meta", {}).get("name") or scalar.get(
+        "current_case_name", "Case")
+    res = {"ok": False, "error": None, "name": name,
+           "df": None, "df_e": None, "kpis": {}}
+    try:
+        case_units = scalar.get("units", default_units)
+        case_fluid = scalar.get("fluid", "Oil with associated gas")
+        case_strategy = scalar.get("strategy", "Depletion")
+        if case_fluid not in FLUID_SYSTEMS:
+            raise ValueError(f"Unknown fluid system '{case_fluid}'. "
+                             f"Valid: {', '.join(FLUID_SYSTEMS)}")
+
+        wells_s, reservoirs_s, meta, econ_dict = _wells_from_payload_tables(
+            payload, case_units, default_start_date, case_fluid)
+        if not wells_s:
+            raise ValueError("no producers found in case tables")
+        well_links_s = _well_links_from_payload(payload)
+        asm_s = _build_asm_for_scenario(meta, case_fluid, case_strategy,
+                                          reservoirs=reservoirs_s,
+                                          well_links=well_links_s)
+        econ_s = EconInputs(**econ_dict)
+        is_oil_s = FLUID_SYSTEMS[case_fluid]["primary"] == "oil"
+
+        df_s, _, _ = run_simulation(wells_s, asm_s)
+        df_e_s = compute_economics(df_s, is_oil_s, econ_s, wells_s)
+
+        # KPIs
+        npv_MM = float(df_e_s["npv"].iloc[-1]) / 1e6 if "npv" in df_e_s.columns else 0.0
+        cum_oil = float(df_s["cum_oil"].iloc[-1]) if "cum_oil" in df_s.columns else 0.0
+        cum_gas = float(df_s["cum_gas"].iloc[-1]) if "cum_gas" in df_s.columns else 0.0
+        final_rf = float(df_s["recovery_factor"].iloc[-1]) \
+            if "recovery_factor" in df_s.columns else 0.0
+        peak_rate = float(df_s["primary_rate"].max()) \
+            if "primary_rate" in df_s.columns else 0.0
+        payback_yrs = None
+        if "cum_cashflow" in df_e_s.columns:
+            cumv = df_e_s["cum_cashflow"].values
+            for i, v in enumerate(cumv):
+                if v >= 0:
+                    payback_yrs = i / 12.0
+                    break
+        try:
+            be = fh.breakeven_price(
+                df_s, is_oil_s, econ_s, wells_s,
+                base_oil_price=econ_s.oil_price,
+                base_gas_price=econ_s.gas_price,
+                compute_economics_fn=compute_economics, target_npv=0.0)
+            be_oil = be.get("oil_price") if be else None
+        except Exception:
+            be_oil = None
+
+        res["kpis"] = {
+            "npv_MM": npv_MM, "cum_oil_MMstb": cum_oil,
+            "cum_gas_Bscf": cum_gas, "final_rf": final_rf,
+            "peak_primary_rate": peak_rate, "payback_yrs": payback_yrs,
+            "breakeven_oil": be_oil,
+        }
+        res["df"] = df_s
+        res["df_e"] = df_e_s
+        res["ok"] = True
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+    return res
 
 
 # =============================================================================
@@ -7895,6 +8359,180 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
     }).map(_color_delta, subset=["ΔNPV ($MM)", "ΔCum CF ($MM)", delta_df.columns[-1]]) \
       .map(_color_delta_inverse, subset=["ΔBreakeven ($/bbl)", "ΔCost ($MM)"])
     st.dataframe(styled, use_container_width=True)
+
+
+# =============================================================================
+# Batch mode — run many cases from a single YAML file
+# =============================================================================
+def batch_mode_section(units, fluid):
+    """Run multiple cases from a batch YAML file in one go, then export the
+    KPI results as CSV or JSON (API-style)."""
+    st.divider()
+    st.subheader("📦 Batch mode — run many cases from one YAML file")
+    with st.expander("ℹ️ How batch mode works", expanded=False):
+        st.markdown(
+            "Upload a **batch YAML file** containing multiple cases. Each "
+            "case is run through the full engine (production + economics) "
+            "and the KPIs are collected into a results table you can "
+            "download as CSV or JSON.\n\n"
+            "**Batch file format:**\n"
+            "```yaml\n"
+            "schema_version: \"1.0\"\n"
+            "cases:\n"
+            "  - meta: {name: \"Low case\", description: \"P90 volumes\"}\n"
+            "    scalar:\n"
+            "      units: field\n"
+            "      fluid: \"Oil with associated gas\"\n"
+            "      start_date: \"2027-01-01\"\n"
+            "      oil_price_bbl: 70\n"
+            "      # ... all other scalar settings\n"
+            "    tables:\n"
+            "      producers_df:\n"
+            "        - {name: P1, rig: Rig-A, qi_primary: 2000, ...}\n"
+            "      cap_df:\n"
+            "        - {start_date: \"2027-01-01\", oil: 40000, ...}\n"
+            "  - meta: {name: \"Base case\"}\n"
+            "    scalar: { ... }\n"
+            "    tables: { ... }\n"
+            "```\n\n"
+            "Tip: export a working case from **YAML import / export** in the "
+            "sidebar to get a correctly-structured starting point, then "
+            "duplicate it under a `cases:` list."
+        )
+
+    up = st.file_uploader("Upload batch YAML file", type=["yaml", "yml"],
+                           key="batch_yaml_uploader")
+    if up is None:
+        st.caption("No batch file uploaded yet.")
+        return
+
+    try:
+        yaml_text = up.read().decode("utf-8")
+        cases = fh.parse_batch_yaml(yaml_text)
+    except Exception as exc:
+        st.error(f"Could not parse batch YAML: {exc}")
+        return
+
+    st.success(f"Parsed **{len(cases)} case(s)** from the batch file.")
+
+    # Pre-flight validation
+    all_warnings = []
+    for payload, meta in cases:
+        warns = fh.validate_yaml_payload(payload, meta)
+        if warns:
+            all_warnings.append((meta.get("name", "?"), warns))
+    if all_warnings:
+        with st.expander(f"⚠️ Validation notes ({len(all_warnings)} case(s) "
+                         "with warnings)", expanded=False):
+            for cname, warns in all_warnings:
+                st.markdown(f"**{cname}**")
+                for w in warns:
+                    st.markdown(f"- {w}")
+
+    save_cases = st.checkbox(
+        "Also save each case to the case library", value=False,
+        key="batch_save_cases",
+        help="When ticked, each batch case is also saved as a normal case "
+             "(so it appears in the case manager and scenario comparison).")
+
+    if not st.button("▶️ Run batch", key="batch_run_btn", type="primary"):
+        return
+
+    default_sd = st.session_state.get("start_date", date.today())
+    results = []
+    progress = st.progress(0.0, text="Running batch…")
+    for i, (payload, meta) in enumerate(cases):
+        payload["_meta"] = meta
+        progress.progress((i + 0.5) / len(cases),
+                          text=f"Running '{meta.get('name', f'Case {i+1}')}'…")
+        res = run_payload_case(payload, default_sd, units)
+        res["name"] = meta.get("name", f"Case {i+1}")
+        results.append(res)
+        if save_cases and res["ok"]:
+            try:
+                fh.save_case(res["name"], meta.get("description", ""), payload)
+            except Exception:
+                pass
+        progress.progress((i + 1) / len(cases))
+    progress.empty()
+
+    n_ok = sum(1 for r in results if r["ok"])
+    n_fail = len(results) - n_ok
+    if n_fail:
+        st.warning(f"{n_ok} succeeded, {n_fail} failed.")
+    else:
+        st.success(f"All {n_ok} cases ran successfully.")
+
+    # Results table
+    rows = []
+    for r in results:
+        k = r.get("kpis", {})
+        rows.append({
+            "Case": r["name"],
+            "Status": "✅ OK" if r["ok"] else "❌ FAILED",
+            "Error": r.get("error") or "",
+            "NPV ($MM)": k.get("npv_MM"),
+            "Breakeven oil ($/bbl)": k.get("breakeven_oil"),
+            "Payback (yrs)": k.get("payback_yrs"),
+            "Cum oil (MMstb)": k.get("cum_oil_MMstb"),
+            "Cum gas (Bscf)": k.get("cum_gas_Bscf"),
+            "Final RF": k.get("final_rf"),
+            "Peak rate": k.get("peak_primary_rate"),
+        })
+    batch_df = pd.DataFrame(rows)
+    fmt = {
+        "NPV ($MM)": "{:,.0f}", "Breakeven oil ($/bbl)": "{:,.1f}",
+        "Payback (yrs)": "{:,.1f}", "Cum oil (MMstb)": "{:,.2f}",
+        "Cum gas (Bscf)": "{:,.2f}", "Final RF": "{:.1%}",
+        "Peak rate": "{:,.0f}",
+    }
+    # Only format columns that have at least one non-null value
+    fmt = {c: f for c, f in fmt.items()
+           if c in batch_df.columns and batch_df[c].notna().any()}
+    try:
+        st.dataframe(batch_df.style.format(fmt, na_rep="—"),
+                     use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(batch_df, use_container_width=True, hide_index=True)
+
+    # Exports — build API-style payloads via the helper
+    headless_like = [
+        {"name": r["name"], "ok": r["ok"], "error": r.get("error"),
+         "kpis": {
+             "npv_MM": r["kpis"].get("npv_MM"),
+             "irr": None,
+             "payback_yrs": r["kpis"].get("payback_yrs"),
+             "cum_oil": r["kpis"].get("cum_oil_MMstb"),
+             "cum_gas": r["kpis"].get("cum_gas_Bscf"),
+             "final_rf": r["kpis"].get("final_rf"),
+             "peak_rate": r["kpis"].get("peak_primary_rate"),
+         }}
+        for r in results
+    ]
+    exp1, exp2 = st.columns(2)
+    with exp1:
+        try:
+            csv_bytes = fh.batch_results_to_csv(headless_like).encode("utf-8")
+            st.download_button("⬇️ Download results as CSV", data=csv_bytes,
+                               file_name="batch_results.csv", mime="text/csv",
+                               use_container_width=True, key="batch_csv_dl")
+        except Exception as exc:
+            st.error(f"CSV export failed: {exc}")
+    with exp2:
+        try:
+            json_bytes = fh.batch_results_to_json(headless_like).encode("utf-8")
+            st.download_button("⬇️ Download results as JSON (API format)",
+                               data=json_bytes, file_name="batch_results.json",
+                               mime="application/json",
+                               use_container_width=True, key="batch_json_dl")
+        except Exception as exc:
+            st.error(f"JSON export failed: {exc}")
+    st.caption(
+        "The JSON export is structured as an API-style response "
+        "(`schema_version`, `generated_at`, `n_cases`, `n_ok`, `cases[]` with "
+        "per-case `kpis`) so it can be consumed programmatically by "
+        "downstream tooling."
+    )
 
 
 if __name__ == "__main__":
