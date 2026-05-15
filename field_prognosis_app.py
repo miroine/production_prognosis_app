@@ -5155,24 +5155,28 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — convert everything to pd.Timestamp so
-            # Plotly's internal axis-mean call sees uniform types.
+            # Milestone markers — use add_shape + add_annotation to avoid Plotly's datetime mean calculation
             for label, mdate in sched["milestones"]:
-                mts = pd.Timestamp(mdate)
-                fig_g.add_vline(
-                    x=mts, line=dict(color="#333", dash="dot", width=1),
-                    annotation_text=label,
-                    annotation_position="top",
-                    annotation_textangle=-45,
-                    annotation_font=dict(size=9, color="#444"),
+                mts = pd.Timestamp(mdate).to_pydatetime()
+                fig_g.add_shape(
+                    type="line", x0=mts, x1=mts, y0=0, y1=1,
+                    yref="paper", line=dict(color="#333", dash="dot", width=1)
+                )
+                fig_g.add_annotation(
+                    x=mts, text=label, showarrow=False,
+                    textangle=-45, font=dict(size=9, color="#444"),
+                    yanchor="bottom", y=1.05, xanchor="left"
                 )
             # First-oil emphasis — green thick line
-            fo_ts = pd.Timestamp(sched["first_oil_date"])
-            fig_g.add_vline(
-                x=fo_ts, line=dict(color="#2ca02c", width=3),
-                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
-                annotation_position="bottom",
-                annotation_font=dict(size=12, color="#2ca02c"),
+            fo_ts = pd.Timestamp(sched["first_oil_date"]).to_pydatetime()
+            fig_g.add_shape(
+                type="line", x0=fo_ts, x1=fo_ts, y0=0, y1=1,
+                yref="paper", line=dict(color="#2ca02c", width=3)
+            )
+            fig_g.add_annotation(
+                x=fo_ts, text=f"🛢️ First oil: {sched['first_oil_date']}",
+                showarrow=False, font=dict(size=12, color="#2ca02c"),
+                yanchor="top", y=-0.05, xanchor="center"
             )
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
@@ -5230,18 +5234,19 @@ def economics_section(units, start_date):
                 f"The computed first-oil date is "
                 f"**{sched['first_oil_date']}**. Currently the field's "
                 f"production start date is set to **{start_date}**.")
-            if push_col2.button("📌 Use first oil date as production start",
-                                 key="sched_push_fop",
-                                 help="Updates the field's production start "
-                                      "date to match the computed first-oil "
-                                      "milestone, so the economics and "
-                                      "production forecast align with the "
-                                      "schedule."):
-                st.session_state["start_date"] = sched["first_oil_date"]
+            def _update_start_date_to_fop():
+                fod = sched["first_oil_date"]
+                st.session_state["start_date"] = fod.date() if hasattr(fod, 'date') else fod
                 mark_stale()
-                st.success(f"Production start date set to "
-                           f"{sched['first_oil_date']}. Re-run to refresh.")
-                st.rerun()
+            
+            push_col2.button("📌 Use first oil date as production start",
+                            key="sched_push_fop",
+                            on_click=_update_start_date_to_fop,
+                            help="Updates the field's production start "
+                                 "date to match the computed first-oil "
+                                 "milestone, so the economics and "
+                                 "production forecast align with the "
+                                 "schedule.")
 
     st.markdown("**Phased facility CAPEX**")
     if "fac_df" not in st.session_state:
