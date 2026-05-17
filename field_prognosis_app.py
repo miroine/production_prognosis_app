@@ -2555,8 +2555,17 @@ def sidebar_inputs():
              "Injection = water/gas injection adds voidage replacement & pressure support.",
     )
 
+    # Check if there's a pending update to start_date from schedule push
+    initial_start_date = date(2026, 1, 1)
+    if "_pending_start_date" in st.session_state:
+        try:
+            initial_start_date = pd.Timestamp(st.session_state["_pending_start_date"]).date()
+            del st.session_state["_pending_start_date"]
+        except:
+            pass
+    
     start_date = st.sidebar.date_input(
-        "Project start date", value=date(2026, 1, 1),
+        "Project start date", value=initial_start_date,
         key="start_date", on_change=mark_stale,
         help="Anchor for all schedules (drilling, capacities, facility CAPEX).",
     )
@@ -5495,7 +5504,7 @@ def economics_section(units, start_date):
                                       "milestone, so the economics and "
                                       "production forecast align with the "
                                       "schedule."):
-                st.session_state["start_date"] = sched["first_oil_date"]
+                st.session_state["_pending_start_date"] = sched["first_oil_date"]
                 mark_stale()
                 st.success(f"Production start date set to "
                            f"{sched['first_oil_date']}. Re-run to refresh.")
