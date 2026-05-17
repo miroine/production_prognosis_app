@@ -5409,24 +5409,28 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — convert everything to pd.Timestamp so
-            # Plotly's internal axis-mean call sees uniform types.
+            # Milestone markers — just draw lines without annotations
+            # to avoid Plotly's internal mean calculation issues with Timestamps
             for label, mdate in sched["milestones"]:
                 mts = pd.Timestamp(mdate)
                 fig_g.add_vline(
-                    x=mts, line=dict(color="#333", dash="dot", width=1),
-                    annotation_text=label,
-                    annotation_position="top",
-                    annotation_textangle=-45,
-                    annotation_font=dict(size=9, color="#444"),
+                    x=mts, line=dict(color="#333", dash="dot", width=1)
                 )
-            # First-oil emphasis — green thick line
+                # Add annotation separately to avoid arithmetic on Timestamp
+                fig_g.add_annotation(
+                    x=mts, text=label,
+                    showarrow=False, xanchor='center', yanchor='bottom',
+                    textangle=-45, font=dict(size=9, color="#444")
+                )
+            # First-oil emphasis — green thick line (without annotations via add_vline)
             fo_ts = pd.Timestamp(sched["first_oil_date"])
             fig_g.add_vline(
-                x=fo_ts, line=dict(color="#2ca02c", width=3),
-                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
-                annotation_position="bottom",
-                annotation_font=dict(size=12, color="#2ca02c"),
+                x=fo_ts, line=dict(color="#2ca02c", width=3)
+            )
+            fig_g.add_annotation(
+                x=fo_ts, text=f"🛢️ First oil: {sched['first_oil_date']}",
+                showarrow=False, xanchor='center', yanchor='top',
+                font=dict(size=12, color="#2ca02c")
             )
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
