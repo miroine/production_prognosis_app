@@ -467,8 +467,12 @@ class EconInputs:
     ncs_cit_rate: float = 0.22             # corporate income tax 22%
     ncs_spt_rate: float = 0.718            # special petroleum tax 71.8%
     ncs_uplift_rate: float = 0.1769        # uplift allowance: 17.69% × capex
-                                            # in year of spend, deducted from
-                                            # the SPT base only
+                                            # spread over ncs_uplift_years,
+                                            # deducted from the SPT base only
+    ncs_depreciation_years: float = 6.0    # straight-line CAPEX depreciation
+                                            # (CIT + SPT base)
+    ncs_uplift_years: float = 4.0          # period over which uplift is given
+                                            # (set to ~0.08 for immediate)
     # ---- Money basis: nominal vs real ----
     # "real":    costs & revenues kept in today's $ (no inflation applied);
     #            discount_rate is interpreted as a REAL discount rate.
@@ -1763,27 +1767,102 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     else:
         # Standard Tax/Royalty OR NCS (Norwegian Continental Shelf)
         ncs = (regime == "NCS")
-        pretax = net_revenue - opex - capex - aban_cost - co2_cost
         if ncs:
-            # NCS regime (screening simplification):
-            # - Corporate income tax (CIT): 22% on positive pre-tax CF
-            # - Special petroleum tax (SPT): 71.8% on positive pre-tax CF
-            #   AFTER an "uplift" allowance — an extra deduction = uplift_rate
-            #   × investment, booked in the year of the investment, that
-            #   reduces the SPT base only.
-            # Defaults follow current NCS rules; both rates and the uplift
-            # are configurable via EconInputs.ncs_* fields.
+            # ---- NCS petroleum tax — proper carry-forward treatment ----
+            # The Norwegian system is NOT a simple month-by-month "tax the
+            # positive months" calculation. Two features dominate and MUST be
+            # modelled or the project looks far too negative:
+            #
+            #  (1) Loss carry-forward. Tax losses (negative tax base) are
+            #      carried forward and offset against future positive base.
+            #      During the investment phase the base is deeply negative;
+            #      that relief is preserved, not discarded. (The real system
+            #      even refunds the tax value of exploration losses and pays
+            #      out remaining loss carry-forwards at cessation — modelled
+            #      here via carry-forward that fully unwinds over field life.)
+            #
+            #  (2) CAPEX is depreciated, not expensed in one month. NCS uses
+            #      6-year straight-line depreciation for both CIT and SPT.
+            #      Uplift (an extra SPT-only allowance) is likewise spread —
+            #      historically over 4 years; modern rules give immediate
+            #      uplift, which the user can approximate by setting the
+            #      uplift period to 1.
+            #
+            # The combined CIT(22%) + SPT(71.8%) headline rate of ~78% applies
+            # to PROFITS, after costs and depreciation and after losses are
+            # carried forward — so a healthy project keeps a sensible margin.
             cit_rate = float(getattr(econ, "ncs_cit_rate", 0.22))
             spt_rate = float(getattr(econ, "ncs_spt_rate", 0.718))
             uplift_rate = float(getattr(econ, "ncs_uplift_rate", 0.1769))
-            # Uplift is computed on facility + well CAPEX in the year of spend
-            uplift = uplift_rate * (capex_well + capex_fac)
-            cit = np.where(pretax > 0, pretax * cit_rate, 0.0)
-            spt_base = pretax - uplift
-            spt = np.where(spt_base > 0, spt_base * spt_rate, 0.0)
+            depr_years = float(getattr(econ, "ncs_depreciation_years", 6.0))
+            uplift_years = float(getattr(econ, "ncs_uplift_years", 4.0))
+
+            n = len(df)
+            capex_total_arr = (np.asarray(capex_well, dtype=float)
+                               + np.asarray(capex_fac, dtype=float))
+            # --- Depreciation schedule: straight-line over depr_years from
+            #     the month each CAPEX tranche is incurred ---
+            depr_months = max(1, int(round(depr_years * 12)))
+            depreciation = np.zeros(n)
+            for i in range(n):
+                amt = capex_total_arr[i]
+                if amt <= 0:
+                    continue
+                per_month = amt / depr_months
+                end = min(n, i + depr_months)
+                depreciation[i:end] += per_month
+            # --- Uplift schedule: straight-line over uplift_years ---
+            uplift_months = max(1, int(round(uplift_years * 12)))
+            uplift_sched = np.zeros(n)
+            for i in range(n):
+                amt = capex_total_arr[i] * uplift_rate
+                if amt <= 0:
+                    continue
+                per_month = amt / uplift_months
+                end = min(n, i + uplift_months)
+                uplift_sched[i:end] += per_month
+            uplift = uplift_sched  # for reporting
+
+            # --- Operating profit (before depreciation & financing) ---
+            # CAPEX is NOT expensed here — it enters via depreciation.
+            op_profit = (net_revenue.values - opex.values
+                         - aban_cost - co2_cost)
+
+            # --- CIT base: operating profit minus depreciation, with loss
+            #     carry-forward ---
+            cit = np.zeros(n)
+            cit_cf = 0.0   # carried-forward CIT loss (positive number = a loss)
+            cit_base_arr = np.zeros(n)
+            for i in range(n):
+                base = op_profit[i] - depreciation[i]
+                base_after_cf = base - cit_cf
+                if base_after_cf >= 0:
+                    cit[i] = base_after_cf * cit_rate
+                    cit_cf = 0.0
+                else:
+                    cit[i] = 0.0
+                    cit_cf = -base_after_cf   # grow the carry-forward
+                cit_base_arr[i] = base_after_cf
+            # --- SPT base: operating profit minus depreciation minus uplift,
+            #     with its own loss carry-forward ---
+            spt = np.zeros(n)
+            spt_cf = 0.0
+            for i in range(n):
+                base = op_profit[i] - depreciation[i] - uplift_sched[i]
+                base_after_cf = base - spt_cf
+                if base_after_cf >= 0:
+                    spt[i] = base_after_cf * spt_rate
+                    spt_cf = 0.0
+                else:
+                    spt[i] = 0.0
+                    spt_cf = -base_after_cf
             tax = cit + spt
-            cf = pretax - tax
+            # Cashflow: real cash CAPEX leaves in the month spent; tax is the
+            # depreciation-based number computed above.
+            pretax = net_revenue - opex - capex - aban_cost - co2_cost
+            cf = pretax.values - tax
         else:
+            pretax = net_revenue - opex - capex - aban_cost - co2_cost
             tax = np.where(pretax > 0, pretax * econ.tax_rate, 0.0)
             cf = pretax - tax
 
@@ -1894,6 +1973,118 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     except Exception:
         # If anything goes wrong, fall back to the un-padded df_e
         pass
+
+    # ---- NCS tax recomputation on the FULL (padded) dataframe ----
+    # The NCS calculation done earlier ran on the engine df, which starts at
+    # first production. But facility CAPEX dated before first oil is added by
+    # the pre-FOP prepend step above. To depreciate the COMPLETE CAPEX
+    # schedule (not just the post-FOP slice) the NCS tax must be recomputed
+    # here, on df_e, after the prepend. This is what makes the effective tax
+    # rate land at the correct ~70-78% instead of being roughly doubled.
+    if getattr(econ, "fiscal_regime", "Tax/Royalty") == "NCS":
+        try:
+            cit_rate = float(getattr(econ, "ncs_cit_rate", 0.22))
+            spt_rate = float(getattr(econ, "ncs_spt_rate", 0.718))
+            uplift_rate = float(getattr(econ, "ncs_uplift_rate", 0.1769))
+            depr_years = float(getattr(econ, "ncs_depreciation_years", 6.0))
+            uplift_years = float(getattr(econ, "ncs_uplift_years", 4.0))
+            n = len(df_e)
+
+            capex_full = (df_e["capex_well"].values.astype(float)
+                          + df_e["capex_facility"].values.astype(float))
+            # Depreciation: straight-line over depr_years from each tranche.
+            depr_months = max(1, int(round(depr_years * 12)))
+            depreciation = np.zeros(n)
+            for i in range(n):
+                amt = capex_full[i]
+                if amt <= 0:
+                    continue
+                per_month = amt / depr_months
+                # Tail beyond the forecast is allowed to accelerate into the
+                # final month so total depreciation always equals total CAPEX
+                # (NCS losses are not lost — they unwind at cessation).
+                end = min(n, i + depr_months)
+                depreciation[i:end] += per_month
+                spilled = per_month * (depr_months - (end - i))
+                if spilled > 0:
+                    depreciation[n - 1] += spilled
+            # Uplift: straight-line over uplift_years, SPT base only.
+            uplift_months = max(1, int(round(uplift_years * 12)))
+            uplift_sched = np.zeros(n)
+            for i in range(n):
+                amt = capex_full[i] * uplift_rate
+                if amt <= 0:
+                    continue
+                per_month = amt / uplift_months
+                end = min(n, i + uplift_months)
+                uplift_sched[i:end] += per_month
+                spilled = per_month * (uplift_months - (end - i))
+                if spilled > 0:
+                    uplift_sched[n - 1] += spilled
+
+            # Operating profit (CAPEX enters via depreciation, not expensed).
+            op_profit = (df_e["revenue"].values
+                         - df_e["royalty"].values
+                         - df_e["tariff"].values
+                         - df_e["opex"].values
+                         - df_e["abandonment"].values
+                         - df_e.get("co2_cost", pd.Series(np.zeros(n))).values)
+
+            # CIT with loss carry-forward.
+            cit = np.zeros(n)
+            cit_cf = 0.0
+            for i in range(n):
+                base = op_profit[i] - depreciation[i] - cit_cf
+                if base >= 0:
+                    cit[i] = base * cit_rate
+                    cit_cf = 0.0
+                else:
+                    cit_cf = -base
+            # Terminal loss settlement: NCS does not let tax losses expire —
+            # remaining carry-forward at cessation is refunded (the State
+            # carries the downside symmetrically). Credit the residual loss
+            # at its tax value in the final month.
+            if cit_cf > 0:
+                cit[n - 1] -= cit_cf * cit_rate
+            # SPT with its own loss carry-forward (uplift in the base).
+            spt = np.zeros(n)
+            spt_cf = 0.0
+            for i in range(n):
+                base = (op_profit[i] - depreciation[i]
+                        - uplift_sched[i] - spt_cf)
+                if base >= 0:
+                    spt[i] = base * spt_rate
+                    spt_cf = 0.0
+                else:
+                    spt_cf = -base
+            if spt_cf > 0:
+                spt[n - 1] -= spt_cf * spt_rate
+            tax_full = cit + spt
+
+            df_e["ncs_cit"] = cit
+            df_e["ncs_spt"] = spt
+            df_e["ncs_uplift"] = uplift_sched
+            df_e["ncs_depreciation"] = depreciation
+            df_e["tax"] = tax_full
+            # Rebuild cashflow: real cash CAPEX leaves when spent; tax is the
+            # depreciation-based figure.
+            pretax_cash = (df_e["revenue"].values
+                           - df_e["royalty"].values
+                           - df_e["tariff"].values
+                           - df_e["opex"].values
+                           - df_e["capex_well"].values
+                           - df_e["capex_facility"].values
+                           - df_e["abandonment"].values
+                           - df_e.get("co2_cost", pd.Series(np.zeros(n))).values)
+            cf_full = pretax_cash - tax_full
+            df_e["cashflow"] = cf_full
+            df_e["cum_cashflow"] = np.cumsum(cf_full)
+            disc_full = (1 + r_m) ** np.arange(n)
+            df_e["discounted_cf"] = cf_full / disc_full
+            df_e["npv"] = df_e["discounted_cf"].cumsum()
+        except Exception:
+            # If recomputation fails, leave the earlier NCS numbers in place.
+            pass
 
     # Stash the per-well cost breakdown on the DataFrame so the UI can show it
     df_e.attrs["well_cost_breakdown"] = well_cost_breakdown
@@ -3166,6 +3357,28 @@ def decline_fitter_picker(units: str, fluid: str, rig_names: list):
 def well_section(units, fluid, start_date):
     is_oil = FLUID_SYSTEMS[fluid]["primary"] == "oil"
     st.subheader("🛠️ Drilling rigs, producers & injectors")
+
+    # HPHT badge — the field PVT determines whether these are HPHT wells.
+    try:
+        _p = to_field(float(st.session_state.get("p_init", 3500.0)),
+                      "pressure", units)
+        _t = to_field(float(st.session_state.get("t_res", 180.0)),
+                      "temp", units)
+        _hpht = fh.classify_hpht(_p, _t)
+        if _hpht["is_hpht"]:
+            st.warning(f"**{_hpht['tag']} wells** — these wells operate in "
+                       f"{_hpht['tier']} conditions ({_p:,.0f} psi, "
+                       f"{_t:,.0f} °F). HPHT wells need specialised "
+                       f"completions and higher-grade metallurgy; expect "
+                       f"longer drilling/completion times and higher well "
+                       f"cost. The development concept builder applies a "
+                       f"×{_hpht['capex_uplift']:.2f} CAPEX uplift for this "
+                       f"tier.")
+        else:
+            st.caption(f"{_hpht['tag']} — standard pressure/temperature "
+                       f"conditions ({_p:,.0f} psi, {_t:,.0f} °F).")
+    except Exception:
+        pass
 
     with st.expander("ℹ️ How this section works", expanded=False):
         st.markdown(
@@ -4814,11 +5027,52 @@ def economics_section(units, start_date):
         cost_overrides = st.session_state.get("dc_cost_overrides", {})
 
         # Assemble the spec and build the concept
+        # HPHT classification — auto-derived from the reservoir PVT inputs
+        # (pressure / temperature in the Reservoir tab), with a manual
+        # override so the user can force a tier.
+        _p_psi = to_field(float(st.session_state.get("p_init", 3500.0)),
+                          "pressure", units)
+        _t_F = to_field(float(st.session_state.get("t_res", 180.0)),
+                        "temp", units)
+        _auto_hpht = fh.classify_hpht(_p_psi, _t_F)
+        st.markdown("**HPHT classification**")
+        hpht_choice = st.radio(
+            "Pressure / temperature class",
+            ["Auto from reservoir PVT", "Standard", "HPHT", "Ultra-HPHT",
+             "Extreme-HPHT"],
+            horizontal=True, key="dc_hpht_choice",
+            help="HPHT (High Pressure / High Temperature) developments need "
+                 "specialised completions, higher-grade metallurgy and longer "
+                 "drilling/testing — a CAPEX uplift applies to wells and "
+                 "subsea hardware.\n\n"
+                 "Thresholds: HPHT ≥ 10,000 psi or ≥ 300 °F; "
+                 "Ultra-HPHT ≥ 15,000 psi or ≥ 350 °F; "
+                 "Extreme-HPHT ≥ 20,000 psi or ≥ 400 °F.\n\n"
+                 "'Auto' reads the pressure & temperature from the Reservoir "
+                 "tab's PVT inputs.")
+        if hpht_choice == "Auto from reservoir PVT":
+            hpht_tier = _auto_hpht["tier"]
+            tag = _auto_hpht["tag"]
+            if _auto_hpht["is_hpht"]:
+                st.warning(f"**{tag}** — {_auto_hpht['rationale']}")
+            else:
+                st.caption(f"{tag} — {_auto_hpht['rationale']}")
+        else:
+            hpht_tier = hpht_choice
+            _man = fh._HPHT_CAPEX_UPLIFT.get(hpht_tier, 1.0)
+            st.caption(f"Manual override: **{hpht_tier}** "
+                       f"(CAPEX uplift ×{_man:.2f} on wells & subsea). "
+                       f"Auto-classification from PVT would be "
+                       f"'{_auto_hpht['tier']}'.")
+
         dc_spec = {
             "concept_type": concept_type,
             "host_type": host_type,
             "processing_capacity_kboed": processing_capacity,
             "water_depth_class": water_depth_class,
+            "hpht_tier": hpht_tier,
+            "reservoir_pressure_psi": _p_psi,
+            "reservoir_temp_F": _t_F,
             "n_templates": n_templates,
             "n_subsea_wells": n_subsea_wells,
             "n_dry_wells": n_dry_wells,
@@ -5155,28 +5409,24 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — use add_shape + add_annotation to avoid Plotly's datetime mean calculation
+            # Milestone markers — convert everything to pd.Timestamp so
+            # Plotly's internal axis-mean call sees uniform types.
             for label, mdate in sched["milestones"]:
-                mts = pd.Timestamp(mdate).to_pydatetime()
-                fig_g.add_shape(
-                    type="line", x0=mts, x1=mts, y0=0, y1=1,
-                    yref="paper", line=dict(color="#333", dash="dot", width=1)
-                )
-                fig_g.add_annotation(
-                    x=mts, text=label, showarrow=False,
-                    textangle=-45, font=dict(size=9, color="#444"),
-                    yanchor="bottom", y=1.05, xanchor="left"
+                mts = pd.Timestamp(mdate)
+                fig_g.add_vline(
+                    x=mts, line=dict(color="#333", dash="dot", width=1),
+                    annotation_text=label,
+                    annotation_position="top",
+                    annotation_textangle=-45,
+                    annotation_font=dict(size=9, color="#444"),
                 )
             # First-oil emphasis — green thick line
-            fo_ts = pd.Timestamp(sched["first_oil_date"]).to_pydatetime()
-            fig_g.add_shape(
-                type="line", x0=fo_ts, x1=fo_ts, y0=0, y1=1,
-                yref="paper", line=dict(color="#2ca02c", width=3)
-            )
-            fig_g.add_annotation(
-                x=fo_ts, text=f"🛢️ First oil: {sched['first_oil_date']}",
-                showarrow=False, font=dict(size=12, color="#2ca02c"),
-                yanchor="top", y=-0.05, xanchor="center"
+            fo_ts = pd.Timestamp(sched["first_oil_date"])
+            fig_g.add_vline(
+                x=fo_ts, line=dict(color="#2ca02c", width=3),
+                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
+                annotation_position="bottom",
+                annotation_font=dict(size=12, color="#2ca02c"),
             )
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
@@ -5234,19 +5484,18 @@ def economics_section(units, start_date):
                 f"The computed first-oil date is "
                 f"**{sched['first_oil_date']}**. Currently the field's "
                 f"production start date is set to **{start_date}**.")
-            def _update_start_date_to_fop():
-                fod = sched["first_oil_date"]
-                st.session_state["start_date"] = fod.date() if hasattr(fod, 'date') else fod
+            if push_col2.button("📌 Use first oil date as production start",
+                                 key="sched_push_fop",
+                                 help="Updates the field's production start "
+                                      "date to match the computed first-oil "
+                                      "milestone, so the economics and "
+                                      "production forecast align with the "
+                                      "schedule."):
+                st.session_state["start_date"] = sched["first_oil_date"]
                 mark_stale()
-            
-            push_col2.button("📌 Use first oil date as production start",
-                            key="sched_push_fop",
-                            on_click=_update_start_date_to_fop,
-                            help="Updates the field's production start "
-                                 "date to match the computed first-oil "
-                                 "milestone, so the economics and "
-                                 "production forecast align with the "
-                                 "schedule.")
+                st.success(f"Production start date set to "
+                           f"{sched['first_oil_date']}. Re-run to refresh.")
+                st.rerun()
 
     st.markdown("**Phased facility CAPEX**")
     if "fac_df" not in st.session_state:

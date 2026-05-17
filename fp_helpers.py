@@ -549,6 +549,81 @@ def co2_intensity_benchmark(df_e, df, is_oil) -> dict:
 
 
 # =============================================================================
+# HPHT (High Pressure / High Temperature) classification
+# =============================================================================
+# Industry-standard thresholds (API / common service-company usage):
+#   Standard      : p < 10,000 psi  AND  T < 300 °F
+#   HPHT          : p ≥ 10,000 psi  OR   T ≥ 300 °F
+#   Ultra-HPHT    : p ≥ 15,000 psi  OR   T ≥ 350 °F
+#   Extreme-HPHT  : p ≥ 20,000 psi  OR   T ≥ 400 °F
+# HPHT conditions drive specialised completions, higher-grade metallurgy,
+# longer well-test and drilling times, and a CAPEX premium.
+_HPHT_PRESSURE_PSI = 10000.0
+_HPHT_TEMP_F = 300.0
+_ULTRA_HPHT_PRESSURE_PSI = 15000.0
+_ULTRA_HPHT_TEMP_F = 350.0
+_EXTREME_HPHT_PRESSURE_PSI = 20000.0
+_EXTREME_HPHT_TEMP_F = 400.0
+
+# CAPEX uplift multipliers applied to well + subsea cost for HPHT tiers.
+_HPHT_CAPEX_UPLIFT = {
+    "Standard":      1.00,
+    "HPHT":          1.25,
+    "Ultra-HPHT":    1.55,
+    "Extreme-HPHT":  1.90,
+}
+
+
+def classify_hpht(pressure_psi: float, temperature_F: float) -> dict:
+    """Classify a well / reservoir / concept by HPHT tier from initial
+    reservoir pressure (psi) and temperature (°F).
+
+    Returns a dict:
+        tier        : "Standard" | "HPHT" | "Ultra-HPHT" | "Extreme-HPHT"
+        is_hpht     : bool
+        capex_uplift: float  (multiplier on well + subsea CAPEX)
+        tag         : short display string (e.g. "🔥 HPHT")
+        rationale   : human-readable reason for the classification
+    """
+    p = float(pressure_psi or 0.0)
+    t = float(temperature_F or 0.0)
+    if p >= _EXTREME_HPHT_PRESSURE_PSI or t >= _EXTREME_HPHT_TEMP_F:
+        tier = "Extreme-HPHT"
+    elif p >= _ULTRA_HPHT_PRESSURE_PSI or t >= _ULTRA_HPHT_TEMP_F:
+        tier = "Ultra-HPHT"
+    elif p >= _HPHT_PRESSURE_PSI or t >= _HPHT_TEMP_F:
+        tier = "HPHT"
+    else:
+        tier = "Standard"
+    is_hpht = (tier != "Standard")
+    tags = {"Standard": "Standard P/T", "HPHT": "🔥 HPHT",
+            "Ultra-HPHT": "🔥 Ultra-HPHT", "Extreme-HPHT": "🔥 Extreme-HPHT"}
+    # Rationale
+    reasons = []
+    if p >= _HPHT_PRESSURE_PSI:
+        reasons.append(f"pressure {p:,.0f} psi ≥ {_HPHT_PRESSURE_PSI:,.0f} psi")
+    if t >= _HPHT_TEMP_F:
+        reasons.append(f"temperature {t:,.0f} °F ≥ {_HPHT_TEMP_F:,.0f} °F")
+    if reasons:
+        rationale = ("Classified " + tier + " because " + " and ".join(reasons)
+                     + ". HPHT conditions require specialised completions, "
+                     "higher-grade metallurgy and longer drilling / testing "
+                     "times — a CAPEX premium applies.")
+    else:
+        rationale = (f"Standard pressure/temperature "
+                     f"({p:,.0f} psi, {t:,.0f} °F) — below the "
+                     f"{_HPHT_PRESSURE_PSI:,.0f} psi / {_HPHT_TEMP_F:,.0f} °F "
+                     f"HPHT thresholds.")
+    return {
+        "tier": tier,
+        "is_hpht": is_hpht,
+        "capex_uplift": _HPHT_CAPEX_UPLIFT[tier],
+        "tag": tags[tier],
+        "rationale": rationale,
+    }
+
+
+# =============================================================================
 # PDF report
 # =============================================================================
 def build_pdf_report(case_name: str, summary_kpis: dict,
@@ -2524,6 +2599,19 @@ def build_development_concept(spec: dict) -> dict:
     # override any line item while keeping the rest benchmark-driven.
     overrides = g("cost_overrides") or {}
 
+    # HPHT classification — drives a CAPEX uplift on wells + subsea hardware.
+    # Either passed directly as spec["hpht_tier"], or derived from spec
+    # pressure / temperature if those are supplied.
+    hpht_tier = g("hpht_tier")
+    if not hpht_tier:
+        p_psi = g("reservoir_pressure_psi", 0.0)
+        t_F = g("reservoir_temp_F", 0.0)
+        if p_psi or t_F:
+            hpht_tier = classify_hpht(p_psi, t_F)["tier"]
+        else:
+            hpht_tier = "Standard"
+    hpht_uplift = _HPHT_CAPEX_UPLIFT.get(hpht_tier, 1.0)
+
     rows = []          # (offset_days, amount_MMUSD, label)
     warnings = []
     summary = []
@@ -2535,15 +2623,22 @@ def build_development_concept(spec: dict) -> dict:
             rows.append((offset_days, float(amt), label))
 
     # ---- Component costs --------------------------------------------------
-    # Subsea templates / manifolds
-    cost_templates = n_templates * _TEMPLATE_COST
-    _push(0, cost_templates, f"{n_templates} × subsea template/manifold")
+    # Subsea templates / manifolds — HPHT uplift applies (higher-spec
+    # structures and connectors for HPHT service).
+    cost_templates = n_templates * _TEMPLATE_COST * hpht_uplift
+    _hpht_sfx = f" [{hpht_tier}]" if hpht_tier != "Standard" else ""
+    _push(0, cost_templates,
+          f"{n_templates} × subsea template/manifold{_hpht_sfx}")
 
-    # Xmas trees
-    cost_wet_trees = n_subsea_wells * _XMAS_TREE_COST["Wet (subsea) tree"]
-    cost_dry_trees = n_dry_wells * _XMAS_TREE_COST["Dry (surface) tree"]
-    _push(90, cost_wet_trees, f"{n_subsea_wells} × wet (subsea) xmas trees")
-    _push(90, cost_dry_trees, f"{n_dry_wells} × dry (surface) xmas trees")
+    # Xmas trees — HPHT uplift applies (HPHT-rated trees cost materially more).
+    cost_wet_trees = (n_subsea_wells * _XMAS_TREE_COST["Wet (subsea) tree"]
+                      * hpht_uplift)
+    cost_dry_trees = (n_dry_wells * _XMAS_TREE_COST["Dry (surface) tree"]
+                      * hpht_uplift)
+    _push(90, cost_wet_trees,
+          f"{n_subsea_wells} × wet (subsea) xmas trees{_hpht_sfx}")
+    _push(90, cost_dry_trees,
+          f"{n_dry_wells} × dry (surface) xmas trees{_hpht_sfx}")
 
     # Flowlines (base)
     fl_per_km = _flowline_cost_per_km(flowline_diam, flowline_material,
@@ -2720,6 +2815,10 @@ def build_development_concept(spec: dict) -> dict:
 
     # ---- Summary ----------------------------------------------------------
     summary.append(("Concept type", concept_type))
+    if hpht_tier != "Standard":
+        summary.append(("HPHT classification",
+                         f"{hpht_tier}  (CAPEX uplift ×{hpht_uplift:.2f} "
+                         f"on wells & subsea)"))
     if concept_type == "Standalone":
         summary.append(("Host / facility", g("host_type", "—")))
         summary.append(("Processing capacity",
@@ -2829,6 +2928,8 @@ def build_development_concept(spec: dict) -> dict:
         "summary": summary,
         "warnings": warnings,
         "schematic": schematic,
+        "hpht_tier": hpht_tier,
+        "hpht_uplift": hpht_uplift,
         "totals": {
             "capex_excl_cessation": capex_excl_cessation,
             "cessation": cessation,
@@ -2863,37 +2964,17 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
     parts = []
     parts.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
                  f'height="{H}" viewBox="0 0 {W} {H}" font-family="sans-serif">')
-    # Define gradients for fancy styling
-    parts.append(f'<defs>')
-    parts.append(f'<linearGradient id="seaGrad" x1="0%" y1="0%" x2="0%" y2="100%">')
-    parts.append(f'<stop offset="0%" style="stop-color:#dCEcF7;stop-opacity:1" />')
-    parts.append(f'<stop offset="100%" style="stop-color:#a8d8f0;stop-opacity:1" />')
-    parts.append(f'</linearGradient>')
-    parts.append(f'<linearGradient id="waterGrad" x1="0%" y1="0%" x2="0%" y2="100%">')
-    parts.append(f'<stop offset="0%" style="stop-color:#bcdcef;stop-opacity:1" />')
-    parts.append(f'<stop offset="100%" style="stop-color:#7ab8e5;stop-opacity:1" />')
-    parts.append(f'</linearGradient>')
-    parts.append(f'<linearGradient id="templateGrad" x1="0%" y1="0%" x2="0%" y2="100%">')
-    parts.append(f'<stop offset="0%" style="stop-color:#d46;stop-opacity:1" />')
-    parts.append(f'<stop offset="100%" style="stop-color:#a33;stop-opacity:1" />')
-    parts.append(f'</linearGradient>')
-    parts.append(f'</defs>')
-    # Sky / sea / seabed bands with gradients
-    parts.append(f'<rect x="0" y="0" width="{W}" height="{sea}" fill="url(#seaGrad)"/>')
+    # Sky / sea / seabed bands
+    parts.append(f'<rect x="0" y="0" width="{W}" height="{sea}" fill="#dCEcF7"/>')
     parts.append(f'<rect x="0" y="{sea}" width="{W}" height="{seabed-sea}" '
-                 f'fill="url(#waterGrad)"/>')
+                 f'fill="#bcdcef"/>')
     parts.append(f'<rect x="0" y="{seabed}" width="{W}" height="{H-seabed}" '
                  f'fill="#d8c9a8"/>')
-    # Water surface with ripple effect
     parts.append(f'<line x1="0" y1="{sea}" x2="{W}" y2="{sea}" '
-                 f'stroke="#5a9bcf" stroke-width="2.5" opacity="0.8"/>')
-    parts.append(f'<line x1="0" y1="{sea+1}" x2="{W}" y2="{sea+1}" '
-                 f'stroke="#7ab8e5" stroke-width="1" opacity="0.6"/>')
-    parts.append(f'<text x="8" y="{sea-6}" font-size="11" fill="#33648a" '
-                 f'font-weight="bold">'
+                 f'stroke="#5a9bcf" stroke-width="2"/>')
+    parts.append(f'<text x="8" y="{sea-6}" font-size="11" fill="#33648a">'
                  f'Sea surface</text>')
-    parts.append(f'<text x="8" y="{seabed+16}" font-size="11" fill="#7a6a45" '
-                 f'font-weight="bold">'
+    parts.append(f'<text x="8" y="{seabed+16}" font-size="11" fill="#7a6a45">'
                  f'Seabed</text>')
 
     is_onshore = (concept_type == "Standalone" and
@@ -2905,61 +2986,29 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
                      f'fill="#e8e2d0"/>')
         parts.append(f'<rect x="0" y="{seabed}" width="{W}" height="{H-seabed}" '
                      f'fill="#cdbf9a"/>')
-        # CPF with shadow and gradient
-        parts.append(f'<defs>')
-        parts.append(f'<linearGradient id="cpfGrad" x1="0%" y1="0%" x2="0%" y2="100%">')
-        parts.append(f'<stop offset="0%" style="stop-color:#a8a8a8;stop-opacity:1" />')
-        parts.append(f'<stop offset="100%" style="stop-color:#6a6a6a;stop-opacity:1" />')
-        parts.append(f'</linearGradient>')
-        parts.append(f'</defs>')
-        # Shadow
-        parts.append(f'<rect x="502" y="262" width="150" height="8" '
-                     f'fill="#000" opacity="0.15" rx="4"/>')
+        # CPF
         parts.append(f'<rect x="500" y="170" width="150" height="90" '
-                     f'fill="url(#cpfGrad)" stroke="#333" stroke-width="2.5" rx="4"/>')
-        # CPF structure lines
-        parts.append(f'<line x1="530" y1="170" x2="530" y2="260" '
-                     f'stroke="#555" stroke-width="1" opacity="0.5"/>')
-        parts.append(f'<line x1="560" y1="170" x2="560" y2="260" '
-                     f'stroke="#555" stroke-width="1" opacity="0.5"/>')
-        parts.append(f'<line x1="590" y1="170" x2="590" y2="260" '
-                     f'stroke="#555" stroke-width="1" opacity="0.5"/>')
-        parts.append(f'<line x1="620" y1="170" x2="620" y2="260" '
-                     f'stroke="#555" stroke-width="1" opacity="0.5"/>')
-        parts.append(f'<text x="575" y="215" font-size="12" fill="white" '
-                     f'text-anchor="middle" font-weight="bold">Central</text>')
-        parts.append(f'<text x="575" y="233" font-size="12" fill="white" '
-                     f'text-anchor="middle" font-weight="bold">Processing</text>')
-        # wellpads with improved styling
+                     f'fill="#8a8a8a" stroke="#333" stroke-width="2"/>')
+        parts.append(f'<text x="575" y="220" font-size="12" fill="white" '
+                     f'text-anchor="middle">Central</text>')
+        parts.append(f'<text x="575" y="236" font-size="12" fill="white" '
+                     f'text-anchor="middle">Processing</text>')
+        # wellpads
         n_pads = max(1, n_dry + n_subsea)
         for i in range(min(n_pads, 6)):
             x = 60 + i * 65
-            # Wellpad shadow
-            parts.append(f'<rect x="{x+1}" y="256" width="34" height="6" '
-                         f'fill="#000" opacity="0.2" rx="2"/>')
             parts.append(f'<rect x="{x}" y="235" width="34" height="20" '
-                         f'fill="#5a8f3a" stroke="#333" stroke-width="1.5" rx="2"/>')
-            # Derrick structure
-            parts.append(f'<line x1="{x+17}" y1="240" x2="{x+12}" '
-                         f'y2="200" stroke="#333" stroke-width="2"/>')
-            parts.append(f'<line x1="{x+17}" y1="240" x2="{x+22}" '
-                         f'y2="200" stroke="#333" stroke-width="2"/>')
-            parts.append(f'<line x1="{x+17}" y1="200" x2="{x+17}" y2="180" '
-                         f'stroke="#333" stroke-width="3"/>')
-            parts.append(f'<circle cx="{x+17}" cy="185" r="4" fill="#ff6" stroke="#333"/>')  # top block
-            # Gathering line to CPF
-            parts.append(f'<path d="M {x+34} {245} Q {(x+34+500)/2} {220} 500 {230}" '
-                         f'fill="none" stroke="#946" stroke-width="2.5" stroke-linecap="round"/>')
+                         f'fill="#5a8f3a" stroke="#333"/>')
+            parts.append(f'<line x1="{x+17}" y1="235" x2="{x+17}" y2="200" '
+                         f'stroke="#333" stroke-width="3"/>')  # derrick
+            parts.append(f'<line x1="{x+34}" y1="245" x2="500" y2="230" '
+                         f'stroke="#946" stroke-width="2"/>')  # gathering line
         parts.append(f'<text x="200" y="285" font-size="11" '
-                     f'fill="#333" font-weight="bold">Well pads + gathering lines</text>')
+                     f'fill="#333">Well pads + gathering lines</text>')
         if export_km > 0:
-            # Export pipeline with styling
             parts.append(f'<line x1="650" y1="215" x2="710" y2="215" '
-                         f'stroke="#135" stroke-width="5" opacity="0.3"/>')
-            parts.append(f'<line x1="650" y1="215" x2="710" y2="215" '
-                         f'stroke="#246" stroke-width="3.5" stroke-linecap="round"/>')
-            parts.append(f'<text x="630" y="150" font-size="11" fill="#246" '
-                         f'font-weight="bold">'
+                         f'stroke="#246" stroke-width="4"/>')
+            parts.append(f'<text x="600" y="150" font-size="11" fill="#246">'
                          f'Export pipeline {export_km:.0f} km →</text>')
         parts.append('</svg>')
         return "".join(parts)
@@ -2978,64 +3027,38 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
                      f'fill="#333" text-anchor="middle">Host facility</text>')
         # Subsea template + wells on the left
         tx = 90
-        # Fancy template with 3D-like appearance
-        parts.append(f'<g>')
-        parts.append(f'<rect x="{tx-2}" y="{seabed-14}" width="90" height="16" '
-                     f'fill="url(#templateGrad)" stroke="#333" stroke-width="2.5" opacity="0.9"/>')
-        # Template pattern/structure details
-        for j in range(0, 90, 18):
-            parts.append(f'<line x1="{tx+j}" y1="{seabed-14}" x2="{tx+j}" '
-                         f'y2="{seabed+2}" stroke="#333" stroke-width="1.5" opacity="0.4"/>')
-        parts.append(f'</g>')
+        parts.append(f'<rect x="{tx}" y="{seabed-14}" width="90" height="16" '
+                     f'fill="#c46" stroke="#333" stroke-width="2"/>')
         parts.append(f'<text x="{tx+45}" y="{seabed+28}" font-size="11" '
-                     f'fill="#333" text-anchor="middle" font-weight="bold">'
+                     f'fill="#333" text-anchor="middle">'
                      f'{max(1,n_templates)} template(s), {n_subsea} wells</text>')
         for i in range(min(max(1, n_subsea), 6)):
             wx = tx + 8 + i * 14
             parts.append(f'<line x1="{wx}" y1="{seabed}" x2="{wx}" '
-                         f'y2="{seabed+30}" stroke="#333" stroke-width="3" '
-                         f'stroke-linecap="round"/>')
-            # Well bottom connectors
-            parts.append(f'<circle cx="{wx}" cy="{seabed+30}" r="2" fill="#333"/>')
-        # Flowline template → host with shadow
+                         f'y2="{seabed+30}" stroke="#333" stroke-width="3"/>')
+        # Flowline template → host
         parts.append(f'<line x1="{tx+90}" y1="{seabed-6}" x2="{hx}" '
-                     f'y2="{seabed-6}" stroke="#135" stroke-width="4.5" opacity="0.4"/>')
-        parts.append(f'<line x1="{tx+90}" y1="{seabed-6}" x2="{hx}" '
-                     f'y2="{seabed-6}" stroke="#246" stroke-width="3.5"/>')
+                     f'y2="{seabed-6}" stroke="#246" stroke-width="4"/>')
         midx = (tx + 90 + hx) / 2
         parts.append(f'<text x="{midx}" y="{seabed-14}" font-size="11" '
-                     f'fill="#246" text-anchor="middle" font-weight="bold">'
+                     f'fill="#246" text-anchor="middle">'
                      f'Flowline {flowline_km:.0f} km '
                      f'(tie-back {host_distance_km:.0f} km)</text>')
-        # Boosting station with fancy styling
+        # Boosting station
         if n_boosting > 0:
             bx = midx
-            # Boosting station shadow
-            parts.append(f'<circle cx="{bx}" cy="{seabed-6+3}" r="9.5" '
-                         f'fill="#000" opacity="0.2"/>')
-            # Main circle with gradient effect
             parts.append(f'<circle cx="{bx}" cy="{seabed-6}" r="9" '
-                         f'fill="#fa3" stroke="#c80" stroke-width="2.5"/>')
-            # Highlight
-            parts.append(f'<circle cx="{bx-2}" cy="{seabed-8}" r="3" '
-                         f'fill="#ffd" opacity="0.7"/>')
-            parts.append(f'<text x="{bx}" y="{seabed+20}" font-size="10" '
-                         f'fill="#a60" text-anchor="middle" font-weight="bold">'
+                         f'fill="#fa3" stroke="#333" stroke-width="2"/>')
+            parts.append(f'<text x="{bx}" y="{seabed+18}" font-size="10" '
+                         f'fill="#a60" text-anchor="middle">'
                          f'Boosting ×{n_boosting}</text>')
-        # Risers up the host — S-shaped
+        # Risers up the host
         if n_risers > 0:
-            # S-curve: start at seabed, curve left then right to reach surface
-            cx1 = hx - 50  # first control point (curve outward)
-            cy1 = seabed - 40
-            cx2 = hx + 20  # second control point (curve back inward)
-            cy2 = sea + 20
-            parts.append(f'<path d="M {hx} {seabed-6} C {cx1} {cy1} {cx2} {cy2} {hx+12} {sea}" '
-                         f'fill="none" stroke="#19a" stroke-width="4" stroke-linecap="round" opacity="0.8"/>')
-            parts.append(f'<path d="M {hx} {seabed-6} C {cx1} {cy1} {cx2} {cy2} {hx+12} {sea}" '
-                         f'fill="none" stroke="#2db" stroke-width="2.5" stroke-linecap="round"/>')
-            parts.append(f'<circle cx="{hx+12}" cy="{sea}" r="3" fill="#2db" stroke="#19a" stroke-width="1"/>')
+            parts.append(f'<path d="M {hx} {seabed-6} Q {hx-30} '
+                         f'{(seabed+sea)/2} {hx+12} {sea}" fill="none" '
+                         f'stroke="#19a" stroke-width="3"/>')
             parts.append(f'<text x="{hx-50}" y="{(seabed+sea)/2}" '
-                         f'font-size="10" fill="#19a" font-weight="bold">{n_risers} riser(s)</text>')
+                         f'font-size="10" fill="#19a">{n_risers} riser(s)</text>')
         # Heating annotation
         if heating and heating != "None":
             parts.append(f'<text x="{midx}" y="{seabed+2}" font-size="10" '
@@ -3086,39 +3109,23 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
         # Subsea wells + template on the left, tied back
         if n_subsea > 0:
             tx = 70
-            # Fancy template
-            parts.append(f'<g>')
-            parts.append(f'<rect x="{tx-2}" y="{seabed-14}" width="80" '
-                         f'height="16" fill="url(#templateGrad)" stroke="#333" '
-                         f'stroke-width="2.5" opacity="0.9"/>')
-            for j in range(0, 80, 16):
-                parts.append(f'<line x1="{tx+j}" y1="{seabed-14}" x2="{tx+j}" '
-                             f'y2="{seabed+2}" stroke="#333" stroke-width="1.5" opacity="0.4"/>')
-            parts.append(f'</g>')
+            parts.append(f'<rect x="{tx}" y="{seabed-14}" width="80" '
+                         f'height="16" fill="#c46" stroke="#333" '
+                         f'stroke-width="2"/>')
             for i in range(min(n_subsea, 5)):
                 wx = tx + 8 + i * 14
                 parts.append(f'<line x1="{wx}" y1="{seabed}" x2="{wx}" '
                              f'y2="{seabed+28}" stroke="#333" '
-                             f'stroke-width="3" stroke-linecap="round"/>')
-                parts.append(f'<circle cx="{wx}" cy="{seabed+28}" r="2" fill="#333"/>')
+                             f'stroke-width="3"/>')
             parts.append(f'<text x="{tx+40}" y="{seabed+42}" font-size="10" '
-                         f'fill="#333" text-anchor="middle" font-weight="bold">'
+                         f'fill="#333" text-anchor="middle">'
                          f'{n_subsea} subsea well(s)</text>')
             parts.append(f'<line x1="{tx+80}" y1="{seabed-6}" x2="{hx+20}" '
-                         f'y2="{seabed-6}" stroke="#135" stroke-width="4.5" opacity="0.4"/>')
-            parts.append(f'<line x1="{tx+80}" y1="{seabed-6}" x2="{hx+20}" '
-                         f'y2="{seabed-6}" stroke="#246" stroke-width="3"/>')
+                         f'y2="{seabed-6}" stroke="#246" stroke-width="4"/>')
             if n_risers > 0:
-                # S-shaped riser
-                cx1 = hx - 20
-                cy1 = seabed - 35
-                cx2 = hx + 40
-                cy2 = sea + 15
-                parts.append(f'<path d="M {hx+20} {seabed-6} C {cx1} {cy1} {cx2} {cy2} {hx+30} {sea}" '
-                             f'fill="none" stroke="#19a" stroke-width="4" stroke-linecap="round" opacity="0.8"/>')
-                parts.append(f'<path d="M {hx+20} {seabed-6} C {cx1} {cy1} {cx2} {cy2} {hx+30} {sea}" '
-                             f'fill="none" stroke="#2db" stroke-width="2.5" stroke-linecap="round"/>')
-                parts.append(f'<circle cx="{hx+30}" cy="{sea}" r="3" fill="#2db" stroke="#19a" stroke-width="1"/>')
+                parts.append(f'<path d="M {hx+20} {seabed-6} Q {hx} '
+                             f'{(seabed+sea)/2} {hx+30} {sea}" fill="none" '
+                             f'stroke="#19a" stroke-width="3"/>')
         # Export pipeline
         if export_km > 0:
             parts.append(f'<line x1="{hx+120}" y1="{sea-20}" x2="{W-10}" '
