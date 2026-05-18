@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "3.4"
+FP_HELPERS_VERSION = "3.5"
 
 import io
 import json
@@ -2408,12 +2408,18 @@ def batch_results_to_json(batch_results: list[dict]) -> str:
 # Unit basis is stated explicitly for every parameter so there is no ambiguity.
 
 # ---- Screening cost bases (all in $MM unless noted) -------------------------
+# Cost basis: 2025-2026 NCS (Norwegian Continental Shelf) screening levels.
+# These were escalated ~30-40% from a pre-2021 baseline to reflect steel,
+# fabrication, rig-rate and subsea-equipment inflation through 2022-2025.
+# All figures are ORDER-OF-MAGNITUDE screening anchors — a class-3 estimate
+# needs a quantity surveyor.
+#
 # Flowline cost is $MM per km, indexed by nominal diameter (inches) and
 # material. Carbon steel is the baseline; corrosion-resistant alloy (CRA) and
 # flexible pipe carry multipliers.
-_FLOWLINE_BASE_MMUSD_PER_KM = {   # carbon steel, rigid, installed
-    6:  0.9, 8:  1.1, 10: 1.4, 12: 1.7, 14: 2.1,
-    16: 2.5, 18: 3.0, 20: 3.6, 24: 4.8, 30: 6.5,
+_FLOWLINE_BASE_MMUSD_PER_KM = {   # carbon steel, rigid, installed (NCS 2025)
+    6:  1.2, 8:  1.5, 10: 1.9, 12: 2.3, 14: 2.8,
+    16: 3.4, 18: 4.1, 20: 4.9, 24: 6.5, 30: 8.8,
 }
 _FLOWLINE_MATERIAL_MULT = {
     "Carbon steel":        1.00,
@@ -2427,29 +2433,27 @@ _FLOWLINE_WATERDEPTH_MULT = {      # installation difficulty by water depth
     "Deep (600-1500 m)":   1.70,
     "Ultra-deep (>1500 m)": 2.20,
 }
-# Xmas tree unit cost ($MM each)
+# Xmas tree unit cost ($MM each) — NCS 2025, includes tree, controls, install
 _XMAS_TREE_COST = {
-    "Dry (surface) tree":      1.8,
-    "Wet (subsea) tree":       9.0,
+    "Dry (surface) tree":      2.5,
+    "Wet (subsea) tree":      13.0,
 }
-# Riser unit cost ($MM each), by type
+# Riser unit cost ($MM each), by type — NCS 2025
 _RISER_COST = {
-    "Steel catenary riser (SCR)":  18.0,
-    "Flexible riser":              12.0,
-    "Top-tensioned riser (TTR)":   25.0,
-    "Hybrid riser tower segment":  35.0,
+    "Steel catenary riser (SCR)":  24.0,
+    "Flexible riser":              16.0,
+    "Top-tensioned riser (TTR)":   33.0,
+    "Hybrid riser tower segment":  46.0,
 }
 # Subsea template / manifold unit cost ($MM each). Template cost scales with
 # the number of well slots — more slots means a bigger, heavier structure.
-_TEMPLATE_COST = 45.0   # legacy single figure (kept for back-compat)
-# Slot-count-aware template costs ($MM each). A template is built for a
-# fixed number of well slots; choosing the slot count is a real design
-# decision (drilling sequence, future tie-in flexibility, structure size).
+_TEMPLATE_COST = 60.0   # legacy single figure (kept for back-compat)
+# Slot-count-aware template costs ($MM each) — NCS 2025 installed.
 _TEMPLATE_SLOT_COST = {
-    "Single-slot (1 well)":   18.0,
-    "Double-slot (2 wells)":  30.0,
-    "4-slot (4 wells)":       52.0,
-    "6-slot (6 wells)":       72.0,
+    "Single-slot (1 well)":   24.0,
+    "Double-slot (2 wells)":  40.0,
+    "4-slot (4 wells)":       70.0,
+    "6-slot (6 wells)":       96.0,
 }
 _TEMPLATE_SLOT_CAPACITY = {
     "Single-slot (1 well)":   1,
@@ -2461,42 +2465,43 @@ _TEMPLATE_SLOT_CAPACITY = {
 # system that protects downstream equipment rated below shut-in pressure;
 # effectively mandatory for HPHT subsea developments where the flowline /
 # host is not rated for full reservoir shut-in pressure.
-_HIPPS_COST = 35.0   # $MM per HIPPS skid (screening)
-# Umbilical cost ($MM per km)
-_UMBILICAL_MMUSD_PER_KM = 1.6
-# Subsea boosting (multiphase pump station) — $MM per station
-_BOOSTING_STATION_COST = 75.0
+_HIPPS_COST = 45.0   # $MM per HIPPS skid (NCS 2025 screening)
+# Umbilical cost ($MM per km) — NCS 2025
+_UMBILICAL_MMUSD_PER_KM = 2.1
+# Subsea boosting (multiphase pump station) — $MM per station, NCS 2025
+_BOOSTING_STATION_COST = 100.0
 # Gas lift system — $MM (compression + distribution), scales with well count
-_GAS_LIFT_BASE_COST = 25.0
-_GAS_LIFT_PER_WELL = 1.2
+_GAS_LIFT_BASE_COST = 33.0
+_GAS_LIFT_PER_WELL = 1.6
 # Heating (for waxy/viscous crude or hydrate management) — $MM
 _HEATING_SYSTEM_COST = {
     "None":                      0.0,
     "Electrically heated flowline (EHTF)": 0.0,   # priced per km below
     "Direct electric heating (DEH)":       0.0,   # priced per km below
-    "Hot-water / glycol circulation":      18.0,
+    "Hot-water / glycol circulation":      24.0,
 }
-_EHTF_MMUSD_PER_KM = 1.1   # added on top of base flowline for heated lines
-_DEH_MMUSD_PER_KM = 0.7
+_EHTF_MMUSD_PER_KM = 1.5   # added on top of base flowline for heated lines
+_DEH_MMUSD_PER_KM = 0.95
 
-# Platform / host fixed costs ($MM) — very rough screening anchors
+# Platform / host fixed costs ($MM) — NCS 2025 screening anchors.
+# FPSO / floater newbuild costs in particular escalated sharply 2021-2025.
 _PLATFORM_BASE = {
-    "Fixed steel jacket (shallow)":  220.0,
-    "Fixed steel jacket (mid)":      380.0,
-    "Concrete gravity structure":    650.0,
-    "Compliant tower":               480.0,
-    "Jack-up production unit":       180.0,
-    "FPSO (leased — capitalised)":   450.0,
-    "FPSO (owned)":                  1100.0,
-    "Semi-submersible FPU":          900.0,
-    "Spar":                          850.0,
-    "TLP (tension-leg platform)":    780.0,
+    "Fixed steel jacket (shallow)":  300.0,
+    "Fixed steel jacket (mid)":      520.0,
+    "Concrete gravity structure":    900.0,
+    "Compliant tower":               650.0,
+    "Jack-up production unit":       260.0,
+    "FPSO (leased — capitalised)":   750.0,
+    "FPSO (owned)":                 1700.0,
+    "Semi-submersible FPU":         1300.0,
+    "Spar":                         1200.0,
+    "TLP (tension-leg platform)":   1100.0,
 }
-_TOPSIDES_PER_KBOED = 6.5   # $MM per thousand boe/d of processing capacity
-_CPF_PER_KBOED = 3.2        # onshore central processing facility $MM per kboe/d
-_ONSHORE_WELLPAD_PER_WELL = 2.5
-_ONSHORE_PIPELINE_PER_KM = 0.7
-_HOST_TIEIN_MOD = 45.0      # host facility modification for a tie-in
+_TOPSIDES_PER_KBOED = 9.0   # $MM per thousand boe/d of processing capacity
+_CPF_PER_KBOED = 4.4        # onshore central processing facility $MM per kboe/d
+_ONSHORE_WELLPAD_PER_WELL = 3.3
+_ONSHORE_PIPELINE_PER_KM = 0.95
+_HOST_TIEIN_MOD = 65.0      # host facility modification for a tie-in
 
 # ---- New cost bases (added in v2) ----
 # Flowline thermal insulation — applied per km of insulated line. Driven by
@@ -2560,28 +2565,29 @@ def _flowline_cost_per_km(diameter_in: float, material: str,
 # domain, not project-specific values.
 _CONCEPT_COST_BENCHMARKS = [
     # (region, concept class, capex $/boe low, mid, high, note)
-    ("NCS",  "Subsea tie-in to host",        6,   12,   22,
+    # Bands reflect 2025-2026 NCS / UKCS screening levels.
+    ("NCS",  "Subsea tie-in to host",        8,   16,   28,
      "Short tie-backs to an existing host — the most capital-efficient "
      "NCS development class."),
-    ("NCS",  "Standalone subsea + FPSO",     14,  22,   38,
+    ("NCS",  "Standalone subsea + FPSO",     18,  28,   46,
      "Greenfield floating development — new FPSO plus subsea."),
-    ("NCS",  "Standalone fixed platform",    12,  20,   34,
+    ("NCS",  "Standalone fixed platform",    15,  25,   42,
      "New fixed steel jacket or concrete structure with topsides."),
-    ("UKCS", "Subsea tie-in to host",        8,   15,   28,
+    ("UKCS", "Subsea tie-in to host",        10,  19,   34,
      "UKCS tie-backs — slightly higher than NCS on average due to ageing "
      "host infrastructure and decommissioning interfaces."),
-    ("UKCS", "Standalone subsea + FPSO",     16,  26,   45,
+    ("UKCS", "Standalone subsea + FPSO",     20,  32,   54,
      "UKCS greenfield floating development."),
-    ("UKCS", "Standalone fixed platform",    14,  24,   40,
+    ("UKCS", "Standalone fixed platform",    18,  30,   50,
      "UKCS new fixed platform development."),
 ]
 # CAPEX per subsea well ($MM) — drilling + completion + subsea hardware
-# share per well, screening bands.
+# share per well, screening bands (2025-2026 levels).
 _SUBSEA_WELL_COST_BENCHMARKS = [
-    ("NCS",  "Subsea producer well",  55,  85,  130,
+    ("NCS",  "Subsea producer well",  75,  115,  175,
      "Includes the drilled & completed well plus its share of trees, "
      "manifold and controls."),
-    ("UKCS", "Subsea producer well",  60,  95,  145,
+    ("UKCS", "Subsea producer well",  80,  125,  190,
      "UKCS subsea well — typically a little higher than NCS."),
 ]
 

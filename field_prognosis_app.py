@@ -2330,9 +2330,136 @@ def _sample_factor(rng: np.random.Generator, dist: str,
     return 1.0
 
 
+def _factor_from_uniform(u: float, dist: str, low: float, high: float) -> float:
+    """Inverse-CDF transform: map a uniform(0,1) draw u to a multiplicative
+    factor under the named distribution. Used for CORRELATED sampling — a
+    correlated Gaussian copula produces correlated uniforms, which this maps
+    to the correct marginal for each driver.
+    """
+    from math import erf, sqrt, log, exp
+    u = min(max(u, 1e-6), 1.0 - 1e-6)
+    if dist == "uniform":
+        return low + u * (high - low)
+    if dist == "triangular":
+        mode = (low * high) ** 0.5
+        # inverse CDF of a triangular distribution
+        fc = (mode - low) / (high - low)
+        if u < fc:
+            return low + sqrt(u * (high - low) * (mode - low))
+        return high - sqrt((1 - u) * (high - low) * (high - mode))
+    # normal-based: get the standard-normal quantile via the inverse erf
+    # (rational approximation, Acklam's algorithm — accurate to ~1e-9)
+    def _norm_ppf(p):
+        a = [-3.969683028665376e+01, 2.209460984245205e+02,
+             -2.759285104469687e+02, 1.383577518672690e+02,
+             -3.066479806614716e+01, 2.506628277459239e+00]
+        b = [-5.447609879822406e+01, 1.615858368580409e+02,
+             -1.556989798598866e+02, 6.680131188771972e+01,
+             -1.328068155288572e+01]
+        c = [-7.784894002430293e-03, -3.223964580411365e-01,
+             -2.400758277161838e+00, -2.549732539343734e+00,
+             4.374664141464968e+00, 2.938163982698783e+00]
+        d = [7.784695709041462e-03, 3.224671290700398e-01,
+             2.445134137142996e+00, 3.754408661907416e+00]
+        plow, phigh = 0.02425, 1 - 0.02425
+        if p < plow:
+            q = sqrt(-2 * log(p))
+            return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                   ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+        if p > phigh:
+            q = sqrt(-2 * log(1 - p))
+            return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
+                    ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+        q = p - 0.5
+        r = q * q
+        return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
+               (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+    z = _norm_ppf(u)
+    if dist == "lognormal":
+        ln_low, ln_high = log(low), log(high)
+        mu = 0.5 * (ln_low + ln_high)
+        sigma = (ln_high - ln_low) / 4.0
+        return float(exp(mu + sigma * z))
+    # truncnormal / default normal
+    mu = 0.5 * (low + high)
+    sigma = (high - low) / 4.0
+    return float(min(max(mu + sigma * z, low), high))
+
+
+def _correlated_uniforms(rng: np.random.Generator, names: list,
+                          corr_pairs: dict) -> dict:
+    """Generate one set of correlated uniform(0,1) draws — a Gaussian copula.
+
+    Args:
+        names      : list of driver names to sample.
+        corr_pairs : {(name_a, name_b): rho} desired rank correlations.
+
+    Returns {name: u in (0,1)}. Uncorrelated drivers fall back to rho=0.
+    """
+    from math import erf, sqrt
+    n = len(names)
+    if n == 0:
+        return {}
+    idx = {nm: i for i, nm in enumerate(names)}
+    # Build the correlation matrix
+    C = np.eye(n)
+    for (a, b), rho in corr_pairs.items():
+        if a in idx and b in idx:
+            rho = float(max(-0.95, min(0.95, rho)))
+            C[idx[a], idx[b]] = rho
+            C[idx[b], idx[a]] = rho
+    # Nearest positive-definite repair: clip eigenvalues to be >= small +ve
+    try:
+        evals, evecs = np.linalg.eigh(C)
+        evals = np.clip(evals, 1e-6, None)
+        C = evecs @ np.diag(evals) @ evecs.T
+        # renormalize to unit diagonal
+        d = np.sqrt(np.diag(C))
+        C = C / np.outer(d, d)
+        L = np.linalg.cholesky(C)
+    except Exception:
+        L = np.eye(n)
+    z = L @ rng.standard_normal(n)
+    # standard-normal CDF -> uniform
+    u = {nm: 0.5 * (1 + erf(z[idx[nm]] / sqrt(2.0))) for nm in names}
+    return u
+
+
+def classify_reserves(npv_sorted_or_vols) -> dict:
+    """Classify a Monte-Carlo reserves distribution into 1P / 2P / 3P.
+
+    Petroleum-industry convention:
+      1P (Proved)             = P90  (90% probability of at least this much)
+      2P (Proved + Probable)  = P50
+      3P (Proved+Prob+Possible)= P10
+
+    Args:
+        npv_sorted_or_vols : 1-D array-like of per-realization volumes
+                             (or any reserves metric).
+
+    Returns dict with p90/p50/p10 (= 1P/2P/3P), mean, and the spread ratio.
+    """
+    import numpy as _np
+    arr = _np.asarray(list(npv_sorted_or_vols), dtype=float)
+    arr = arr[~_np.isnan(arr)]
+    if arr.size == 0:
+        return {"p90": None, "p50": None, "p10": None, "mean": None,
+                "n": 0}
+    # In reserves convention P90 is the LOW value (90% chance of exceeding).
+    p90 = float(_np.percentile(arr, 10))   # 1P — low estimate
+    p50 = float(_np.percentile(arr, 50))   # 2P — best estimate
+    p10 = float(_np.percentile(arr, 90))   # 3P — high estimate
+    return {
+        "p90_1P": p90, "p50_2P": p50, "p10_3P": p10,
+        "mean": float(_np.mean(arr)),
+        "n": int(arr.size),
+        "spread_3P_1P": (p10 / p90 if p90 > 0 else None),
+    }
+
+
 def run_monte_carlo(wells, asm, econ, n_realizations: int,
                      drivers_cfg: dict, seed: int = 42,
-                     progress_callback=None) -> dict:
+                     progress_callback=None, corr_pairs: dict = None) -> dict:
     """Run N realizations sampling from the configured driver distributions.
 
     Returns a dict with:
@@ -2344,19 +2471,33 @@ def run_monte_carlo(wells, asm, econ, n_realizations: int,
     from copy import deepcopy
     is_oil = FLUID_SYSTEMS[asm.fluid_system]["primary"] == "oil"
     rng = np.random.default_rng(seed)
+    corr_pairs = corr_pairs or {}
 
     monthly_records = []
     summary_records = []
 
+    # Names of the enabled drivers — used for correlated sampling.
+    enabled_names = [nm for nm, cfg in drivers_cfg.items() if cfg.get("on")]
+
     for r in range(n_realizations):
-        # Sample factors for each enabled driver
+        # Sample factors for each enabled driver. When correlations are
+        # specified, draw a correlated set of uniforms (a Gaussian copula)
+        # and map each through its marginal; otherwise sample independently.
         factors = {}
+        if corr_pairs and enabled_names:
+            u_corr = _correlated_uniforms(rng, enabled_names, corr_pairs)
+        else:
+            u_corr = {}
         for name, cfg in drivers_cfg.items():
             if cfg.get("on"):
-                factors[name] = _sample_factor(
-                    rng, cfg.get("dist", "triangular"),
-                    cfg.get("low", 0.8), cfg.get("high", 1.2)
-                )
+                if name in u_corr:
+                    factors[name] = _factor_from_uniform(
+                        u_corr[name], cfg.get("dist", "triangular"),
+                        cfg.get("low", 0.8), cfg.get("high", 1.2))
+                else:
+                    factors[name] = _sample_factor(
+                        rng, cfg.get("dist", "triangular"),
+                        cfg.get("low", 0.8), cfg.get("high", 1.2))
             else:
                 factors[name] = 1.0
 
@@ -4701,14 +4842,19 @@ def economics_section(units, start_date):
     oil_price_bbl = c1.number_input(
         "Oil price ($/bbl)", value=75.0,
         key="oil_price_bbl", on_change=mark_stale,
-        help="Crude oil price per barrel. Industry-standard regardless of unit system."
+        help="Flat real crude price per barrel. $75/bbl is a conservative "
+             "long-run screening value (Brent). Industry-standard "
+             "regardless of unit system."
     )
     gas_price_mmbtu = c2.number_input(
-        "Gas price ($/MMBtu)", value=3.5,
+        "Gas price ($/MMBtu)", value=2.5,
         key="gas_price_mmbtu", on_change=mark_stale,
-        help="Natural-gas price per MMBtu (Henry Hub / JKM / TTF benchmark unit). "
-             "Internally converted to $/Mscf using 1 Mcf ≈ 1 MMBtu "
-             "(screening approximation; real heating values vary 0.95–1.10)."
+        help="Flat real gas price per MMBtu. Default $2.5/MMBtu is a "
+             "conservative long-run screening value — NCS gas is sold "
+             "mainly into the European hubs (TTF / NBP), which are volatile; "
+             "use a long-run real price for screening rather than a recent "
+             "spot peak. Internally converted to $/Mscf using 1 Mcf ≈ 1 "
+             "MMBtu (real heating values vary 0.95–1.10)."
     )
     # Variable OPEX — unit basis depends on the fluid system. For an oil
     # field the natural basis is $/bbl of oil; for a gas field it is $/Mscf
@@ -4718,20 +4864,22 @@ def economics_section(units, start_date):
     _econ_is_oil = FLUID_SYSTEMS[_econ_fluid]["primary"] == "oil"
     if _econ_is_oil:
         opex_var_bbl = c3.number_input(
-            "Var. OPEX ($/bbl)", value=8.0,
+            "Var. OPEX ($/bbl)", value=5.5,
             key="opex_var_bbl", on_change=mark_stale,
             help="Variable operating cost per barrel of primary fluid "
-                 "(oil) produced. Industry-standard regardless of unit "
-                 "system.")
+                 "(oil) produced. Default $5.5/bbl reflects a mid-size NCS "
+                 "offshore development; small / late-life fields run "
+                 "higher ($10-20/bbl), very large fields lower. Industry-"
+                 "standard regardless of unit system.")
     else:
         opex_var_bbl = c3.number_input(
-            "Var. OPEX ($/Mscf)", value=1.3,
+            "Var. OPEX ($/Mscf)", value=0.9,
             key="opex_var_bbl", on_change=mark_stale,
             help="Variable operating cost per Mscf of primary fluid (gas) "
-                 "produced. For a gas field the engine charges variable "
-                 "OPEX against the gas rate (Mscf/d), so this must be a "
-                 "$/Mscf figure — typically $0.5-2.5/Mscf. "
-                 "(≈ $3-15/boe at 6 Mscf/boe.)")
+                 "produced. Default $0.9/Mscf reflects an NCS gas "
+                 "development (~$5/boe). For a gas field the engine charges "
+                 "variable OPEX against the gas rate (Mscf/d), so this must "
+                 "be a $/Mscf figure — typically $0.5-2.0/Mscf.")
     opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
                                  key="opex_fixed", on_change=mark_stale)
 
@@ -5839,26 +5987,24 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — add lines and annotations separately
+            # Milestone markers — convert everything to pd.Timestamp so
+            # Plotly's internal axis-mean call sees uniform types.
             for label, mdate in sched["milestones"]:
-                mts = pd.Timestamp(mdate).to_pydatetime()
+                mts = pd.Timestamp(mdate)
                 fig_g.add_vline(
-                    x=mts, line=dict(color="#333", dash="dot", width=1)
-                )
-                fig_g.add_annotation(
-                    x=mts, text=label,
-                    showarrow=False, xanchor="center", yanchor="bottom",
-                    textangle=-45, font=dict(size=9, color="#444")
+                    x=mts, line=dict(color="#333", dash="dot", width=1),
+                    annotation_text=label,
+                    annotation_position="top",
+                    annotation_textangle=-45,
+                    annotation_font=dict(size=9, color="#444"),
                 )
             # First-oil emphasis — green thick line
-            fo_ts = pd.Timestamp(sched["first_oil_date"]).to_pydatetime()
+            fo_ts = pd.Timestamp(sched["first_oil_date"])
             fig_g.add_vline(
-                x=fo_ts, line=dict(color="#2ca02c", width=3)
-            )
-            fig_g.add_annotation(
-                x=fo_ts, text=f"🛢️ First oil: {sched['first_oil_date']}",
-                showarrow=False, xanchor="center", yanchor="top",
-                font=dict(size=12, color="#2ca02c")
+                x=fo_ts, line=dict(color="#2ca02c", width=3),
+                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
+                annotation_position="bottom",
+                annotation_font=dict(size=12, color="#2ca02c"),
             )
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
@@ -6601,7 +6747,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "3.4"
+    _EXPECTED_FP_VERSION = "3.5"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -8044,7 +8190,7 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
     ]
     # NGL row only when the stream is active
     if getattr(econ, "ngl_yield_bbl_per_mmscf", 0.0) > 0:
-        asm_rows.append(
+        assumptions.append(
             ("NGL yield / price",
              f"{econ.ngl_yield_bbl_per_mmscf:.0f} bbl/MMscf @ "
              f"${econ.ngl_price_bbl:.0f}/bbl  (OPEX ${econ.ngl_opex_bbl:.1f}/bbl)")
@@ -9098,7 +9244,7 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         fig_c = go.Figure()
         fig_c.add_trace(go.Bar(
             y=names, x=vals, orientation="h",
-            marker_color=[C.get("spring", C.get("water", "#3498db")) if v > 0 else C.get("gas", "#e74c3c") for v in vals],
+            marker_color=[C["spring"] if v > 0 else C["gas"] for v in vals],
             hovertemplate="%{y}: %{x:+.2f}<extra></extra>",
         ))
         fig_c.add_vline(x=0, line=dict(color=C["pressure"], width=1))
