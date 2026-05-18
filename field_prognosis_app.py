@@ -5839,24 +5839,26 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — convert everything to pd.Timestamp so
-            # Plotly's internal axis-mean call sees uniform types.
+            # Milestone markers — add lines and annotations separately
             for label, mdate in sched["milestones"]:
-                mts = pd.Timestamp(mdate)
+                mts = pd.Timestamp(mdate).to_pydatetime()
                 fig_g.add_vline(
-                    x=mts, line=dict(color="#333", dash="dot", width=1),
-                    annotation_text=label,
-                    annotation_position="top",
-                    annotation_textangle=-45,
-                    annotation_font=dict(size=9, color="#444"),
+                    x=mts, line=dict(color="#333", dash="dot", width=1)
+                )
+                fig_g.add_annotation(
+                    x=mts, text=label,
+                    showarrow=False, xanchor="center", yanchor="bottom",
+                    textangle=-45, font=dict(size=9, color="#444")
                 )
             # First-oil emphasis — green thick line
-            fo_ts = pd.Timestamp(sched["first_oil_date"])
+            fo_ts = pd.Timestamp(sched["first_oil_date"]).to_pydatetime()
             fig_g.add_vline(
-                x=fo_ts, line=dict(color="#2ca02c", width=3),
-                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
-                annotation_position="bottom",
-                annotation_font=dict(size=12, color="#2ca02c"),
+                x=fo_ts, line=dict(color="#2ca02c", width=3)
+            )
+            fig_g.add_annotation(
+                x=fo_ts, text=f"🛢️ First oil: {sched['first_oil_date']}",
+                showarrow=False, xanchor="center", yanchor="top",
+                font=dict(size=12, color="#2ca02c")
             )
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
