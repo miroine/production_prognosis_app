@@ -8044,7 +8044,7 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
     ]
     # NGL row only when the stream is active
     if getattr(econ, "ngl_yield_bbl_per_mmscf", 0.0) > 0:
-        assumptions.append(
+        asm_rows.append(
             ("NGL yield / price",
              f"{econ.ngl_yield_bbl_per_mmscf:.0f} bbl/MMscf @ "
              f"${econ.ngl_price_bbl:.0f}/bbl  (OPEX ${econ.ngl_opex_bbl:.1f}/bbl)")
@@ -9098,7 +9098,7 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         fig_c = go.Figure()
         fig_c.add_trace(go.Bar(
             y=names, x=vals, orientation="h",
-            marker_color=[C["spring"] if v > 0 else C["gas"] for v in vals],
+            marker_color=[C.get("spring", C.get("water", "#3498db")) if v > 0 else C.get("gas", "#e74c3c") for v in vals],
             hovertemplate="%{y}: %{x:+.2f}<extra></extra>",
         ))
         fig_c.add_vline(x=0, line=dict(color=C["pressure"], width=1))
