@@ -1,4 +1,4 @@
-# Field Production Prognosis Tool
+# FieldVista — Integrated Field Development & Economics
 
 A Streamlit application for early-phase oil & gas field production forecasting.
 Multi-rig drilling, PVT-aware material balance, optional multi-reservoir mode

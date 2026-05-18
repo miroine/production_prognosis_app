@@ -1,6 +1,6 @@
 """
-Field Production Prognosis Tool — v3
-=====================================
+FieldVista — Integrated Field Development & Economics
+======================================================
 Streamlit app for forecasting oil & gas field production with:
 - Unit system selector (Field / Metric)
 - Drainage strategies: depletion, injection (water/gas), with VRR control
@@ -47,7 +47,7 @@ import fp_helpers as fh
 # Page config
 # =============================================================================
 st.set_page_config(
-    page_title="Field Production Prognosis",
+    page_title="FieldVista — Integrated Field Development & Economics",
     page_icon="🛢️",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1318,6 +1318,58 @@ def run_simulation(wells, asm: FieldAssumptions):
     cum_s = np.cumsum(field_s * days) / 1e6
     field_l = field_oil_rate + field_w  # liquid is always oil + water
 
+    # ---- Volumetric consistency cap (decline curve vs material balance) ----
+    # Decline curves are generated independently of the in-place volumes. A
+    # user can specify well rates / declines that, integrated, would produce
+    # MORE than the oil/gas originally in place — giving a recovery factor
+    # above 100%, which is physically impossible. Here we cap cumulative
+    # primary production at the primary-fluid in-place volume: once the
+    # field has produced 100% of OOIP/OGIP, the rate is forced to zero. A
+    # warning is recorded on the DataFrame so the UI can flag it.
+    profile_warnings = []
+    primary_in_place = asm.ooip_oil if is_oil else asm.ogip_gas  # MMstb / Bscf
+    if primary_in_place and primary_in_place > 0:
+        cum_primary_running = np.cumsum(field_p * days) / 1e6
+        over = cum_primary_running > primary_in_place
+        if over.any():
+            cap_idx = int(np.argmax(over))
+            cum_before = (cum_primary_running[cap_idx - 1]
+                          if cap_idx > 0 else 0.0)
+            remaining = max(0.0, primary_in_place - cum_before)
+            month_vol = field_p[cap_idx] * days / 1e6
+            scale = (remaining / month_vol) if month_vol > 0 else 0.0
+            scale = min(1.0, max(0.0, scale))
+            for arr in (field_oil_rate, field_gas_rate, field_p, field_s,
+                        field_w, field_l):
+                arr[cap_idx] *= scale
+                arr[cap_idx + 1:] = 0.0
+            field_inj[cap_idx + 1:] = 0.0
+            oil_mat[cap_idx + 1:, :] = 0.0
+            gas_mat[cap_idx + 1:, :] = 0.0
+            # recompute cumulatives after the cap
+            cum_p = np.cumsum(field_p * days) / 1e6
+            cum_s = np.cumsum(field_s * days) / 1e6
+            # recompute the recovery factor from the capped cumulative so it
+            # cannot exceed 100%
+            if is_oil:
+                _oip = sum(r.ooip_oil for r in reservoirs
+                           if FLUID_SYSTEMS[r.fluid_system]["primary"] == "oil")
+            else:
+                _oip = sum(r.ogip_gas for r in reservoirs
+                           if FLUID_SYSTEMS[r.fluid_system]["primary"] == "gas")
+            if _oip > 0:
+                rf = np.minimum(cum_p / _oip, 1.0)
+            profile_warnings.append(
+                f"Decline-curve production reached 100% of "
+                f"{'OOIP' if is_oil else 'OGIP'} "
+                f"({primary_in_place:,.1f} "
+                f"{'MMstb' if is_oil else 'Bscf'}) at month {cap_idx + 1}. "
+                f"Production was capped there so the recovery factor cannot "
+                f"exceed 100%. This usually means the well rates / decline "
+                f"parameters are too optimistic for the stated in-place "
+                f"volume, or the in-place volume is too low — check that "
+                f"the decline curves and the volumetrics are consistent.")
+
     # ---- Gas disposition (uses true field gas stream) ----
     gross_gas = field_gas_rate.copy()
 
@@ -1389,6 +1441,63 @@ def run_simulation(wells, asm: FieldAssumptions):
         "active_producers": active_p, "active_injectors": active_i,
         "choke_factor": choke,
     })
+
+    # ---- Profile robustness checks ----
+    # A set of sanity checks on the generated profile. Anything that looks
+    # physically wrong is recorded as a warning for the UI to surface.
+    try:
+        final_rf = float(rf[-1]) if len(rf) else 0.0
+        if final_rf > 1.0:
+            profile_warnings.append(
+                f"Recovery factor reached {final_rf:.0%} — above 100%, which "
+                f"is physically impossible. Check in-place volumes and decline "
+                f"parameters.")
+        elif final_rf > 0.75:
+            profile_warnings.append(
+                f"Recovery factor is {final_rf:.0%} — very high. Typical "
+                f"recovery: primary depletion 5-20%, waterflood 20-45%, "
+                f"strong aquifer / EOR 35-60%. A figure above ~75% is "
+                f"optimistic — confirm it is intended.")
+        # Plateau realism: peak rate vs in-place (very rough — flags a peak
+        # that would drain the field implausibly fast).
+        if primary_in_place and primary_in_place > 0 and len(field_p):
+            peak = float(np.max(field_p))
+            # months of plateau-equivalent supply
+            annual_peak_vol = peak * 365.25 / 1e6   # MMstb/yr or Bscf/yr
+            if annual_peak_vol > 0:
+                yrs_to_drain = primary_in_place / annual_peak_vol
+                if yrs_to_drain < 1.5:
+                    profile_warnings.append(
+                        f"Peak rate would drain the entire "
+                        f"{'OOIP' if is_oil else 'OGIP'} in "
+                        f"{yrs_to_drain:.1f} years at plateau — an "
+                        f"implausibly aggressive offtake. Real fields "
+                        f"plateau at roughly 5-12% of in-place per year.")
+        # Pressure sanity: MBE pressure should not go negative or rise far
+        # above initial without injection / aquifer support.
+        if len(pressure):
+            if float(np.min(pressure)) < 0:
+                profile_warnings.append(
+                    "Material-balance pressure went negative — the offtake "
+                    "is too high for the in-place volume and drive energy. "
+                    "Reduce rates, add injection, or increase in-place "
+                    "volume.")
+            if (float(np.max(pressure)) > 1.05 * asm.pvt.p_init_psi
+                    and asm.strategy != "Injection"
+                    and not asm.aquifer.active):
+                profile_warnings.append(
+                    "Reservoir pressure rises above initial pressure without "
+                    "injection or aquifer support — check the material-"
+                    "balance inputs.")
+        # First-year production with no producing wells
+        if len(field_p) >= 12 and float(np.sum(field_p[:12])) <= 0:
+            profile_warnings.append(
+                "No production in the first 12 months — check well spud "
+                "dates and the drilling schedule.")
+    except Exception:
+        pass
+
+    df.attrs["profile_warnings"] = profile_warnings
 
     # Per-reservoir DataFrame: long format for easy plotting / aggregation
     res_rows = []
@@ -1479,11 +1588,12 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     royalty = revenue * econ.royalty_rate
     net_revenue = revenue - royalty - tariff
 
-    if is_oil:
-        var_cost = df["primary_rate"] * days * econ.opex_var
-    else:
-        # primary_rate in Mscf/d, opex_var in $/Mscf
-        var_cost = df["primary_rate"] * days * econ.opex_var
+    # Variable OPEX: primary_rate × days × opex_var. The unit basis of
+    # opex_var matches the primary fluid — $/bbl for an oil field (oil rate
+    # in stb/d) or $/Mscf for a gas field (gas rate in Mscf/d). The UI sets
+    # the correct basis per fluid system, so the same expression is valid
+    # for both.
+    var_cost = df["primary_rate"] * days * econ.opex_var
     fixed_cost = econ.opex_fixed / 12.0
     opex = var_cost + fixed_cost + ngl_opex
 
@@ -1960,8 +2070,11 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 # Pre-FOP cashflow = -capex_facility (no revenue, no opex)
                 if "capex_facility" in pre.columns:
                     pre["cashflow"] = -pre["capex_facility"]
-                # Recompute discounted CF / NPV across the full (pre + main) span
+                # Recompute pre-FOP cashflow and prepend. pd.concat does not
+                # preserve .attrs, so capture them and restore afterwards.
+                _saved_attrs = dict(df_e.attrs)
                 df_e = pd.concat([pre, df_e], ignore_index=True)
+                df_e.attrs.update(_saved_attrs)
                 # Re-discount from the new t=0 (earliest investment)
                 disc_full = (1 + r_m) ** np.arange(len(df_e))
                 df_e["discounted_cf"] = df_e["cashflow"].values / disc_full
@@ -1970,6 +2083,13 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 # Restore year column for the annual groupby in plot_economics
                 df_e["year"] = pd.to_datetime(df_e["date"]).dt.year
                 df_e.attrs["pre_fop_months"] = len(pre_dates)
+                # The pre-FOP prepend shifts every row forward by len(pre_dates).
+                # Any index-based attr set BEFORE the prepend (the economic
+                # cutoff) must be shifted too, or the cessation marker and the
+                # cutoff date fall out of sync with the abandonment cost row.
+                if "economic_cutoff_idx" in df_e.attrs:
+                    df_e.attrs["economic_cutoff_idx"] = (
+                        int(df_e.attrs["economic_cutoff_idx"]) + len(pre_dates))
     except Exception:
         # If anything goes wrong, fall back to the un-padded df_e
         pass
@@ -2555,17 +2675,8 @@ def sidebar_inputs():
              "Injection = water/gas injection adds voidage replacement & pressure support.",
     )
 
-    # Check if there's a pending update to start_date from schedule push
-    initial_start_date = date(2026, 1, 1)
-    if "_pending_start_date" in st.session_state:
-        try:
-            initial_start_date = pd.Timestamp(st.session_state["_pending_start_date"]).date()
-            del st.session_state["_pending_start_date"]
-        except:
-            pass
-    
     start_date = st.sidebar.date_input(
-        "Project start date", value=initial_start_date,
+        "Project start date", value=date(2026, 1, 1),
         key="start_date", on_change=mark_stale,
         help="Anchor for all schedules (drilling, capacities, facility CAPEX).",
     )
@@ -2585,14 +2696,50 @@ def sidebar_inputs():
             key="ogip", on_change=mark_stale,
             help="Associated/solution gas originally in place.")
     else:
-        ooip = st.sidebar.number_input(
-            f"Condensate in place ({ulabel('oil_vol', units)})", min_value=0.0,
-            value=from_field(20.0, "oil_vol", units), step=1.0,
-            key="ooip", on_change=mark_stale)
         ogip = st.sidebar.number_input(
             f"OGIP ({ulabel('gas_vol', units)})", min_value=0.0,
             value=from_field(1500.0, "gas_vol", units), step=50.0,
-            key="ogip", on_change=mark_stale)
+            key="ogip", on_change=mark_stale,
+            help="Gas originally in place — the primary in-place volume "
+                 "for a gas / gas-condensate field.")
+        # Condensate in place. For a gas-condensate field this is not an
+        # independent number: it follows from the gas in place and the CGR.
+        # If a CGR has been entered in the PVT tab, offer to derive it and
+        # flag any inconsistency between the entered value and OGIP × CGR.
+        _cgr = float(st.session_state.get("rs_init", 0.0) or 0.0)  # stb/MMscf
+        ooip = st.sidebar.number_input(
+            f"Condensate in place ({ulabel('oil_vol', units)})",
+            min_value=0.0,
+            value=from_field(20.0, "oil_vol", units), step=1.0,
+            key="ooip", on_change=mark_stale,
+            help="Stock-tank condensate originally in place. For a gas-"
+                 "condensate field this should be roughly OGIP × CGR "
+                 "(initial), since the condensate is dissolved in the gas. "
+                 "The app shows the implied value below so you can check "
+                 "consistency.")
+        if _cgr > 0:
+            # OGIP is in display units; convert to Bscf for the arithmetic.
+            ogip_bscf = to_field(ogip, "gas_vol", units)
+            # condensate (MMstb) = OGIP(Bscf) * 1000 (MMscf/Bscf) * CGR
+            #                       (stb/MMscf) / 1e6  (stb -> MMstb)
+            implied_cond_mmstb = ogip_bscf * 1000.0 * _cgr / 1e6
+            implied_cond_disp = from_field(implied_cond_mmstb,
+                                            "oil_vol", units)
+            entered_cond_mmstb = to_field(ooip, "oil_vol", units)
+            st.sidebar.caption(
+                f"Implied condensate in place from OGIP × CGR "
+                f"({_cgr:.0f} stb/MMscf): "
+                f"**{implied_cond_disp:,.1f} {ulabel('oil_vol', units)}**.")
+            if entered_cond_mmstb > 0:
+                ratio = implied_cond_mmstb / entered_cond_mmstb
+                if ratio > 1.25 or ratio < 0.8:
+                    st.sidebar.warning(
+                        f"⚠️ Condensate-in-place ({ooip:,.1f}) and the value "
+                        f"implied by OGIP × CGR ({implied_cond_disp:,.1f}) "
+                        f"differ by {abs(ratio - 1) * 100:.0f}%. For a gas-"
+                        f"condensate field these should be close — check "
+                        f"the OGIP, the CGR, or the condensate-in-place "
+                        f"entry.")
 
     rf_target = st.sidebar.slider(
         "Target recovery factor", 0.05, 0.80, 0.35, 0.01,
@@ -2625,16 +2772,56 @@ def sidebar_inputs():
                               help="35 = light oil. <22 = heavy.")
         gas_grav = st.number_input("Gas specific gravity (air = 1)", value=0.7,
                                    key="gas_grav", on_change=mark_stale)
+        # Solution ratio: oil systems use Rs (solution gas-oil ratio,
+        # scf gas per stb oil); gas-condensate systems are characterised by
+        # CGR (condensate-gas ratio, stb condensate per MMscf gas). The
+        # engine stores the number in `rs_init`; the label clarifies which
+        # physical quantity it represents for the chosen fluid.
+        if FLUID_SYSTEMS[fluid]["primary"] == "gas":
+            rs_label = "Initial CGR (stb/MMscf)"
+            rs_help = ("Condensate-gas ratio — stock-tank barrels of "
+                       "condensate per million scf of gas. Typical lean "
+                       "gas-condensate 5-50 stb/MMscf; rich 50-250. "
+                       "Set 0 for dry gas. This drives the secondary "
+                       "(condensate) production stream.")
+            rs_default = 30.0
+            rs_kind = None    # CGR is not a GOR — no unit conversion
+        else:
+            rs_label = f"Initial Rs ({ulabel('gor', units)})"
+            rs_help = "Initial solution gas-oil ratio (scf gas / stb oil)."
+            rs_default = from_field(700.0, "gor", units)
+            rs_kind = "gor"
         rs_init_disp = st.number_input(
-            f"Initial Rs ({ulabel('gor', units)})",
-            value=from_field(700.0, "gor", units),
-            key="rs_init", on_change=mark_stale,
-            help="Initial solution gas-oil ratio.")
+            rs_label, value=rs_default,
+            key="rs_init", on_change=mark_stale, help=rs_help)
+        # Saturation pressure: for an oil system this is the BUBBLE point
+        # (pressure at which the first gas bubble evolves from the oil);
+        # for a gas / gas-condensate system it is the DEW point (pressure
+        # at which the first liquid condenses from the gas). They are
+        # physically distinct phase-boundary points — labelling matters.
+        _pvt_is_gas = FLUID_SYSTEMS[fluid]["primary"] == "gas"
+        if _pvt_is_gas:
+            p_sat_label = f"Dew point ({ulabel('pressure', units)})"
+            p_sat_help = (
+                "Dew-point pressure of the gas. Below this pressure liquid "
+                "(condensate) drops out of the gas phase in the reservoir. "
+                "For a dry gas with no condensate, set this at or below the "
+                "abandonment pressure so no retrograde behaviour is modelled. "
+                "For gas-condensate, retrograde liquid drop-out below the "
+                "dew point reduces the produced gas and is the reason a CGR "
+                "is specified.")
+            p_sat_default = 3200.0
+        else:
+            p_sat_label = f"Bubble point ({ulabel('pressure', units)})"
+            p_sat_help = (
+                "Bubble-point pressure of the oil. Below this pressure gas "
+                "evolves from solution and Bo declines.")
+            p_sat_default = 2800.0
         p_bub_disp = st.number_input(
-            f"Bubble point ({ulabel('pressure', units)})",
-            value=from_field(2800.0, "pressure", units),
+            p_sat_label,
+            value=from_field(p_sat_default, "pressure", units),
             key="p_bub", on_change=mark_stale,
-            help="Below this pressure, gas evolves and Bo declines.")
+            help=p_sat_help)
         ct_rock = st.number_input("Rock compressibility (1/psi)", value=4e-6,
                                   format="%.1e", key="ct_rock", on_change=mark_stale)
         sw_init = st.number_input("Initial water saturation", value=0.20,
@@ -2645,7 +2832,8 @@ def sidebar_inputs():
         p_init_psi=to_field(p_init_disp, "pressure", units),
         t_res_F=to_field(t_res_disp, "temp", units),
         api=api, gas_grav=gas_grav,
-        rs_init=to_field(rs_init_disp, "gor", units),
+        rs_init=(to_field(rs_init_disp, "gor", units)
+                 if rs_kind == "gor" else float(rs_init_disp)),
         p_bub_psi=to_field(p_bub_disp, "pressure", units),
     )
 
@@ -2734,21 +2922,51 @@ def sidebar_inputs():
         eff = st.session_state.get("inj_eff", 0.85)
 
     with st.sidebar.expander("🧪 Productivity index (single-reservoir)", expanded=False):
-        st.caption(
-            "Used only when wells have **PI mode** enabled in the producers table. "
-            "Multi-reservoir mode picks PI from each reservoir's row instead."
-        )
         is_oil_for_pi = FLUID_SYSTEMS[fluid]["primary"] == "oil"
-        pi_units_label = "bbl/d/psi" if is_oil_for_pi else "Mscf/d/psi"
-        well_pi_default = st.number_input(
+        # PI relates rate to drawdown:  q = PI × (P_res − P_wf).
+        # Field units: oil bbl/d/psi, gas Mscf/d/psi.
+        # Metric units: oil Sm³/d/bar, gas kSm³/d/bar.
+        if units == "metric":
+            pi_units_label = "Sm³/d/bar" if is_oil_for_pi else "kSm³/d/bar"
+        else:
+            pi_units_label = "bbl/d/psi" if is_oil_for_pi else "Mscf/d/psi"
+        st.caption(
+            "Used only when wells have **PI mode** enabled in the producers "
+            "table. Multi-reservoir mode picks PI from each reservoir's row "
+            "instead."
+        )
+        st.caption(
+            f"**How PI works:** the productivity index links flow rate to "
+            f"drawdown by  q = PI × (P_res − P_wf), where P_wf is the "
+            f"flowing bottom-hole pressure. So PI in **{pi_units_label}** is "
+            f"the rate produced per unit of pressure drawdown. Example: a PI "
+            f"of 2 {pi_units_label} with 1000 "
+            f"{'psi' if units=='field' else 'bar'} of drawdown delivers "
+            f"2000 {'bbl/d' if is_oil_for_pi else ('Mscf/d' if units=='field' else 'kSm³/d')}. "
+            f"It is normally obtained from a well test (build-up / drawdown) "
+            f"or estimated from k·h, fluid viscosity and skin."
+        )
+        # The engine works internally in field units; convert the metric
+        # input back. PI has compound units so it scales by the rate factor
+        # divided by the pressure factor.
+        _pi_rate_kind = "oil_rate" if is_oil_for_pi else "gas_rate"
+        well_pi_disp = st.number_input(
             f"Well PI ({pi_units_label}/well)",
             value=2.0 if is_oil_for_pi else 1.0,
-            min_value=0.0, step=0.1, format="%.2f",
+            min_value=0.0, step=0.1, format="%.3f",
             key="well_pi_default", on_change=mark_stale,
-            help="Productivity index per well. Typical screening values: "
-                 "light onshore oil 1-3, deepwater 10-20, dry gas conv. 0.5-2, "
-                 "tight gas 0.05-0.20. Heavy oil 0.3-1.5 (viscosity-limited).",
+            help="Productivity index per well. Typical screening values "
+                 "(field units): light onshore oil 1-3 bbl/d/psi, deepwater "
+                 "10-20, dry gas conventional 0.5-2 Mscf/d/psi, tight gas "
+                 "0.05-0.20, heavy oil 0.3-1.5 (viscosity-limited).",
         )
+        # Convert metric PI -> field PI for the engine.
+        if units == "metric":
+            # PI_field = PI_metric × (rate m->f factor) / (pressure m->f factor)
+            well_pi_default = (well_pi_disp
+                               * M2F[_pi_rate_kind] / M2F["pressure"])
+        else:
+            well_pi_default = well_pi_disp
         min_bhp_default = st.number_input(
             f"Min flowing BHP ({ulabel('pressure', units)})",
             value=from_field(1500.0, "pressure", units),
@@ -4492,12 +4710,28 @@ def economics_section(units, start_date):
              "Internally converted to $/Mscf using 1 Mcf ≈ 1 MMBtu "
              "(screening approximation; real heating values vary 0.95–1.10)."
     )
-    opex_var_bbl = c3.number_input(
-        "Var. OPEX ($/bbl)", value=8.0,
-        key="opex_var_bbl", on_change=mark_stale,
-        help="Per barrel of primary fluid produced. Industry-standard "
-             "regardless of unit system."
-    )
+    # Variable OPEX — unit basis depends on the fluid system. For an oil
+    # field the natural basis is $/bbl of oil; for a gas field it is $/Mscf
+    # of gas. Charging a $/bbl number against a Mscf/d rate (the old bug)
+    # under-charges gas OPEX by roughly the boe factor.
+    _econ_fluid = st.session_state.get("fluid", "Oil with associated gas")
+    _econ_is_oil = FLUID_SYSTEMS[_econ_fluid]["primary"] == "oil"
+    if _econ_is_oil:
+        opex_var_bbl = c3.number_input(
+            "Var. OPEX ($/bbl)", value=8.0,
+            key="opex_var_bbl", on_change=mark_stale,
+            help="Variable operating cost per barrel of primary fluid "
+                 "(oil) produced. Industry-standard regardless of unit "
+                 "system.")
+    else:
+        opex_var_bbl = c3.number_input(
+            "Var. OPEX ($/Mscf)", value=1.3,
+            key="opex_var_bbl", on_change=mark_stale,
+            help="Variable operating cost per Mscf of primary fluid (gas) "
+                 "produced. For a gas field the engine charges variable "
+                 "OPEX against the gas rate (Mscf/d), so this must be a "
+                 "$/Mscf figure — typically $0.5-2.5/Mscf. "
+                 "(≈ $3-15/boe at 6 Mscf/boe.)")
     opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
                                  key="opex_fixed", on_change=mark_stale)
 
@@ -4850,12 +5084,13 @@ def economics_section(units, start_date):
             "Subsea templates / manifolds", min_value=0, value=1, step=1,
             key="dc_n_templates",
             help="Subsea structures that host and tie together multiple "
-                 "wells. ~$45MM each (screening).")
+                 "wells. Cost depends on the slot count chosen below.")
         n_subsea_wells = ws2.number_input(
             "Wells on wet (subsea) trees", min_value=0, value=4, step=1,
             key="dc_n_subsea_wells",
             help="Wells completed with subsea xmas trees on the seabed "
-                 "(~$9MM/tree). Standard for tie-ins and floating hosts.")
+                 "(~$9MM/tree). Standard for tie-ins and floating hosts. "
+                 "Must fit within the template slot capacity.")
         n_dry_wells = ws3.number_input(
             "Wells on dry (surface) trees", min_value=0, value=0, step=1,
             key="dc_n_dry_wells",
@@ -4868,6 +5103,52 @@ def economics_section(units, start_date):
             help="Pipes carrying fluids from the seabed up to a floating or "
                  "fixed host. Subsea production needs risers; dry-tree wells "
                  "do not.")
+        # Template type — sets slot capacity and per-template cost.
+        tt1, tt2 = st.columns(2)
+        template_type = tt1.selectbox(
+            "Template type (slot count)",
+            ["Single-slot (1 well)", "Double-slot (2 wells)",
+             "4-slot (4 wells)", "6-slot (6 wells)"],
+            index=2, key="dc_template_type",
+            help="A subsea template is built for a fixed number of well "
+                 "slots. More slots → bigger, heavier, costlier structure, "
+                 "but more drilling flexibility and room for future infill. "
+                 "Screening cost: single $18MM, double $30MM, 4-slot $52MM, "
+                 "6-slot $72MM. The number of subsea wells must fit within "
+                 "n_templates × slots — a warning is shown if not.")
+        _slot_cap = {"Single-slot (1 well)": 1, "Double-slot (2 wells)": 2,
+                     "4-slot (4 wells)": 4, "6-slot (6 wells)": 6}[template_type]
+        _total_slots = n_templates * _slot_cap
+        if n_subsea_wells > _total_slots:
+            tt2.error(f"⚠️ {n_subsea_wells} wells > {_total_slots} slots "
+                      f"({n_templates} × {_slot_cap}). Add templates or pick "
+                      f"a larger type.")
+        elif n_subsea_wells > 0 and n_subsea_wells <= _total_slots - _slot_cap:
+            tt2.warning(f"{_total_slots} slots for {n_subsea_wells} wells — "
+                        f"{_total_slots - n_subsea_wells} spare.")
+        elif n_subsea_wells > 0:
+            tt2.success(f"✓ {n_subsea_wells} wells fit in {_total_slots} "
+                        f"slots ({n_templates} × {_slot_cap}).")
+        # Multi-template layout — only meaningful with 2+ templates.
+        if n_templates > 1:
+            template_layout = st.radio(
+                "Template layout",
+                ["clustered", "spread"], horizontal=True,
+                key="dc_template_layout",
+                format_func=lambda x: ("Clustered (drill centres together)"
+                                       if x == "clustered"
+                                       else "Spread (separated along tie-back)"),
+                help="How the templates are positioned relative to each "
+                     "other. **Clustered**: templates sit side-by-side at "
+                     "one drill centre — simplest, shortest in-field "
+                     "lines, one manifold hub. **Spread**: templates are "
+                     "separated (e.g. over different fault blocks or "
+                     "crestal areas) and linked by an in-field line — more "
+                     "reservoir coverage but more flowline and a longer "
+                     "installation campaign. The schematic updates to show "
+                     "the chosen layout.")
+        else:
+            template_layout = "clustered"
         rs1, rs2 = st.columns(2)
         riser_type = rs1.selectbox(
             "Riser type",
@@ -5074,6 +5355,24 @@ def economics_section(units, start_date):
                        f"Auto-classification from PVT would be "
                        f"'{_auto_hpht['tier']}'.")
 
+        # HIPPS — pressure-protection system. Auto-enabled for HPHT tiers,
+        # optional otherwise.
+        _hpht_is_hpht = hpht_tier != "Standard"
+        hipps_on = st.checkbox(
+            "Include HIPPS (High Integrity Pressure Protection System)",
+            value=_hpht_is_hpht, key="dc_hipps",
+            help="A safety-instrumented system that protects downstream "
+                 "equipment (flowline, host) rated below full reservoir "
+                 "shut-in pressure. Effectively mandatory for HPHT subsea "
+                 "developments. ~$35MM per skid (one per template by "
+                 "default). Auto-enabled when an HPHT tier is selected.")
+        n_hipps_ui = 0
+        if hipps_on:
+            n_hipps_ui = st.number_input(
+                "Number of HIPPS skids", min_value=1,
+                value=max(1, int(n_templates)), step=1, key="dc_n_hipps",
+                help="Typically one HIPPS skid per template / drill centre.")
+
         dc_spec = {
             "concept_type": concept_type,
             "host_type": host_type,
@@ -5082,6 +5381,10 @@ def economics_section(units, start_date):
             "hpht_tier": hpht_tier,
             "reservoir_pressure_psi": _p_psi,
             "reservoir_temp_F": _t_F,
+            "hipps": hipps_on,
+            "n_hipps": n_hipps_ui,
+            "template_type": template_type,
+            "template_layout": template_layout,
             "n_templates": n_templates,
             "n_subsea_wells": n_subsea_wells,
             "n_dry_wells": n_dry_wells,
@@ -5292,6 +5595,109 @@ def economics_section(units, start_date):
                 st.caption("Items under 2.5% of total are grouped as 'Other' "
                            "to keep the chart readable.")
 
+            # ---- NCS / UKCS cost benchmarking ----
+            st.markdown("**Cost benchmarking — NCS / UKCS reference data**")
+            # Reserves basis: prefer the engine's in-place × RF if available,
+            # else let the user enter a reserves figure for the $/boe metric.
+            _ooip = float(st.session_state.get("ooip", 0.0) or 0.0)
+            _ogip = float(st.session_state.get("ogip", 0.0) or 0.0)
+            _rf = float(st.session_state.get("rf_target", 0.35) or 0.35)
+            # crude boe reserves estimate: oil MMstb + gas Bscf/6 *1000/1000
+            _reserves_guess = (_ooip + _ogip / 6.0) * _rf
+            bench_reserves = st.number_input(
+                "Recoverable reserves for benchmarking (MMboe)",
+                min_value=0.0,
+                value=float(round(max(_reserves_guess, 1.0), 1)),
+                step=5.0, key="dc_bench_reserves",
+                help="Used as the denominator for the CAPEX-per-boe "
+                     "benchmark. Pre-filled from (OOIP + OGIP/6) × target RF; "
+                     "override with your own reserves estimate if needed.")
+            bench = fh.benchmark_concept_cost(
+                grand_total_MMUSD=concept["totals"]["grand_total"],
+                reserves_mmboe=bench_reserves,
+                concept_type=concept_type,
+                host_type=host_type or "",
+                n_subsea_wells=n_subsea_wells)
+            st.caption(
+                f"Matched benchmark class: **{bench['concept_class']}**. "
+                f"Your concept: "
+                f"**${bench['capex_per_boe']:.1f}/boe**"
+                if bench['capex_per_boe'] is not None
+                else "Enter a reserves figure above to compute $/boe.")
+
+            if bench["rows"] and bench["capex_per_boe"] is not None:
+                # Bar chart: benchmark low/mid/high bands + the user's value,
+                # per region.
+                fig_bm = go.Figure()
+                regions = [r["region"] for r in bench["rows"]]
+                lows = [r["low"] for r in bench["rows"]]
+                mids = [r["mid"] for r in bench["rows"]]
+                highs = [r["high"] for r in bench["rows"]]
+                # low-to-high range bar
+                fig_bm.add_trace(go.Bar(
+                    x=regions, y=[h - l for h, l in zip(highs, lows)],
+                    base=lows, name="Typical range",
+                    marker_color="#bcd4e6",
+                    hovertemplate="%{x}: $%{base:.0f}-$%{customdata:.0f}/boe"
+                                   "<extra></extra>",
+                    customdata=highs))
+                # mid markers
+                fig_bm.add_trace(go.Scatter(
+                    x=regions, y=mids, mode="markers", name="Benchmark mid",
+                    marker=dict(symbol="line-ew", size=26, color="#2a6f97",
+                                line=dict(width=3, color="#2a6f97")),
+                    hovertemplate="%{x} mid: $%{y:.0f}/boe<extra></extra>"))
+                # the user's concept
+                fig_bm.add_trace(go.Scatter(
+                    x=regions, y=[bench["capex_per_boe"]] * len(regions),
+                    mode="markers+text", name="This concept",
+                    marker=dict(symbol="diamond", size=15, color="#d62828"),
+                    text=[f"${bench['capex_per_boe']:.0f}"] * len(regions),
+                    textposition="top center",
+                    hovertemplate="This concept: $%{y:.1f}/boe<extra></extra>"))
+                fig_bm.update_layout(
+                    title=f"Development CAPEX intensity vs NCS / UKCS — "
+                          f"{bench['concept_class']}",
+                    yaxis_title="CAPEX per boe ($/boe)",
+                    height=380, barmode="overlay",
+                    margin=dict(t=60, b=30, l=10, r=10),
+                    legend=dict(orientation="h", y=-0.15))
+                st.plotly_chart(fh.apply_plot_template(fig_bm),
+                                use_container_width=True)
+                # Verdict line
+                vparts = []
+                for r in bench["rows"]:
+                    vparts.append(f"{r['region']}: {r['verdict']}")
+                st.caption("Verdict — " + "  •  ".join(vparts))
+
+            # Per-subsea-well benchmark
+            if bench["well_rows"] and bench["well_share_MM"] is not None:
+                with st.expander("CAPEX per subsea well vs NCS / UKCS",
+                                 expanded=False):
+                    wb_df = pd.DataFrame([
+                        {"Region": r["region"],
+                         "Typical low ($MM)": r["low"],
+                         "Typical mid ($MM)": r["mid"],
+                         "Typical high ($MM)": r["high"],
+                         "This concept ($MM)": round(bench["well_share_MM"], 1),
+                         "Verdict": r["verdict"]}
+                        for r in bench["well_rows"]])
+                    st.dataframe(wb_df, use_container_width=True,
+                                 hide_index=True)
+                    st.caption(
+                        "This is total concept CAPEX ÷ number of subsea "
+                        "wells, so for a standalone development it also "
+                        "carries the host/topsides cost — expect it to read "
+                        "high for FPSO / platform concepts. It is most "
+                        "meaningful for pure subsea tie-ins.")
+            for note in bench["notes"]:
+                st.info(note)
+            st.caption(
+                "Benchmark bands are screening-level ranges compiled from "
+                "public NCS (Sokkeldirektoratet) and UKCS (NSTA) project "
+                "disclosures. Real project costs vary widely — use these to "
+                "check order of magnitude, not as a class-3 estimate.")
+
             if st.button("⚙️ Generate CAPEX schedule from this concept",
                           key="dc_generate", type="primary"):
                 st.session_state.fac_df = pd.DataFrame(concept["capex_rows"])
@@ -5418,28 +5824,24 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — just draw lines without annotations
-            # to avoid Plotly's internal mean calculation issues with Timestamps
+            # Milestone markers — convert everything to pd.Timestamp so
+            # Plotly's internal axis-mean call sees uniform types.
             for label, mdate in sched["milestones"]:
                 mts = pd.Timestamp(mdate)
                 fig_g.add_vline(
-                    x=mts, line=dict(color="#333", dash="dot", width=1)
+                    x=mts, line=dict(color="#333", dash="dot", width=1),
+                    annotation_text=label,
+                    annotation_position="top",
+                    annotation_textangle=-45,
+                    annotation_font=dict(size=9, color="#444"),
                 )
-                # Add annotation separately to avoid arithmetic on Timestamp
-                fig_g.add_annotation(
-                    x=mts, text=label,
-                    showarrow=False, xanchor='center', yanchor='bottom',
-                    textangle=-45, font=dict(size=9, color="#444")
-                )
-            # First-oil emphasis — green thick line (without annotations via add_vline)
+            # First-oil emphasis — green thick line
             fo_ts = pd.Timestamp(sched["first_oil_date"])
             fig_g.add_vline(
-                x=fo_ts, line=dict(color="#2ca02c", width=3)
-            )
-            fig_g.add_annotation(
-                x=fo_ts, text=f"🛢️ First oil: {sched['first_oil_date']}",
-                showarrow=False, xanchor='center', yanchor='top',
-                font=dict(size=12, color="#2ca02c")
+                x=fo_ts, line=dict(color="#2ca02c", width=3),
+                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
+                annotation_position="bottom",
+                annotation_font=dict(size=12, color="#2ca02c"),
             )
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
@@ -5504,7 +5906,7 @@ def economics_section(units, start_date):
                                       "milestone, so the economics and "
                                       "production forecast align with the "
                                       "schedule."):
-                st.session_state["_pending_start_date"] = sched["first_oil_date"]
+                st.session_state["start_date"] = sched["first_oil_date"]
                 mark_stale()
                 st.success(f"Production start date set to "
                            f"{sched['first_oil_date']}. Re-run to refresh.")
@@ -6179,14 +6581,48 @@ def main():
     st.markdown(fh.APP_CSS, unsafe_allow_html=True)
 
     # ---- Branded banner ----
+    # FieldVista — an SVG logo mark: a horizon over subsurface strata with a
+    # production curve rising to the surface (the "vista").
+    _logo_svg = (
+        '<svg width="64" height="64" viewBox="0 0 64 64" '
+        'xmlns="http://www.w3.org/2000/svg">'
+        '<defs><linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#1a4d6e"/>'
+        '<stop offset="1" stop-color="#2a7fa8"/></linearGradient>'
+        '<linearGradient id="rock" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#c98a3a"/>'
+        '<stop offset="1" stop-color="#6e4a1f"/></linearGradient></defs>'
+        '<rect x="2" y="2" width="60" height="60" rx="12" fill="url(#sky)"/>'
+        '<path d="M2 38 Q 32 30 62 38 L62 62 L2 62 Z" fill="url(#rock)"/>'
+        '<path d="M2 46 Q 32 40 62 46" stroke="#8a5e2a" '
+        'stroke-width="1.5" fill="none" opacity="0.7"/>'
+        '<path d="M2 54 Q 32 49 62 54" stroke="#8a5e2a" '
+        'stroke-width="1.5" fill="none" opacity="0.7"/>'
+        '<path d="M10 52 C 22 50 26 22 54 12" stroke="#ffd24a" '
+        'stroke-width="3.5" fill="none" stroke-linecap="round"/>'
+        '<circle cx="54" cy="12" r="4" fill="#ffd24a"/>'
+        '<rect x="28" y="20" width="3" height="20" fill="#e8e8e8"/>'
+        '<rect x="25" y="16" width="9" height="5" rx="1" fill="#e8e8e8"/>'
+        '</svg>'
+    )
     st.markdown(
-        """
+        f"""
         <div class="app-banner">
-            <h1>🛢️ Field Production Prognosis</h1>
-            <div class="subtitle">
-                Multi-rig drilling · PVT-aware MBE · injection / depletion · economics · breakeven
+            <div style="display:flex;align-items:center;gap:16px;">
+                <div>{_logo_svg}</div>
+                <div>
+                    <h1 style="margin:0;">FieldVista</h1>
+                    <div class="subtitle">
+                        Integrated Field Development &amp; Economics —
+                        multi-rig drilling · PVT-aware material balance ·
+                        injection / depletion · development concepts ·
+                        scheduling · economics &amp; breakeven
+                    </div>
+                    <div class="author">
+                        © 2026 Merouane Hamdani · MIT License
+                    </div>
+                </div>
             </div>
-            <div class="author">© 2026 Merouane Hamdani · MIT License</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -6393,6 +6829,17 @@ def main():
         else:
             st.warning(f"🎯 Auto-scale: {scale_info['message']}")
 
+    # Profile robustness warnings — physical-consistency checks on the
+    # generated production profile (RF > 100%, implausible offtake,
+    # negative pressure, etc.).
+    profile_warnings = df.attrs.get("profile_warnings", [])
+    if profile_warnings:
+        with st.container():
+            st.warning("⚠️ **Profile consistency checks flagged "
+                       f"{len(profile_warnings)} issue(s):**")
+            for pw in profile_warnings:
+                st.warning(pw)
+
     if final_rf < asm_r.rf_target - 0.005:
         st.warning(f"⚠️ Forecast achieves **{final_rf:.1%}** recovery — "
                    f"below the target of {asm_r.rf_target:.0%}. "
@@ -6458,7 +6905,7 @@ def main():
     tabs = st.tabs([
         "Production", "Cumulatives & RF", "Per-well",
         "Drilling sequence", "Material balance", "Economics",
-        "Sensitivity", "Monte Carlo", "Data",
+        "Sensitivity", "Monte Carlo", "Data", "Methodology",
     ])
 
     with tabs[0]:
@@ -6966,6 +7413,72 @@ def main():
             f"on the fly so it matches what the plots above show."
         )
 
+    with tabs[9]:
+        st.markdown("### 📐 Methodology & equations")
+        st.caption(
+            "Full traceability: how every quantity in FieldVista is "
+            "calculated. Equations are shown exactly as the engine applies "
+            "them, with a glossary of every symbol. All cost models are "
+            "screening-level."
+        )
+        _meth_sections = {}
+        for entry in fh.METHODOLOGY_DOCS:
+            _meth_sections.setdefault(entry["section"], []).append(entry)
+        for sec_name, entries in _meth_sections.items():
+            st.markdown(f"#### {sec_name}")
+            for entry in entries:
+                with st.expander(entry["title"], expanded=False):
+                    st.markdown(entry["summary"])
+                    for eq in entry["equations"]:
+                        st.latex(eq)
+                    if entry["where"]:
+                        st.markdown("**Where:**")
+                        for sym, desc in entry["where"]:
+                            st.markdown("- $" + sym + "$ — " + desc)
+                    for note in entry.get("notes", []):
+                        st.caption("Note: " + note)
+        st.markdown("---")
+        st.markdown("#### Unit conventions & conversion factors")
+        st.caption(
+            "FieldVista runs in field units internally. Values are converted "
+            "to / from metric for display only. The factors below are exact."
+        )
+        _unit_rows = []
+        for (kind, f_lbl, m_lbl, factor, example) in fh.UNIT_REFERENCE_TABLE:
+            _unit_rows.append({
+                "Quantity": kind,
+                "Field unit": f_lbl,
+                "Metric unit": m_lbl,
+                "Factor (metric->field)": (f"{factor:.5g}"
+                                           if factor is not None
+                                           else "(formula)"),
+                "Equivalence": example,
+            })
+        st.dataframe(pd.DataFrame(_unit_rows), use_container_width=True,
+                     hide_index=True)
+        st.markdown("**Engine constants**")
+        for (name, value, note) in fh.ENGINE_CONSTANTS:
+            st.markdown(f"- **{name}**: {value}"
+                        + (f" — {note}" if note else ""))
+        st.markdown("---")
+        st.markdown("#### Live unit-conversion self-test")
+        st.caption(
+            "These checks run the actual conversion functions now and verify "
+            "them against known values — proof the unit handling is correct."
+        )
+        try:
+            _uc = fh.run_unit_checks(to_field, from_field)
+            _np_, _nt_ = fh.unit_checks_summary(_uc)
+            if _np_ == _nt_:
+                st.success(f"All {_nt_} unit-conversion checks pass.")
+            else:
+                st.error(f"{_nt_ - _np_} of {_nt_} unit checks FAILED.")
+            with st.expander("Show all unit-check results", expanded=False):
+                st.dataframe(pd.DataFrame(_uc), use_container_width=True,
+                             hide_index=True)
+        except Exception as _uc_exc:
+            st.info(f"Unit self-test unavailable: {_uc_exc}")
+
     scenario_compare_section(units, fluid, asm, econ, wells)
 
     batch_mode_section(units, fluid)
@@ -6974,7 +7487,8 @@ def main():
     st.markdown(
         f"""
         <div class="app-footer">
-            <b>Field Production Prognosis</b> · © 2026 <b>Merouane Hamdani</b> · MIT License<br>
+            <b>FieldVista</b> — Integrated Field Development &amp; Economics ·
+            © 2026 <b>Merouane Hamdani</b> · MIT License<br>
             For early-phase screening only — not for investment decisions, reserves booking,
             or production-grade reservoir studies.
         </div>

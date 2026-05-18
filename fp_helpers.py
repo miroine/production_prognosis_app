@@ -2431,8 +2431,29 @@ _RISER_COST = {
     "Top-tensioned riser (TTR)":   25.0,
     "Hybrid riser tower segment":  35.0,
 }
-# Subsea template / manifold unit cost ($MM each)
-_TEMPLATE_COST = 45.0
+# Subsea template / manifold unit cost ($MM each). Template cost scales with
+# the number of well slots — more slots means a bigger, heavier structure.
+_TEMPLATE_COST = 45.0   # legacy single figure (kept for back-compat)
+# Slot-count-aware template costs ($MM each). A template is built for a
+# fixed number of well slots; choosing the slot count is a real design
+# decision (drilling sequence, future tie-in flexibility, structure size).
+_TEMPLATE_SLOT_COST = {
+    "Single-slot (1 well)":   18.0,
+    "Double-slot (2 wells)":  30.0,
+    "4-slot (4 wells)":       52.0,
+    "6-slot (6 wells)":       72.0,
+}
+_TEMPLATE_SLOT_CAPACITY = {
+    "Single-slot (1 well)":   1,
+    "Double-slot (2 wells)":  2,
+    "4-slot (4 wells)":       4,
+    "6-slot (6 wells)":       6,
+}
+# HIPPS — High Integrity Pressure Protection System. A safety-instrumented
+# system that protects downstream equipment rated below shut-in pressure;
+# effectively mandatory for HPHT subsea developments where the flowline /
+# host is not rated for full reservoir shut-in pressure.
+_HIPPS_COST = 35.0   # $MM per HIPPS skid (screening)
 # Umbilical cost ($MM per km)
 _UMBILICAL_MMUSD_PER_KM = 1.6
 # Subsea boosting (multiphase pump station) — $MM per station
@@ -2510,6 +2531,156 @@ def _flowline_cost_per_km(diameter_in: float, material: str,
     mat_mult = _FLOWLINE_MATERIAL_MULT.get(material, 1.0)
     wd_mult = _FLOWLINE_WATERDEPTH_MULT.get(water_depth_class, 1.0)
     return base * mat_mult * wd_mult
+
+
+# =============================================================================
+# NCS / UKCS concept-cost benchmarking
+# =============================================================================
+# A small reference set of development-cost intensities representative of
+# Norwegian Continental Shelf (NCS) and UK Continental Shelf (UKCS) projects.
+# Figures are SCREENING-LEVEL ranges expressed as development CAPEX per boe
+# of reserves ($/boe) and, where relevant, CAPEX per subsea well ($MM).
+# They are deliberately given as bands (low / mid / high) because real
+# project costs vary widely with water depth, reservoir quality, tie-back
+# distance and host availability. Use them to sanity-check the order of
+# magnitude of a screening estimate, not as a substitute for a proper
+# class-3 cost estimate.
+#
+# Sources: publicly reported figures from operator disclosures and national
+# regulator data (Sokkeldirektoratet / NPD for NCS; NSTA for UKCS). The
+# bands below are rounded screening anchors compiled from that public
+# domain, not project-specific values.
+_CONCEPT_COST_BENCHMARKS = [
+    # (region, concept class, capex $/boe low, mid, high, note)
+    ("NCS",  "Subsea tie-in to host",        6,   12,   22,
+     "Short tie-backs to an existing host — the most capital-efficient "
+     "NCS development class."),
+    ("NCS",  "Standalone subsea + FPSO",     14,  22,   38,
+     "Greenfield floating development — new FPSO plus subsea."),
+    ("NCS",  "Standalone fixed platform",    12,  20,   34,
+     "New fixed steel jacket or concrete structure with topsides."),
+    ("UKCS", "Subsea tie-in to host",        8,   15,   28,
+     "UKCS tie-backs — slightly higher than NCS on average due to ageing "
+     "host infrastructure and decommissioning interfaces."),
+    ("UKCS", "Standalone subsea + FPSO",     16,  26,   45,
+     "UKCS greenfield floating development."),
+    ("UKCS", "Standalone fixed platform",    14,  24,   40,
+     "UKCS new fixed platform development."),
+]
+# CAPEX per subsea well ($MM) — drilling + completion + subsea hardware
+# share per well, screening bands.
+_SUBSEA_WELL_COST_BENCHMARKS = [
+    ("NCS",  "Subsea producer well",  55,  85,  130,
+     "Includes the drilled & completed well plus its share of trees, "
+     "manifold and controls."),
+    ("UKCS", "Subsea producer well",  60,  95,  145,
+     "UKCS subsea well — typically a little higher than NCS."),
+]
+
+
+def benchmark_concept_cost(grand_total_MMUSD: float,
+                            reserves_mmboe: float,
+                            concept_type: str,
+                            host_type: str = "",
+                            n_subsea_wells: int = 0) -> dict:
+    """Benchmark a development concept's cost against NCS / UKCS reference
+    bands.
+
+    Args:
+        grand_total_MMUSD : the concept's total CAPEX ($MM).
+        reserves_mmboe    : recoverable reserves used as the denominator
+                            (MMboe). If 0 or missing, $/boe is not computed.
+        concept_type      : "Subsea tie-in" or "Standalone".
+        host_type         : host description (used to pick fixed vs floating).
+        n_subsea_wells    : subsea well count, for the per-well metric.
+
+    Returns dict:
+        capex_per_boe   : float or None
+        well_share_MM   : float or None  (CAPEX per subsea well)
+        concept_class   : the benchmark class label matched
+        rows            : list of benchmark rows for the matched class,
+                          one per region: {region, low, mid, high, note,
+                          your_value, verdict}
+        well_rows       : same structure for the per-well metric
+        notes           : list[str]
+    """
+    notes = []
+    # Map the concept to a benchmark class label.
+    if concept_type == "Subsea tie-in":
+        concept_class = "Subsea tie-in to host"
+    else:
+        ht = str(host_type or "")
+        if any(k in ht for k in ("FPSO", "Semi", "Spar", "TLP")):
+            concept_class = "Standalone subsea + FPSO"
+        elif "Onshore" in ht:
+            concept_class = "Standalone subsea + FPSO"  # closest proxy
+            notes.append("Onshore developments are not directly covered by "
+                          "the NCS/UKCS offshore benchmark set — the closest "
+                          "offshore class is shown for rough comparison "
+                          "only.")
+        else:
+            concept_class = "Standalone fixed platform"
+
+    capex_per_boe = (grand_total_MMUSD / reserves_mmboe
+                     if reserves_mmboe and reserves_mmboe > 0 else None)
+
+    def _verdict(value, lo, hi):
+        if value is None:
+            return "—"
+        if value < lo:
+            return "below typical range"
+        if value > hi:
+            return "above typical range"
+        return "within typical range"
+
+    rows = []
+    for (region, cls, lo, mid, hi, note) in _CONCEPT_COST_BENCHMARKS:
+        if cls != concept_class:
+            continue
+        rows.append({
+            "region": region, "low": lo, "mid": mid, "high": hi,
+            "note": note,
+            "your_value": capex_per_boe,
+            "verdict": _verdict(capex_per_boe, lo, hi),
+        })
+
+    well_share_MM = None
+    well_rows = []
+    if n_subsea_wells and n_subsea_wells > 0:
+        well_share_MM = grand_total_MMUSD / n_subsea_wells
+        for (region, cls, lo, mid, hi, note) in _SUBSEA_WELL_COST_BENCHMARKS:
+            well_rows.append({
+                "region": region, "low": lo, "mid": mid, "high": hi,
+                "note": note,
+                "your_value": well_share_MM,
+                "verdict": _verdict(well_share_MM, lo, hi),
+            })
+
+    if capex_per_boe is not None:
+        # Compare to the worst-case (highest) mid value of the matched class
+        mids = [r["mid"] for r in rows]
+        if mids:
+            avg_mid = sum(mids) / len(mids)
+            if capex_per_boe > 1.5 * avg_mid:
+                notes.append(
+                    f"Concept CAPEX intensity (${capex_per_boe:.0f}/boe) is "
+                    f"well above the NCS/UKCS mid benchmark (~${avg_mid:.0f}"
+                    f"/boe) for a {concept_class.lower()} — the project "
+                    f"would need strong prices or more reserves to compete.")
+            elif capex_per_boe < 0.5 * avg_mid:
+                notes.append(
+                    f"Concept CAPEX intensity (${capex_per_boe:.0f}/boe) is "
+                    f"well below the NCS/UKCS mid benchmark — check that the "
+                    f"reserves and the cost estimate are both realistic.")
+
+    return {
+        "capex_per_boe": capex_per_boe,
+        "well_share_MM": well_share_MM,
+        "concept_class": concept_class,
+        "rows": rows,
+        "well_rows": well_rows,
+        "notes": notes,
+    }
 
 
 def build_development_concept(spec: dict) -> dict:
@@ -2623,12 +2794,30 @@ def build_development_concept(spec: dict) -> dict:
             rows.append((offset_days, float(amt), label))
 
     # ---- Component costs --------------------------------------------------
-    # Subsea templates / manifolds — HPHT uplift applies (higher-spec
-    # structures and connectors for HPHT service).
-    cost_templates = n_templates * _TEMPLATE_COST * hpht_uplift
+    # Subsea templates / manifolds — slot-count-aware. The template type sets
+    # both the per-template cost and how many wells each template can host.
+    # HPHT uplift applies (higher-spec structures and connectors).
+    template_type = g("template_type", "4-slot (4 wells)")
+    slot_capacity = _TEMPLATE_SLOT_CAPACITY.get(template_type, 4)
+    per_template_cost = _TEMPLATE_SLOT_COST.get(template_type, _TEMPLATE_COST)
+    cost_templates = n_templates * per_template_cost * hpht_uplift
     _hpht_sfx = f" [{hpht_tier}]" if hpht_tier != "Standard" else ""
     _push(0, cost_templates,
-          f"{n_templates} × subsea template/manifold{_hpht_sfx}")
+          f"{n_templates} × {template_type} template/manifold{_hpht_sfx}")
+
+    # HIPPS — High Integrity Pressure Protection System. Required for HPHT
+    # developments where downstream equipment is not rated for full shut-in
+    # pressure. Added automatically for HPHT tiers, or when the spec
+    # explicitly requests it.
+    want_hipps = bool(g("hipps", False)) or (hpht_tier != "Standard")
+    n_hipps = int(g("n_hipps", 0))
+    if want_hipps and n_hipps <= 0:
+        # default: one HIPPS per template (each template needs protection)
+        n_hipps = max(1, n_templates)
+    if want_hipps and n_hipps > 0:
+        cost_hipps = n_hipps * _HIPPS_COST * hpht_uplift
+        _push(120, cost_hipps,
+              f"{n_hipps} × HIPPS pressure-protection skid{_hpht_sfx}")
 
     # Xmas trees — HPHT uplift applies (HPHT-rated trees cost materially more).
     cost_wet_trees = (n_subsea_wells * _XMAS_TREE_COST["Wet (subsea) tree"]
@@ -2828,7 +3017,9 @@ def build_development_concept(spec: dict) -> dict:
                         f"{host_distance_km:.0f} km"))
     summary.append(("Water depth class", water_depth_class))
     if n_templates:
-        summary.append(("Subsea templates / manifolds", f"{n_templates}"))
+        summary.append(("Subsea templates / manifolds",
+                         f"{n_templates} × {template_type} "
+                         f"({n_templates * slot_capacity} slots total)"))
     if n_subsea_wells:
         summary.append(("Wells on wet (subsea) trees", f"{n_subsea_wells}"))
     if n_dry_wells:
@@ -2861,6 +3052,35 @@ def build_development_concept(spec: dict) -> dict:
     if total_wells == 0:
         warnings.append("No wells specified in the concept — add subsea "
                         "and/or dry wells.")
+
+    # ---- Template slot-capacity consistency ----
+    # The chosen template type has a fixed slot count. The number of subsea
+    # wells must fit within (n_templates × slots-per-template). Flag both
+    # over-subscription (not enough slots) and significant under-use.
+    total_slots = n_templates * slot_capacity
+    if n_templates > 0 and n_subsea_wells > 0:
+        if n_subsea_wells > total_slots:
+            warnings.append(
+                f"Well count does not fit the template design: "
+                f"{n_subsea_wells} subsea wells but only {total_slots} slots "
+                f"available ({n_templates} × {template_type}). Either add "
+                f"templates, choose a larger template type, or reduce the "
+                f"well count.")
+        elif n_subsea_wells <= total_slots - slot_capacity:
+            # at least one whole template is unused
+            spare = total_slots - n_subsea_wells
+            warnings.append(
+                f"Template design is over-sized: {total_slots} slots "
+                f"({n_templates} × {template_type}) for only "
+                f"{n_subsea_wells} subsea wells — {spare} spare slots. "
+                f"Consider fewer or smaller templates unless the spare "
+                f"slots are intentional for future infill wells.")
+    if n_templates == 0 and n_subsea_wells > 0:
+        warnings.append(
+            f"{n_subsea_wells} subsea wells specified but no templates — "
+            f"subsea wells are normally hosted on a template/manifold. Add "
+            f"at least {-(-n_subsea_wells // max(1, slot_capacity))} "
+            f"template(s) of type {template_type}.")
     if concept_type == "Subsea tie-in":
         if host_distance_km <= 0:
             warnings.append("Tie-in concept but tie-back distance to host is "
@@ -2921,7 +3141,12 @@ def build_development_concept(spec: dict) -> dict:
                         "the typical 6-30\" screening range — check the value.")
 
     # ---- Schematic SVG ----------------------------------------------------
-    schematic = _concept_schematic_svg(spec, concept_type)
+    # Enrich the spec with the derived slot capacity / template type so the
+    # schematic can draw slot-accurate template shapes.
+    _schematic_spec = dict(spec)
+    _schematic_spec["slot_capacity"] = slot_capacity
+    _schematic_spec["template_type"] = template_type
+    schematic = _concept_schematic_svg(_schematic_spec, concept_type)
 
     return {
         "capex_rows": capex_rows,
@@ -2930,6 +3155,10 @@ def build_development_concept(spec: dict) -> dict:
         "schematic": schematic,
         "hpht_tier": hpht_tier,
         "hpht_uplift": hpht_uplift,
+        "template_type": template_type,
+        "slot_capacity": slot_capacity,
+        "total_slots": n_templates * slot_capacity,
+        "n_hipps": n_hipps if want_hipps else 0,
         "totals": {
             "capex_excl_cessation": capex_excl_cessation,
             "cessation": cessation,
@@ -3025,43 +3254,109 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
                      f'stroke="#555" stroke-width="4"/>')
         parts.append(f'<text x="{hx+40}" y="{sea-58}" font-size="11" '
                      f'fill="#333" text-anchor="middle">Host facility</text>')
-        # Subsea template + wells on the left
-        tx = 90
-        parts.append(f'<rect x="{tx}" y="{seabed-14}" width="90" height="16" '
-                     f'fill="#c46" stroke="#333" stroke-width="2"/>')
-        parts.append(f'<text x="{tx+45}" y="{seabed+28}" font-size="11" '
-                     f'fill="#333" text-anchor="middle">'
-                     f'{max(1,n_templates)} template(s), {n_subsea} wells</text>')
-        for i in range(min(max(1, n_subsea), 6)):
-            wx = tx + 8 + i * 14
-            parts.append(f'<line x1="{wx}" y1="{seabed}" x2="{wx}" '
-                         f'y2="{seabed+30}" stroke="#333" stroke-width="3"/>')
-        # Flowline template → host
-        parts.append(f'<line x1="{tx+90}" y1="{seabed-6}" x2="{hx}" '
+
+        # ---- Subsea templates with slot-accurate shapes ----
+        # Each template is drawn as a rectangular frame with visible well
+        # slots (small circles). Slot count comes from the template type.
+        slot_capacity = int(g("slot_capacity", 4) or 4)
+        template_type = str(g("template_type", "4-slot (4 wells)"))
+        n_t = max(1, n_templates)
+        # template_layout controls where the templates sit relative to each
+        # other: "clustered" (side by side near the field) or "spread"
+        # (separated along the tie-back). Default clustered.
+        template_layout = str(g("template_layout", "clustered"))
+        # distribute the subsea wells across templates
+        wells_left = n_subsea
+        # base x positions for templates
+        if template_layout == "spread" and n_t > 1:
+            t_xs = [70 + i * (380 / max(1, n_t - 1)) for i in range(n_t)]
+        else:
+            t_xs = [70 + i * 120 for i in range(n_t)]
+        first_t_x = t_xs[0]
+        last_t_x = t_xs[-1]
+        for ti, t_x in enumerate(t_xs):
+            # template frame — width scales with slot count
+            t_w = 30 + slot_capacity * 11
+            t_w = min(t_w, 130)
+            t_y = seabed - 18
+            parts.append(
+                f'<rect x="{t_x}" y="{t_y}" width="{t_w}" height="20" '
+                f'rx="3" fill="#c4566a" stroke="#5a2030" stroke-width="2"/>')
+            # well slots as small circles along the template
+            this_wells = min(slot_capacity,
+                             max(0, wells_left if ti == n_t - 1
+                                 else min(slot_capacity, wells_left)))
+            for s in range(slot_capacity):
+                sx = t_x + 10 + s * ((t_w - 16) / max(1, slot_capacity - 1)
+                                     if slot_capacity > 1 else 0)
+                slot_filled = s < this_wells
+                parts.append(
+                    f'<circle cx="{sx:.0f}" cy="{t_y + 10}" r="4" '
+                    f'fill="{"#2a2a2a" if slot_filled else "#e8e8e8"}" '
+                    f'stroke="#333" stroke-width="1"/>')
+                if slot_filled:
+                    # well stub down into the seabed
+                    parts.append(
+                        f'<line x1="{sx:.0f}" y1="{seabed}" x2="{sx:.0f}" '
+                        f'y2="{seabed + 26}" stroke="#333" '
+                        f'stroke-width="2.5"/>')
+            wells_left -= this_wells
+            parts.append(
+                f'<text x="{t_x + t_w/2:.0f}" y="{seabed + 40}" '
+                f'font-size="9" fill="#5a2030" text-anchor="middle">'
+                f'T{ti+1}: {template_type.split(" ")[0]}</text>')
+        # caption under the template cluster
+        parts.append(
+            f'<text x="{first_t_x:.0f}" y="{seabed + 54}" font-size="10" '
+            f'fill="#333">{n_t} × template, {n_subsea} wells</text>')
+        # inter-template tie line when spread
+        if n_t > 1 and template_layout == "spread":
+            parts.append(
+                f'<line x1="{first_t_x + 40:.0f}" y1="{seabed - 4}" '
+                f'x2="{last_t_x:.0f}" y2="{seabed - 4}" stroke="#888" '
+                f'stroke-width="2" stroke-dasharray="4,3"/>')
+
+        # ---- Flowline: from the last template to the host ----
+        fl_start_x = last_t_x + 90
+        parts.append(f'<line x1="{fl_start_x:.0f}" y1="{seabed-6}" x2="{hx}" '
                      f'y2="{seabed-6}" stroke="#246" stroke-width="4"/>')
-        midx = (tx + 90 + hx) / 2
-        parts.append(f'<text x="{midx}" y="{seabed-14}" font-size="11" '
+        midx = (fl_start_x + hx) / 2
+        parts.append(f'<text x="{midx:.0f}" y="{seabed-14}" font-size="11" '
                      f'fill="#246" text-anchor="middle">'
                      f'Flowline {flowline_km:.0f} km '
                      f'(tie-back {host_distance_km:.0f} km)</text>')
         # Boosting station
         if n_boosting > 0:
-            bx = midx
-            parts.append(f'<circle cx="{bx}" cy="{seabed-6}" r="9" '
+            parts.append(f'<circle cx="{midx:.0f}" cy="{seabed-6}" r="9" '
                          f'fill="#fa3" stroke="#333" stroke-width="2"/>')
-            parts.append(f'<text x="{bx}" y="{seabed+18}" font-size="10" '
+            parts.append(f'<text x="{midx:.0f}" y="{seabed+18}" font-size="10" '
                          f'fill="#a60" text-anchor="middle">'
                          f'Boosting ×{n_boosting}</text>')
-        # Risers up the host
+        # ---- S-shaped (lazy-S) riser up to the host ----
+        # A flexible riser hangs in a characteristic lazy-S: down from the
+        # host, through a sag bend, up over a buoyancy arch, then to the
+        # seabed. Drawn as a cubic Bézier with an S inflection.
         if n_risers > 0:
-            parts.append(f'<path d="M {hx} {seabed-6} Q {hx-30} '
-                         f'{(seabed+sea)/2} {hx+12} {sea}" fill="none" '
-                         f'stroke="#19a" stroke-width="3"/>')
-            parts.append(f'<text x="{hx-50}" y="{(seabed+sea)/2}" '
-                         f'font-size="10" fill="#19a">{n_risers} riser(s)</text>')
+            r_top_x, r_top_y = hx + 4, sea + 4
+            r_bot_x, r_bot_y = hx - 8, seabed - 6
+            mid_y = (r_top_y + r_bot_y) / 2
+            # cubic Bézier: control points pull left then right -> S shape
+            parts.append(
+                f'<path d="M {r_bot_x} {r_bot_y} '
+                f'C {r_bot_x - 55} {mid_y + 35}, '
+                f'{r_top_x + 55} {mid_y - 35}, '
+                f'{r_top_x} {r_top_y}" fill="none" '
+                f'stroke="#1199aa" stroke-width="3"/>')
+            # small buoyancy module marker at the arch
+            parts.append(
+                f'<circle cx="{r_top_x + 20}" cy="{mid_y - 18}" r="5" '
+                f'fill="#ffd24a" stroke="#9a7400" stroke-width="1"/>')
+            parts.append(f'<text x="{hx-70}" y="{mid_y:.0f}" '
+                         f'font-size="10" fill="#1199aa">'
+                         f'{n_risers} × S-riser</text>')
         # Heating annotation
         if heating and heating != "None":
-            parts.append(f'<text x="{midx}" y="{seabed+2}" font-size="10" '
+            parts.append(f'<text x="{midx:.0f}" y="{seabed+2}" font-size="10" '
                          f'fill="#d33" text-anchor="middle">⚡ heated line</text>')
 
     else:  # Standalone offshore
@@ -3691,6 +3986,351 @@ FEATURE_DOCS = [
                     "green/red.",
                 "inputs": [],
             },
+        ],
+    },
+]
+
+
+# =============================================================================
+# Methodology & equations — full traceability documentation
+# =============================================================================
+# Each entry documents how a quantity is calculated, with the governing
+# equations in LaTeX (rendered by st.latex) and a glossary of every symbol.
+METHODOLOGY_DOCS = [
+    {
+        "section": "Production engine",
+        "title": "Arps decline curves",
+        "summary":
+            "Post-plateau production for each well follows the Arps decline "
+            "family. The b-exponent selects the curve: b = 0 is exponential, "
+            "b = 1 is harmonic, 0 < b < 1 is hyperbolic.",
+        "equations": [
+            r"q(t) = \frac{q_i}{\left(1 + b\,D_i\,t\right)^{1/b}} "
+            r"\quad (0 < b \le 1)",
+            r"q(t) = q_i\,e^{-D_i\,t} \quad (b = 0,\ \text{exponential})",
+        ],
+        "where": [
+            (r"q(t)", "production rate at time t (stb/d or Mscf/d)"),
+            (r"q_i", "initial (plateau-end) rate"),
+            (r"D_i", "initial nominal decline rate (1/year)"),
+            (r"b", "Arps decline exponent (dimensionless)"),
+            (r"t", "time since start of decline (years)"),
+        ],
+        "notes": [
+            "The annual decline D_i entered in the UI is the nominal "
+            "decline. Time is handled in months internally: t = months / 12.",
+            "Water cut is ramped separately and applied to gross liquid.",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Water cut ramp",
+        "summary":
+            "Each well's water cut increases linearly from an initial to a "
+            "final value over a user-set ramp period, then holds.",
+        "equations": [
+            r"f_w(t) = f_{w,0} + \left(f_{w,f} - f_{w,0}\right)\,"
+            r"\min\!\left(\frac{t}{t_{ramp}},\,1\right)",
+            r"q_{oil} = q_{liquid}\,(1 - f_w), \qquad "
+            r"q_{water} = q_{liquid}\,f_w",
+        ],
+        "where": [
+            (r"f_w(t)", "water cut at time t (fraction)"),
+            (r"f_{w,0}", "initial water cut"),
+            (r"f_{w,f}", "final water cut"),
+            (r"t_{ramp}", "ramp duration (months)"),
+        ],
+        "notes": [],
+    },
+    {
+        "section": "Production engine",
+        "title": "Material balance — oil reservoir",
+        "summary":
+            "Reservoir pressure is tracked with the general material-balance "
+            "equation (MBE). The depletion form relates produced volumes to "
+            "pressure via the fluid expansion terms.",
+        "equations": [
+            r"N_p\left[B_o + (R_p - R_s)B_g\right] = "
+            r"N\left[(B_o - B_{oi}) + (R_{si} - R_s)B_g\right]",
+            r"\qquad +\; N B_{oi}\frac{c_w S_w + c_f}{1 - S_w}\,\Delta p "
+            r"\;+\; W_e - W_p B_w",
+        ],
+        "where": [
+            (r"N", "oil originally in place, OOIP (stb)"),
+            (r"N_p", "cumulative oil produced (stb)"),
+            (r"B_o,\,B_{oi}", "oil formation volume factor, current / "
+                              "initial (rb/stb)"),
+            (r"B_g", "gas formation volume factor (rb/scf)"),
+            (r"R_s,\,R_{si}", "solution GOR, current / initial (scf/stb)"),
+            (r"R_p", "cumulative produced GOR (scf/stb)"),
+            (r"c_w,\,c_f", "water and formation compressibility (1/psi)"),
+            (r"S_w", "water saturation (fraction)"),
+            (r"\Delta p", "pressure drop from initial (psi)"),
+            (r"W_e,\,W_p", "cumulative aquifer influx, water produced (rb)"),
+        ],
+        "notes": [
+            "PVT properties come from the Standing / Vasquez-Beggs "
+            "correlations evaluated at reservoir temperature.",
+            "The engine solves the MBE for pressure each month given the "
+            "cumulative produced volumes.",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Material balance — gas reservoir (p/Z)",
+        "summary":
+            "For a gas reservoir, depletion follows the p/Z straight line. "
+            "An active aquifer adds an influx term that flattens the trend.",
+        "equations": [
+            r"\frac{p}{Z} = \frac{p_i}{Z_i}\left(1 - "
+            r"\frac{G_p}{G}\right)",
+            r"\text{with aquifer:}\quad \frac{p}{Z} = "
+            r"\frac{p_i}{Z_i}\left(1 - \frac{G_p}{\,G - "
+            r"(W_e - W_p B_w)/B_{gi}\,}\right)",
+        ],
+        "where": [
+            (r"p,\,p_i", "reservoir pressure, current / initial (psia)"),
+            (r"Z,\,Z_i", "gas compressibility (deviation) factor"),
+            (r"G", "gas originally in place, OGIP (scf)"),
+            (r"G_p", "cumulative gas produced (scf)"),
+            (r"B_{gi}", "initial gas formation volume factor"),
+            (r"W_e,\,W_p", "aquifer influx, water produced (rb)"),
+        ],
+        "notes": [],
+    },
+    {
+        "section": "Production engine",
+        "title": "Productivity index & inflow",
+        "summary":
+            "In PI mode the rate is computed from the productivity index "
+            "acting on the drawdown between reservoir pressure and flowing "
+            "bottom-hole pressure.",
+        "equations": [
+            r"q = J\,\left(\bar{p}_R - p_{wf}\right)",
+            r"\text{gas (back-pressure):}\quad "
+            r"q_g = C\left(\bar{p}_R^{\,2} - p_{wf}^{\,2}\right)^{n}",
+        ],
+        "where": [
+            (r"q", "production rate (stb/d)"),
+            (r"J", "productivity index (stb/d/psi)"),
+            (r"\bar{p}_R", "average reservoir pressure (psi)"),
+            (r"p_{wf}", "flowing bottom-hole pressure (psi)"),
+            (r"C,\,n", "gas back-pressure coefficient and exponent"),
+        ],
+        "notes": [
+            "In metric mode J is entered in Sm³/d/bar and converted to "
+            "field units by the rate factor divided by the pressure factor.",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Cumulative volumes & recovery factor",
+        "summary":
+            "Cumulative production is the monthly rate integrated over the "
+            "days in each month. The recovery factor is capped at 100% by "
+            "the volumetric-consistency check.",
+        "equations": [
+            r"N_p = \sum_{m} q_m \cdot d_m \cdot 10^{-6} \quad "
+            r"[\text{MMstb or Bscf}]",
+            r"RF = \min\!\left(\frac{N_p}{N},\,1\right)",
+        ],
+        "where": [
+            (r"q_m", "average rate in month m (stb/d or Mscf/d)"),
+            (r"d_m", "days per month (30.4375 day screening constant)"),
+            (r"N_p", "cumulative primary production"),
+            (r"N", "primary fluid in place (OOIP or OGIP)"),
+            (r"RF", "recovery factor (fraction)"),
+        ],
+        "notes": [
+            "The 10^-6 factor converts stb to MMstb and Mscf to Bscf.",
+            "If the decline curves would produce more than the in-place "
+            "volume, production is capped so RF cannot exceed 100%.",
+        ],
+    },
+    {
+        "section": "Economics",
+        "title": "Cashflow & NPV",
+        "summary":
+            "Monthly net cashflow is revenue minus royalty, tariffs, OPEX, "
+            "CAPEX, tax and abandonment. NPV discounts at the monthly-"
+            "compounded discount rate.",
+        "equations": [
+            r"CF_m = R_m - \text{Roy}_m - T_m - \text{OPEX}_m - "
+            r"\text{CAPEX}_m - \text{Tax}_m - A_m",
+            r"r_m = \left(1 + r_y\right)^{1/12} - 1",
+            r"\text{NPV} = \sum_{m=0}^{M} \frac{CF_m}{(1 + r_m)^{m}}",
+        ],
+        "where": [
+            (r"CF_m", "net cashflow in month m ($)"),
+            (r"R_m", "gross revenue (oil + gas + condensate + NGL)"),
+            (r"\text{Roy}_m", "royalty on gross revenue"),
+            (r"T_m", "tariffs (per-bbl / per-MMBtu)"),
+            (r"A_m", "abandonment / cessation cost"),
+            (r"r_y,\,r_m", "annual and monthly discount rate"),
+            (r"M", "last month of the evaluation horizon"),
+        ],
+        "notes": [
+            "IRR is the rate r that sets NPV = 0, found by bisection.",
+        ],
+    },
+    {
+        "section": "Economics",
+        "title": "Breakeven oil price",
+        "summary":
+            "The breakeven price is the flat oil price at which project NPV "
+            "equals zero, found by a bisection solver that re-runs the "
+            "economics at each trial price.",
+        "equations": [
+            r"\text{find } P^{*} \;:\; \text{NPV}\big(P^{*}\big) = 0",
+        ],
+        "where": [
+            (r"P^{*}", "breakeven oil price ($/bbl)"),
+            (r"\text{NPV}(P)", "project NPV as a function of flat oil price"),
+        ],
+        "notes": [
+            "Gas price is held at its input value while oil price is "
+            "solved; the bracket is $1 to $500/bbl.",
+        ],
+    },
+    {
+        "section": "Economics",
+        "title": "NCS petroleum tax",
+        "summary":
+            "The Norwegian Continental Shelf regime levies Corporate Income "
+            "Tax (CIT) and Special Petroleum Tax (SPT). CAPEX is depreciated "
+            "straight-line; an uplift allowance further reduces the SPT "
+            "base. Losses are carried forward and residuals settled at "
+            "cessation.",
+        "equations": [
+            r"\text{Depr}_m = \sum_{k:\,k \le m < k + N_d} "
+            r"\frac{\text{CAPEX}_k}{N_d}",
+            r"\text{Base}^{CIT}_m = \pi_m - \text{Depr}_m - L^{CIT}_{m-1}",
+            r"\text{Base}^{SPT}_m = \pi_m - \text{Depr}_m - "
+            r"U_m - L^{SPT}_{m-1}",
+            r"\text{Tax}_m = \tau_{CIT}\,[\text{Base}^{CIT}_m]^{+} + "
+            r"\tau_{SPT}\,[\text{Base}^{SPT}_m]^{+}",
+        ],
+        "where": [
+            (r"\pi_m", "operating profit (revenue − royalty − tariff − "
+                       "OPEX)"),
+            (r"\text{Depr}_m", "straight-line depreciation in month m"),
+            (r"N_d", "depreciation period (months); NCS default 6 years"),
+            (r"U_m", "uplift allowance (SPT base only)"),
+            (r"L^{CIT},\,L^{SPT}", "carried-forward losses for each base"),
+            (r"\tau_{CIT}", "corporate income tax rate (22%)"),
+            (r"\tau_{SPT}", "special petroleum tax rate (71.8%)"),
+            (r"[\,x\,]^{+}", "positive part: max(x, 0)"),
+        ],
+        "notes": [
+            "Uplift U = u · CAPEX is spread over the uplift period "
+            "(default 4 years); u defaults to 17.69%.",
+            "A loss carry-forward remaining at the final month is settled "
+            "— credited at the tax rate — since NCS losses do not expire.",
+            "Headline rate is 22% + 71.8%; the effective rate on project "
+            "profit (~78%) is lower once uplift relief is included.",
+        ],
+    },
+    {
+        "section": "Economics",
+        "title": "Nominal vs real money",
+        "summary":
+            "In real terms all cashflows stay in today's money. In nominal "
+            "terms every cashflow is escalated by inflation, compounded "
+            "monthly.",
+        "equations": [
+            r"CF^{nom}_m = CF^{real}_m \cdot \left(1 + i\right)^{m/12}",
+        ],
+        "where": [
+            (r"CF^{real}_m", "real-terms cashflow in month m"),
+            (r"CF^{nom}_m", "nominal-terms cashflow in month m"),
+            (r"i", "annual inflation rate"),
+        ],
+        "notes": [
+            "Use a real discount rate with real cashflows and a nominal "
+            "rate with nominal cashflows; the two agree when "
+            "(1+r_nom) = (1+r_real)(1+i).",
+        ],
+    },
+    {
+        "section": "Development concept",
+        "title": "Flowline cost model",
+        "summary":
+            "Flowline CAPEX is a per-km base cost (interpolated on nominal "
+            "diameter) scaled by a material multiplier and a water-depth "
+            "installation multiplier.",
+        "equations": [
+            r"C_{flowline} = L \cdot c(d) \cdot m_{mat} \cdot m_{wd}",
+        ],
+        "where": [
+            (r"L", "flowline length (km)"),
+            (r"c(d)", "base cost for diameter d ($MM/km, interpolated)"),
+            (r"m_{mat}", "material multiplier (CS 1.0, CRA-clad 1.85, …)"),
+            (r"m_{wd}", "water-depth multiplier (1.0 – 2.2)"),
+        ],
+        "notes": [],
+    },
+    {
+        "section": "Development concept",
+        "title": "HPHT CAPEX uplift",
+        "summary":
+            "Wells and subsea hardware in High Pressure / High Temperature "
+            "conditions carry a CAPEX uplift selected by the HPHT tier.",
+        "equations": [
+            r"C_{HPHT} = C_{base} \cdot u_{tier}",
+        ],
+        "where": [
+            (r"C_{base}", "standard-condition component cost"),
+            (r"u_{tier}", "HPHT uplift: 1.00 / 1.25 / 1.55 / 1.90 for "
+                          "Standard / HPHT / Ultra / Extreme"),
+        ],
+        "notes": [
+            "Tier thresholds: HPHT ≥ 10,000 psi or 300 °F; "
+            "Ultra ≥ 15,000 psi or 350 °F; Extreme ≥ 20,000 psi or 400 °F.",
+        ],
+    },
+    {
+        "section": "Development concept",
+        "title": "CAPEX intensity benchmark",
+        "summary":
+            "The concept's capital intensity is total CAPEX divided by "
+            "recoverable reserves, compared against NCS / UKCS reference "
+            "bands.",
+        "equations": [
+            r"\text{CAPEX intensity} = "
+            r"\frac{\text{CAPEX}_{total}}{\text{Reserves}} "
+            r"\quad [\$/\text{boe}]",
+        ],
+        "where": [
+            (r"\text{CAPEX}_{total}", "grand-total development CAPEX ($MM)"),
+            (r"\text{Reserves}", "recoverable reserves (MMboe)"),
+        ],
+        "notes": [
+            "BOE conversion uses 6 Mscf of gas = 1 boe.",
+        ],
+    },
+    {
+        "section": "Emissions",
+        "title": "CO2 emissions & intensity",
+        "summary":
+            "CO2 comes from combustion of fuel and flare gas plus venting. "
+            "Lifetime intensity is total CO2-equivalent divided by produced "
+            "barrels of oil equivalent.",
+        "equations": [
+            r"E_{CO_2} = \sum_m \left(q^{fuel}_m + q^{flare}_m\right) d_m "
+            r"\cdot \epsilon_c + V_m",
+            r"I_{CO_2} = \frac{E_{CO_2}}{\text{boe produced}} \quad "
+            r"[\text{kg CO}_2/\text{boe}]",
+        ],
+        "where": [
+            (r"q^{fuel},\,q^{flare}", "fuel-gas and flare-gas rates "
+                                      "(Mscf/d)"),
+            (r"\epsilon_c", "combustion emission factor (kg CO2 / Mscf)"),
+            (r"V_m", "vented / fugitive CO2-equivalent in month m"),
+            (r"I_{CO_2}", "lifetime emission intensity"),
+        ],
+        "notes": [
+            "Benchmarks: best-in-class ~7, global average ~18, high-"
+            "intensity ~35+ kg CO2/boe.",
         ],
     },
 ]
