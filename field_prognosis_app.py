@@ -5612,20 +5612,32 @@ def economics_section(units, start_date):
                 help="Used as the denominator for the CAPEX-per-boe "
                      "benchmark. Pre-filled from (OOIP + OGIP/6) × target RF; "
                      "override with your own reserves estimate if needed.")
-            bench = fh.benchmark_concept_cost(
-                grand_total_MMUSD=concept["totals"]["grand_total"],
-                reserves_mmboe=bench_reserves,
-                concept_type=concept_type,
-                host_type=host_type or "",
-                n_subsea_wells=n_subsea_wells)
-            st.caption(
-                f"Matched benchmark class: **{bench['concept_class']}**. "
-                f"Your concept: "
-                f"**${bench['capex_per_boe']:.1f}/boe**"
-                if bench['capex_per_boe'] is not None
-                else "Enter a reserves figure above to compute $/boe.")
+            # Guard against a stale fp_helpers.py that predates this
+            # function (e.g. only one of the two files was redeployed).
+            if not hasattr(fh, "benchmark_concept_cost"):
+                st.info(
+                    "Cost benchmarking is unavailable — the helper module "
+                    "(fp_helpers.py) on this deployment is out of date. "
+                    "Re-upload the latest fp_helpers.py alongside the app "
+                    "to enable NCS / UKCS benchmarking.")
+                bench = None
+            else:
+                bench = fh.benchmark_concept_cost(
+                    grand_total_MMUSD=concept["totals"]["grand_total"],
+                    reserves_mmboe=bench_reserves,
+                    concept_type=concept_type,
+                    host_type=host_type or "",
+                    n_subsea_wells=n_subsea_wells)
+            if bench is not None:
+                st.caption(
+                    f"Matched benchmark class: **{bench['concept_class']}**. "
+                    f"Your concept: "
+                    f"**${bench['capex_per_boe']:.1f}/boe**"
+                    if bench['capex_per_boe'] is not None
+                    else "Enter a reserves figure above to compute $/boe.")
 
-            if bench["rows"] and bench["capex_per_boe"] is not None:
+            if bench is not None and bench["rows"] \
+                    and bench["capex_per_boe"] is not None:
                 # Bar chart: benchmark low/mid/high bands + the user's value,
                 # per region.
                 fig_bm = go.Figure()
@@ -5671,7 +5683,8 @@ def economics_section(units, start_date):
                 st.caption("Verdict — " + "  •  ".join(vparts))
 
             # Per-subsea-well benchmark
-            if bench["well_rows"] and bench["well_share_MM"] is not None:
+            if bench is not None and bench["well_rows"] \
+                    and bench["well_share_MM"] is not None:
                 with st.expander("CAPEX per subsea well vs NCS / UKCS",
                                  expanded=False):
                     wb_df = pd.DataFrame([
@@ -5690,13 +5703,15 @@ def economics_section(units, start_date):
                         "carries the host/topsides cost — expect it to read "
                         "high for FPSO / platform concepts. It is most "
                         "meaningful for pure subsea tie-ins.")
-            for note in bench["notes"]:
-                st.info(note)
-            st.caption(
-                "Benchmark bands are screening-level ranges compiled from "
-                "public NCS (Sokkeldirektoratet) and UKCS (NSTA) project "
-                "disclosures. Real project costs vary widely — use these to "
-                "check order of magnitude, not as a class-3 estimate.")
+            if bench is not None:
+                for note in bench["notes"]:
+                    st.info(note)
+                st.caption(
+                    "Benchmark bands are screening-level ranges compiled "
+                    "from public NCS (Sokkeldirektoratet) and UKCS (NSTA) "
+                    "project disclosures. Real project costs vary widely — "
+                    "use these to check order of magnitude, not as a "
+                    "class-3 estimate.")
 
             if st.button("⚙️ Generate CAPEX schedule from this concept",
                           key="dc_generate", type="primary"):
@@ -6579,6 +6594,24 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
 def main():
     # ---- Styling ----
     st.markdown(fh.APP_CSS, unsafe_allow_html=True)
+
+    # ---- Helper-module version check ----
+    # If the app and fp_helpers.py are out of sync (e.g. only one file was
+    # redeployed), new features crash with AttributeError mid-page. Detect
+    # that here and show one clear banner.
+    _EXPECTED_FP_VERSION = "3.4"
+    _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
+    if _fp_version != _EXPECTED_FP_VERSION:
+        _fp_desc = (f"v{_fp_version}" if _fp_version
+                    else "an older version (no version tag)")
+        st.error(
+            f"⚠️ **Version mismatch.** This app expects fp_helpers.py "
+            f"v{_EXPECTED_FP_VERSION}, but the loaded helper module is "
+            f"{_fp_desc}. Some features (cost benchmarking, HPHT, "
+            f"development concepts, methodology docs) may be unavailable or "
+            f"error. **Re-upload the latest fp_helpers.py alongside "
+            f"field_prognosis_app.py** — both files must be from the same "
+            f"release.")
 
     # ---- Branded banner ----
     # FieldVista — an SVG logo mark: a horizon over subsurface strata with a

@@ -1,11 +1,19 @@
 """
-Field Prognosis — supporting helpers
-====================================
+FieldVista — supporting helpers
+================================
 Case persistence (save/load/list/duplicate/delete), breakeven price solver,
-PDF report generation, JSON-API export, and CSS styling.
+PDF report generation, JSON-API export, development-concept costing,
+project scheduling, HPHT classification, NCS/UKCS benchmarking, methodology
+documentation, and CSS styling.
 """
 
 from __future__ import annotations
+
+# Helper-module version. The main app checks this at startup and warns if the
+# app and fp_helpers.py are out of sync (a common cause of AttributeError
+# when only one of the two files is redeployed). Bump this whenever the
+# public surface of fp_helpers changes.
+FP_HELPERS_VERSION = "3.4"
 
 import io
 import json
