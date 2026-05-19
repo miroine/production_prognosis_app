@@ -566,6 +566,12 @@ class FieldAssumptions:
     # each reservoir row directly.
     default_well_pi: float = 2.0
     default_min_bhp_psi: float = 1500.0
+    # Retrograde-condensate modelling (gas-condensate fields only). When
+    # enabled, the produced condensate stream is recomputed as gas rate ×
+    # a producible CGR that falls below the dew point as liquid drops out
+    # in the reservoir.
+    retrograde_enabled: bool = False
+    retrograde_drop_fraction: float = 0.55
 
     def gas_disposition_sum(self) -> float:
         return (self.gas_export_fraction + self.gas_injection_fraction
@@ -958,6 +964,71 @@ def mbe_pressure(asm, dates, q_p, q_s, q_w, q_inj, is_oil):
             tD_prev = tD_now
 
     return P
+
+
+def retrograde_cgr(pressure_psi, p_dew_psi, cgr_initial,
+                    p_init_psi, drop_fraction=0.55):
+    """Screening model of retrograde condensate behaviour.
+
+    In a gas-condensate reservoir, above the dew-point pressure the produced
+    CGR is constant at its initial value. Below the dew point, liquid
+    condenses in the reservoir pores ("retrograde" drop-out). That liquid is
+    largely immobile, so it is NOT produced — the *producible* CGR therefore
+    falls as pressure declines below the dew point. The produced gas stream
+    also becomes leaner.
+
+    This function returns, for each month, the effective producible CGR.
+
+    Model (screening-grade):
+      - p >= p_dew                : CGR = cgr_initial (single-phase gas)
+      - p_dew > p > p_min_liquid  : CGR falls roughly linearly to a minimum
+      - below p_min_liquid        : CGR holds at the minimum (revaporisation
+                                    is ignored at screening level)
+    The pressure of maximum liquid drop-out p_min_liquid is taken as a
+    fraction of the dew point (typically liquid drop-out peaks at
+    40-60% of p_dew for a lean-to-moderate condensate).
+
+    Args:
+        pressure_psi : array of reservoir pressures (psi).
+        p_dew_psi    : dew-point pressure (psi).
+        cgr_initial  : initial CGR (stb/MMscf).
+        p_init_psi   : initial reservoir pressure (psi).
+        drop_fraction: maximum fractional loss of producible CGR at the
+                       point of maximum liquid drop-out (0.55 = the
+                       producible CGR falls to 45% of its initial value).
+
+    Returns:
+        dict with:
+          cgr        : array of producible CGR per month (stb/MMscf)
+          retrograde_active : bool — whether drop-out occurs at all
+          min_cgr    : the minimum producible CGR reached
+    """
+    pressure = np.asarray(pressure_psi, dtype=float)
+    if cgr_initial <= 0 or p_dew_psi <= 0:
+        return {"cgr": np.full_like(pressure, max(cgr_initial, 0.0)),
+                "retrograde_active": False,
+                "min_cgr": max(cgr_initial, 0.0)}
+    # If the reservoir never drops below the dew point, no retrograde loss.
+    if float(np.min(pressure)) >= p_dew_psi:
+        return {"cgr": np.full_like(pressure, cgr_initial),
+                "retrograde_active": False,
+                "min_cgr": cgr_initial}
+    # Pressure of maximum liquid drop-out — ~50% of the dew point.
+    p_min_liquid = 0.50 * p_dew_psi
+    drop_fraction = float(min(max(drop_fraction, 0.0), 0.95))
+    cgr = np.full_like(pressure, cgr_initial)
+    for i, p in enumerate(pressure):
+        if p >= p_dew_psi:
+            cgr[i] = cgr_initial
+        elif p <= p_min_liquid:
+            cgr[i] = cgr_initial * (1.0 - drop_fraction)
+        else:
+            # linear ramp between the dew point and the drop-out peak
+            f = (p_dew_psi - p) / max(p_dew_psi - p_min_liquid, 1.0)
+            cgr[i] = cgr_initial * (1.0 - drop_fraction * f)
+    return {"cgr": cgr,
+            "retrograde_active": True,
+            "min_cgr": float(np.min(cgr))}
 
 
 # =============================================================================
@@ -1394,6 +1465,37 @@ def run_simulation(wells, asm: FieldAssumptions):
             field_gas_rate += res_p[:, k]    # primary = gas (Mscf/d)
             field_oil_rate += res_s[:, k]    # secondary = condensate (stb/d)
 
+    # ---- Retrograde condensate (gas-condensate fields) ----
+    # If retrograde modelling is enabled and the field is a gas-condensate
+    # system, the condensate stream is recomputed as gas rate × producible
+    # CGR, where the CGR falls below the dew point as liquid drops out in
+    # the reservoir. Without this, condensate is a flat yield off the user
+    # decline; with it, the condensate declines faster than the gas once
+    # the reservoir crosses the dew point.
+    retro_info = None
+    _is_gas_condensate = (not is_oil and
+                          FLUID_SYSTEMS[asm.fluid_system]["secondary"]
+                          == "condensate")
+    if (_is_gas_condensate and getattr(asm, "retrograde_enabled", False)
+            and asm.pvt.rs_init > 0):
+        p_dew = asm.pvt.p_bub_psi   # for a gas system p_bub holds the dew point
+        cgr0 = asm.pvt.rs_init      # stb/MMscf
+        retro = retrograde_cgr(pressure, p_dew, cgr0,
+                               asm.pvt.p_init_psi,
+                               drop_fraction=getattr(
+                                   asm, "retrograde_drop_fraction", 0.55))
+        # producible condensate (stb/d) = gas (Mscf/d) / 1000 (-> MMscf/d)
+        #                                  × CGR (stb/MMscf)
+        new_condensate = field_gas_rate / 1000.0 * retro["cgr"]
+        field_oil_rate = new_condensate
+        retro_info = {
+            "active": retro["retrograde_active"],
+            "min_cgr": retro["min_cgr"],
+            "cgr0": cgr0,
+            "cgr_series": retro["cgr"],
+            "p_dew": p_dew,
+        }
+
     # Override the legacy field_p / field_s / cum_p / cum_s with the unit-correct
     # streams. For single-reservoir this is identical to field_p/field_s; for
     # multi-reservoir mixed fluids, this is the only way to keep units sane.
@@ -1587,6 +1689,8 @@ def run_simulation(wells, asm: FieldAssumptions):
         pass
 
     df.attrs["profile_warnings"] = profile_warnings
+    if retro_info is not None:
+        df.attrs["retrograde_info"] = retro_info
 
     # Per-reservoir DataFrame: long format for easy plotting / aggregation
     res_rows = []
@@ -2905,6 +3009,13 @@ def sidebar_inputs():
              "Injection = water/gas injection adds voidage replacement & pressure support.",
     )
 
+    # Apply a pending start-date change requested elsewhere (e.g. the
+    # "use first oil date" button in the schedule section). Streamlit forbids
+    # writing to a widget-backed key after the widget exists, so the request
+    # is staged under a separate key and applied here, before the widget.
+    if "_pending_start_date" in st.session_state:
+        st.session_state["start_date"] = st.session_state.pop(
+            "_pending_start_date")
     start_date = st.sidebar.date_input(
         "Project start date", value=date(2026, 1, 1),
         key="start_date", on_change=mark_stale,
@@ -3008,22 +3119,73 @@ def sidebar_inputs():
         # engine stores the number in `rs_init`; the label clarifies which
         # physical quantity it represents for the chosen fluid.
         if FLUID_SYSTEMS[fluid]["primary"] == "gas":
-            rs_label = "Initial CGR (stb/MMscf)"
-            rs_help = ("Condensate-gas ratio — stock-tank barrels of "
-                       "condensate per million scf of gas. Typical lean "
-                       "gas-condensate 5-50 stb/MMscf; rich 50-250. "
-                       "Set 0 for dry gas. This drives the secondary "
-                       "(condensate) production stream.")
-            rs_default = 30.0
-            rs_kind = None    # CGR is not a GOR — no unit conversion
+            # CGR (condensate-gas ratio). Field unit: stb condensate per
+            # MMscf gas. Metric unit: Sm³ condensate per kSm³ gas.
+            # Conversion: 1 stb/MMscf = 6.2898 Sm³ / 28.3168 kSm³
+            #            = 0.22213 Sm³/kSm³.
+            CGR_F2M = 0.22213   # field (stb/MMscf) -> metric (Sm3/kSm3)
+            cgr_unit = "Sm³/kSm³" if units == "metric" else "stb/MMscf"
+            # Option: derive CGR from the in-place condensate & gas volumes
+            # instead of entering it directly. This keeps a gas-condensate
+            # field internally consistent (CGR ≈ condensate-in-place / OGIP).
+            cgr_from_inplace = st.checkbox(
+                "Compute initial CGR from in-place volumes",
+                value=False, key="cgr_from_inplace", on_change=mark_stale,
+                help="When ticked, the initial CGR is calculated as "
+                     "(condensate in place) / (gas in place) rather than "
+                     "entered directly — keeping the gas-condensate "
+                     "volumetrics self-consistent. Set the condensate-in-"
+                     "place and OGIP in the sidebar 'Reservoir volumes'.")
+            if cgr_from_inplace:
+                # ooip here holds condensate-in-place (MMstb), ogip is OGIP.
+                _cond_ip = float(st.session_state.get("ooip", 0.0) or 0.0)
+                _gas_ip = float(st.session_state.get("ogip", 0.0) or 0.0)
+                _cond_mmstb = to_field(_cond_ip, "oil_vol", units)
+                _gas_bscf = to_field(_gas_ip, "gas_vol", units)
+                # CGR (stb/MMscf) = condensate(MMstb)*1e6 / (OGIP(Bscf)*1000)
+                if _gas_bscf > 0:
+                    cgr_field = (_cond_mmstb * 1e6) / (_gas_bscf * 1000.0)
+                else:
+                    cgr_field = 0.0
+                cgr_disp = (cgr_field * CGR_F2M if units == "metric"
+                            else cgr_field)
+                st.metric(f"Initial CGR (computed, {cgr_unit})",
+                          f"{cgr_disp:,.2f}")
+                st.caption(
+                    f"= condensate-in-place ÷ OGIP "
+                    f"= {_cond_mmstb:,.1f} MMstb ÷ {_gas_bscf:,.0f} Bscf. "
+                    f"Untick to enter the CGR manually.")
+                rs_init_disp = cgr_disp
+                rs_kind = "cgr"
+            else:
+                rs_default_field = 30.0   # stb/MMscf
+                rs_default = (rs_default_field * CGR_F2M
+                              if units == "metric" else rs_default_field)
+                rs_help = (
+                    f"Condensate-gas ratio in {cgr_unit}. Typical lean "
+                    f"gas-condensate "
+                    + ("1-11 Sm³/kSm³" if units == "metric"
+                       else "5-50 stb/MMscf")
+                    + "; rich "
+                    + ("11-55 Sm³/kSm³" if units == "metric"
+                       else "50-250 stb/MMscf")
+                    + ". Set 0 for dry gas. Drives the secondary "
+                      "(condensate) production stream.")
+                rs_init_disp = st.number_input(
+                    f"Initial CGR ({cgr_unit})", value=rs_default,
+                    key="rs_init", on_change=mark_stale, help=rs_help)
+                rs_kind = "cgr"
+            # store the conversion so the PVTInputs build can convert back
+            _cgr_f2m_factor = CGR_F2M
         else:
             rs_label = f"Initial Rs ({ulabel('gor', units)})"
             rs_help = "Initial solution gas-oil ratio (scf gas / stb oil)."
             rs_default = from_field(700.0, "gor", units)
             rs_kind = "gor"
-        rs_init_disp = st.number_input(
-            rs_label, value=rs_default,
-            key="rs_init", on_change=mark_stale, help=rs_help)
+            _cgr_f2m_factor = 1.0
+            rs_init_disp = st.number_input(
+                rs_label, value=rs_default,
+                key="rs_init", on_change=mark_stale, help=rs_help)
         # Saturation pressure: for an oil system this is the BUBBLE point
         # (pressure at which the first gas bubble evolves from the oil);
         # for a gas / gas-condensate system it is the DEW point (pressure
@@ -3052,18 +3214,57 @@ def sidebar_inputs():
             value=from_field(p_sat_default, "pressure", units),
             key="p_bub", on_change=mark_stale,
             help=p_sat_help)
+        # Retrograde-condensate modelling — only meaningful for a gas-
+        # condensate system (gas primary + condensate secondary).
+        retrograde_enabled = False
+        retrograde_drop_fraction = 0.55
+        if (_pvt_is_gas and
+                FLUID_SYSTEMS[fluid]["secondary"] == "condensate"):
+            retrograde_enabled = st.checkbox(
+                "Model retrograde condensate drop-out",
+                value=False, key="retrograde_enabled", on_change=mark_stale,
+                help="When enabled, the produced condensate is computed as "
+                     "gas rate × a producible CGR that FALLS below the dew "
+                     "point — liquid condenses in the reservoir pores and "
+                     "is left behind. Without this, condensate is a flat "
+                     "yield. With it, the condensate stream declines faster "
+                     "than the gas once the reservoir crosses the dew "
+                     "point — the physically correct behaviour for a "
+                     "gas-condensate field.")
+            if retrograde_enabled:
+                retrograde_drop_fraction = st.slider(
+                    "Max producible-CGR loss at peak drop-out",
+                    min_value=0.1, max_value=0.9, value=0.55, step=0.05,
+                    key="retrograde_drop_fraction", on_change=mark_stale,
+                    help="The fraction of the initial CGR that becomes "
+                         "unproducible at the pressure of maximum liquid "
+                         "drop-out (~50% of the dew point). 0.55 means the "
+                         "producible CGR falls to 45% of its initial value "
+                         "— typical for a moderately rich condensate. "
+                         "Leaner gas: lower; richer: higher.")
         ct_rock = st.number_input("Rock compressibility (1/psi)", value=4e-6,
                                   format="%.1e", key="ct_rock", on_change=mark_stale)
         sw_init = st.number_input("Initial water saturation", value=0.20,
                                   min_value=0.0, max_value=0.6,
                                   key="sw_init", on_change=mark_stale)
 
+    # Resolve rs_init to field units. For an oil system this is Rs (GOR
+    # conversion). For a gas system it is CGR — stored internally in
+    # stb/MMscf, so a metric display value is divided back by the CGR
+    # factor.
+    if rs_kind == "gor":
+        _rs_field = to_field(rs_init_disp, "gor", units)
+    elif rs_kind == "cgr":
+        _rs_field = (float(rs_init_disp) / _cgr_f2m_factor
+                     if units == "metric" else float(rs_init_disp))
+    else:
+        _rs_field = float(rs_init_disp)
+
     pvt = PVTInputs(
         p_init_psi=to_field(p_init_disp, "pressure", units),
         t_res_F=to_field(t_res_disp, "temp", units),
         api=api, gas_grav=gas_grav,
-        rs_init=(to_field(rs_init_disp, "gor", units)
-                 if rs_kind == "gor" else float(rs_init_disp)),
+        rs_init=_rs_field,
         p_bub_psi=to_field(p_bub_disp, "pressure", units),
     )
 
@@ -3276,6 +3477,8 @@ def sidebar_inputs():
                     else to_field(aban_gas_disp, "gas_rate", units) / 1000.0,
         "aban_wc": aban_wc,
         "ct_rock": ct_rock, "sw_init": sw_init,
+        "retrograde_enabled": retrograde_enabled,
+        "retrograde_drop_fraction": retrograde_drop_fraction,
         "prod_eff": prod_eff,
         "auto_scale_rf": auto_scale_rf,
         "gas_export": gas_export, "gas_inj_frac": gas_inj_frac,
@@ -4980,6 +5183,120 @@ def _svg_to_data_uri(svg_string: str) -> str:
     return f"data:image/svg+xml;base64,{b64}"
 
 
+def _build_concept_3d_figure(geo: dict):
+    """Build an interactive Plotly 3D scene of the development concept from
+    the geometry dict returned by fh.concept_3d_geometry. The user can
+    rotate / zoom it in the browser."""
+    fig = go.Figure()
+    sea_z = geo["sea_z"]
+    seabed_z = geo["seabed_z"]
+    tb = geo.get("tieback_km", 10.0)
+    # extents for the surfaces
+    xs = [0.0, geo["host"]["x"] * 1.25]
+    ys = [-tb * 0.4, tb * 0.4]
+
+    # Sea surface — a translucent blue plane
+    fig.add_trace(go.Mesh3d(
+        x=[xs[0], xs[1], xs[1], xs[0]],
+        y=[ys[0], ys[0], ys[1], ys[1]],
+        z=[sea_z] * 4,
+        i=[0, 0], j=[1, 2], k=[2, 3],
+        color="#5a9bcf", opacity=0.25, name="Sea surface",
+        hoverinfo="name", showscale=False))
+    # Seabed — a sandy plane
+    fig.add_trace(go.Mesh3d(
+        x=[xs[0], xs[1], xs[1], xs[0]],
+        y=[ys[0], ys[0], ys[1], ys[1]],
+        z=[seabed_z] * 4,
+        i=[0, 0], j=[1, 2], k=[2, 3],
+        color="#d8c9a8", opacity=0.55, name="Seabed",
+        hoverinfo="name", showscale=False))
+
+    # Templates — markers on the seabed
+    if geo["templates"]:
+        fig.add_trace(go.Scatter3d(
+            x=[t["x"] for t in geo["templates"]],
+            y=[t["y"] for t in geo["templates"]],
+            z=[seabed_z for _ in geo["templates"]],
+            mode="markers+text",
+            marker=dict(size=9, color="#c4566a", symbol="square"),
+            text=[t["label"] for t in geo["templates"]],
+            textposition="top center",
+            name="Templates",
+            hovertext=[f"{t['label']}: {t['wells']}/{t['slots']} slots"
+                       for t in geo["templates"]],
+            hoverinfo="text"))
+    # Wells
+    if geo["wells"]:
+        fig.add_trace(go.Scatter3d(
+            x=[w["x"] for w in geo["wells"]],
+            y=[w["y"] for w in geo["wells"]],
+            z=[seabed_z for _ in geo["wells"]],
+            mode="markers",
+            marker=dict(size=3.5, color="#1a1a1a"),
+            name=f"Wells ({geo['n_subsea']})", hoverinfo="name"))
+    # Flowline
+    fl = geo["flowline"]
+    fig.add_trace(go.Scatter3d(
+        x=[p[0] for p in fl], y=[p[1] for p in fl],
+        z=[p[2] for p in fl], mode="lines",
+        line=dict(color="#224466", width=6), name="Flowline"))
+    # Umbilical
+    um = geo["umbilical"]
+    fig.add_trace(go.Scatter3d(
+        x=[p[0] for p in um], y=[p[1] for p in um],
+        z=[p[2] for p in um], mode="lines",
+        line=dict(color="#b07ac0", width=4, dash="dash"),
+        name="Umbilical"))
+    # Riser — the S-curve up to the host
+    rs = geo["riser"]
+    fig.add_trace(go.Scatter3d(
+        x=[p[0] for p in rs], y=[p[1] for p in rs],
+        z=[p[2] for p in rs], mode="lines",
+        line=dict(color="#1199aa", width=6), name="Riser"))
+    # Host
+    h = geo["host"]
+    fig.add_trace(go.Scatter3d(
+        x=[h["x"]], y=[h["y"]], z=[sea_z],
+        mode="markers+text",
+        marker=dict(size=14, color="#8a96a0",
+                    symbol="diamond"),
+        text=["Host"], textposition="top center",
+        name=h.get("type", "Host"), hoverinfo="name"))
+    # Boosting stations
+    if geo["boosting"]:
+        fig.add_trace(go.Scatter3d(
+            x=[b["x"] for b in geo["boosting"]],
+            y=[b["y"] for b in geo["boosting"]],
+            z=[b["z"] for b in geo["boosting"]],
+            mode="markers",
+            marker=dict(size=7, color="#ffaa33", symbol="circle"),
+            name="Boosting station"))
+    # Export pipeline
+    if geo["export"]:
+        ex = geo["export"]
+        fig.add_trace(go.Scatter3d(
+            x=[p[0] for p in ex], y=[p[1] for p in ex],
+            z=[p[2] for p in ex], mode="lines",
+            line=dict(color="#555555", width=4, dash="dot"),
+            name="Export pipeline"))
+
+    fig.update_layout(
+        height=540,
+        scene=dict(
+            xaxis_title="Along tie-back (km)",
+            yaxis_title="Lateral (km)",
+            zaxis_title="Elevation (m)",
+            aspectmode="manual",
+            aspectratio=dict(x=2.2, y=1.0, z=1.1),
+            camera=dict(eye=dict(x=1.8, y=1.6, z=1.1)),
+        ),
+        margin=dict(l=0, r=0, t=10, b=0),
+        legend=dict(orientation="h", y=-0.05),
+    )
+    return fig
+
+
 def _duplicate_last_row(df: pd.DataFrame) -> pd.DataFrame:
     """Append a copy of the last row to a DataFrame. If the DataFrame is empty,
     returns it unchanged."""
@@ -5081,10 +5398,16 @@ def economics_section(units, start_date):
     # under-charges gas OPEX by roughly the boe factor.
     _econ_fluid = st.session_state.get("fluid", "Oil with associated gas")
     _econ_is_oil = FLUID_SYSTEMS[_econ_fluid]["primary"] == "oil"
+    # The variable-OPEX key is suffixed with the fluid phase. This is
+    # deliberate: switching from an oil to a gas fluid must give a fresh
+    # widget with the gas default ($/Mscf), not carry over the oil $/bbl
+    # value (a $5.5/bbl value silently shown as $5.5/Mscf was a real bug).
+    _opex_phase = "oil" if _econ_is_oil else "gas"
+    _opex_key = f"opex_var_{_opex_phase}"
     if _econ_is_oil:
         opex_var_bbl = c3.number_input(
             "Var. OPEX ($/bbl)", value=5.5,
-            key="opex_var_bbl", on_change=mark_stale,
+            key=_opex_key, on_change=mark_stale,
             help="Variable operating cost per barrel of primary fluid "
                  "(oil) produced. Default $5.5/bbl reflects a mid-size NCS "
                  "offshore development; small / late-life fields run "
@@ -5093,12 +5416,13 @@ def economics_section(units, start_date):
     else:
         opex_var_bbl = c3.number_input(
             "Var. OPEX ($/Mscf)", value=0.9,
-            key="opex_var_bbl", on_change=mark_stale,
+            key=_opex_key, on_change=mark_stale,
             help="Variable operating cost per Mscf of primary fluid (gas) "
-                 "produced. Default $0.9/Mscf reflects an NCS gas "
-                 "development (~$5/boe). For a gas field the engine charges "
-                 "variable OPEX against the gas rate (Mscf/d), so this must "
-                 "be a $/Mscf figure — typically $0.5-2.0/Mscf.")
+                 "produced. Default $0.9/Mscf reflects an NCS gas / gas-"
+                 "condensate development (~$5/boe). For a gas field the "
+                 "engine charges variable OPEX against the gas rate "
+                 "(Mscf/d), so this must be a $/Mscf figure — typically "
+                 "$0.5-2.0/Mscf, NOT an oil $/bbl number.")
     opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
                                  key="opex_fixed", on_change=mark_stale)
 
@@ -5791,10 +6115,51 @@ def economics_section(units, start_date):
             st.error(f"Could not build the concept: {exc}")
 
         if concept is not None:
-            # Schematic
+            # Schematics — the user picks which view to show.
             st.markdown("**Concept schematic**")
-            st.image(_svg_to_data_uri(concept["schematic"]),
-                     use_container_width=True)
+            _view_choice = st.selectbox(
+                "Schematic view",
+                ["Side view (cross-section)", "Aerial view (plan)",
+                 "3D view (interactive)"],
+                key="dc_schematic_view",
+                help="Side view — a water-column cross-section showing "
+                     "wells, risers and the host. Aerial view — a top-down "
+                     "field-layout map. 3D view — an interactive scene you "
+                     "can rotate and zoom, showing the full subsea layout "
+                     "in three dimensions.")
+            if _view_choice.startswith("3D"):
+                geo3d = concept.get("geometry_3d")
+                if geo3d and geo3d.get("available"):
+                    fig3d = _build_concept_3d_figure(geo3d)
+                    st.plotly_chart(fig3d, use_container_width=True)
+                    st.caption(
+                        "Interactive 3D layout — drag to rotate, scroll to "
+                        "zoom. Sea surface and seabed are shown as planes; "
+                        "templates, wells, flowline, umbilical, riser, "
+                        "boosting and export pipeline are positioned in "
+                        "true 3D. Elevation is in metres (water depth from "
+                        "the depth class); horizontal axes in km.")
+                else:
+                    st.info("3D view is available for offshore subsea "
+                            "layouts.")
+            elif _view_choice.startswith("Aerial"):
+                if concept.get("aerial"):
+                    st.image(_svg_to_data_uri(concept["aerial"]),
+                             use_container_width=True)
+                    st.caption("Plan view from above — template layout, "
+                               "well slots, flowline / umbilical routing, "
+                               "manifolds, boosting and the export line. "
+                               "Use the **template layout** control to "
+                               "switch between clustered and spread "
+                               "drill-centre arrangements.")
+                else:
+                    st.info("Aerial view is available for offshore "
+                            "subsea layouts.")
+            else:
+                st.image(_svg_to_data_uri(concept["schematic"]),
+                         use_container_width=True)
+                st.caption("Side-view cross-section — water column, "
+                           "seabed, wells, risers and the host facility.")
 
             # Summary + warnings side by side
             sum_col, warn_col = st.columns([1, 1])
@@ -6089,6 +6454,122 @@ def economics_section(units, start_date):
                            "Edit the table below to fine-tune.")
                 st.rerun()
 
+            # ---- Concept-decision sensitivity ----
+            # The standard tornado perturbs production/economics inputs.
+            # This one perturbs the *concept choices* themselves — host
+            # type, water depth, well count, tie-back distance — and shows
+            # how the development CAPEX responds. It answers the real
+            # screening question: which concept decision moves cost most?
+            with st.expander("🌪️ Concept-decision sensitivity",
+                             expanded=False):
+                st.caption(
+                    "How sensitive is the development CAPEX to the concept "
+                    "choices? Each row re-runs the concept with one "
+                    "decision changed, holding everything else fixed. Use "
+                    "it to see which decision — host type, water depth, "
+                    "well count, tie-back length — drives the cost.")
+                if st.button("Run concept sensitivity",
+                             key="dc_concept_sens"):
+                    base_capex = concept["totals"]["grand_total"]
+                    sens_rows = []
+
+                    def _capex_of(spec_override):
+                        try:
+                            s = dict(dc_spec)
+                            s.update(spec_override)
+                            c = fh.build_development_concept(s)
+                            return c["totals"]["grand_total"]
+                        except Exception:
+                            return base_capex
+
+                    # Define the perturbations to test
+                    perturbations = []
+                    # water depth one class deeper / shallower
+                    _wd_order = ["Shallow (<150 m)", "Mid (150-600 m)",
+                                 "Deep (600-1500 m)",
+                                 "Ultra-deep (>1500 m)"]
+                    if water_depth_class in _wd_order:
+                        _wi = _wd_order.index(water_depth_class)
+                        if _wi > 0:
+                            perturbations.append(
+                                ("Water depth one class shallower",
+                                 {"water_depth_class": _wd_order[_wi-1]}))
+                        if _wi < len(_wd_order) - 1:
+                            perturbations.append(
+                                ("Water depth one class deeper",
+                                 {"water_depth_class": _wd_order[_wi+1]}))
+                    # well count +/- 25%
+                    _nw = int(dc_spec.get("n_subsea_wells", 0))
+                    if _nw > 0:
+                        perturbations.append(
+                            ("Subsea wells +25%",
+                             {"n_subsea_wells": int(round(_nw * 1.25))}))
+                        perturbations.append(
+                            ("Subsea wells -25%",
+                             {"n_subsea_wells": max(1,
+                                                    int(round(_nw*0.75)))}))
+                    # tie-back distance +/- 30%
+                    _hd = float(dc_spec.get("host_distance_km", 0))
+                    if _hd > 0:
+                        perturbations.append(
+                            ("Tie-back +30% longer",
+                             {"host_distance_km": _hd * 1.3,
+                              "flowline_km": float(
+                                  dc_spec.get("flowline_km", _hd)) * 1.3,
+                              "umbilical_km": float(
+                                  dc_spec.get("umbilical_km", _hd)) * 1.3}))
+                        perturbations.append(
+                            ("Tie-back -30% shorter",
+                             {"host_distance_km": _hd * 0.7,
+                              "flowline_km": float(
+                                  dc_spec.get("flowline_km", _hd)) * 0.7,
+                              "umbilical_km": float(
+                                  dc_spec.get("umbilical_km", _hd)) * 0.7}))
+                    # HPHT tier up
+                    if dc_spec.get("hpht_tier", "Standard") == "Standard":
+                        perturbations.append(
+                            ("HPHT conditions (vs standard)",
+                             {"hpht_tier": "HPHT"}))
+
+                    for label, override in perturbations:
+                        capex = _capex_of(override)
+                        sens_rows.append({
+                            "Decision change": label,
+                            "CAPEX ($MM)": round(capex, 0),
+                            "Δ vs base ($MM)": round(capex - base_capex, 0),
+                            "Δ %": round(100.0 * (capex - base_capex)
+                                         / base_capex, 1)
+                            if base_capex > 0 else 0.0,
+                        })
+                    if sens_rows:
+                        sens_df = pd.DataFrame(sens_rows)
+                        sens_df = sens_df.reindex(
+                            sens_df["Δ vs base ($MM)"].abs()
+                            .sort_values(ascending=False).index)
+                        st.dataframe(sens_df, use_container_width=True,
+                                     hide_index=True)
+                        # tornado chart
+                        fig_cs = go.Figure()
+                        fig_cs.add_trace(go.Bar(
+                            y=sens_df["Decision change"],
+                            x=sens_df["Δ vs base ($MM)"],
+                            orientation="h",
+                            marker_color=["#d62828" if v > 0 else "#2a9d8f"
+                                          for v in
+                                          sens_df["Δ vs base ($MM)"]]))
+                        fig_cs.update_layout(
+                            title=f"Concept CAPEX sensitivity "
+                                  f"(base ${base_capex:,.0f}MM)",
+                            xaxis_title="Δ CAPEX vs base ($MM)",
+                            height=max(260, 52 * len(sens_df)),
+                            margin=dict(l=10, r=10, t=50, b=30))
+                        st.plotly_chart(fh.apply_plot_template(fig_cs),
+                                        use_container_width=True)
+                        st.caption(
+                            "Positive (red) = the change increases CAPEX. "
+                            "The decision at the top is the biggest cost "
+                            "lever for this concept.")
+
         # Stash the spec so the schedule builder can use it
         st.session_state["_dc_spec"] = dc_spec
 
@@ -6285,10 +6766,16 @@ def economics_section(units, start_date):
                                       "milestone, so the economics and "
                                       "production forecast align with the "
                                       "schedule."):
-                st.session_state["start_date"] = sched["first_oil_date"]
+                # Stage the change — it is applied to the date widget on the
+                # next run, before that widget is created (Streamlit forbids
+                # writing a widget-backed key after the widget exists).
+                fo = sched["first_oil_date"]
+                if not isinstance(fo, date):
+                    fo = pd.Timestamp(fo).date()
+                st.session_state["_pending_start_date"] = fo
                 mark_stale()
                 st.success(f"Production start date set to "
-                           f"{sched['first_oil_date']}. Re-run to refresh.")
+                           f"{sched['first_oil_date']}. Refreshing…")
                 st.rerun()
 
     st.markdown("**Phased facility CAPEX**")
@@ -6963,7 +7450,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "3.6"
+    _EXPECTED_FP_VERSION = "3.9"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -7109,6 +7596,9 @@ def main():
         well_links=well_links,
         default_well_pi=inputs.get("well_pi", 2.0),
         default_min_bhp_psi=inputs.get("min_bhp_psi", 1500.0),
+        retrograde_enabled=inputs.get("retrograde_enabled", False),
+        retrograde_drop_fraction=inputs.get("retrograde_drop_fraction",
+                                            0.55),
     )
 
     st.divider()
@@ -8012,6 +8502,8 @@ def main():
                 f"screening values. {vfld['notes']}")
 
     scenario_compare_section(units, fluid, asm, econ, wells)
+
+    portfolio_section(units, fluid, asm)
 
     batch_mode_section(units, fluid)
 
@@ -10250,6 +10742,257 @@ def scenario_compare_section(units, fluid, asm, econ, wells):
     }).map(_color_delta, subset=["ΔNPV ($MM)", "ΔCum CF ($MM)", delta_df.columns[-1]]) \
       .map(_color_delta_inverse, subset=["ΔBreakeven ($/bbl)", "ΔCost ($MM)"])
     st.dataframe(styled, use_container_width=True)
+
+
+# =============================================================================
+# Portfolio mode — roll up several fields against a shared constraint
+# =============================================================================
+def portfolio_section(units, fluid, asm):
+    """Roll up several saved cases into a portfolio: sum their production and
+    cashflow, and apply an optional shared facility / export constraint that
+    caps the combined rate. Answers 'what does my whole asset base look like,
+    and does it fit the host / export capacity?'."""
+    st.divider()
+    st.subheader("📦 Portfolio rollup")
+    with st.expander("ℹ️ How portfolio rollup works", expanded=False):
+        st.markdown(
+            "Pick **two or more saved cases** — each is treated as a "
+            "separate field. The engine runs every field, aligns them on a "
+            "common calendar, and **sums** their production and cashflow "
+            "into a portfolio total.\n\n"
+            "You can optionally set a **shared facility / export "
+            "constraint** — a maximum combined oil or gas rate (a shared "
+            "host platform, an export pipeline, or a processing hub). When "
+            "the combined rate exceeds the limit, the portfolio total is "
+            "capped and the deferred volume is reported. This is the core "
+            "question for a hub development: do the fields fit the shared "
+            "infrastructure, or do they need to be sequenced?"
+        )
+
+    try:
+        cases = fh.list_cases()
+    except Exception as exc:
+        st.info(f"Case directory not accessible ({exc}).")
+        return
+    if not cases or len(cases) < 2:
+        st.info("📭 Portfolio rollup needs at least two saved cases. "
+                "Save each field as a case from the case manager at the "
+                "top of the page.")
+        return
+
+    case_names = [c["name"] for c in cases]
+    chosen = st.multiselect(
+        "Fields in the portfolio (saved cases)", case_names,
+        default=case_names[:min(3, len(case_names))],
+        key="portfolio_chosen_cases")
+    if len(chosen) < 2:
+        st.info("Pick at least two fields.")
+        return
+
+    # Shared constraint
+    cc1, cc2 = st.columns(2)
+    constraint_type = cc1.selectbox(
+        "Shared constraint", ["None", "Oil rate", "Gas rate"],
+        key="portfolio_constraint_type",
+        help="Cap the combined portfolio rate at a shared facility or "
+             "export limit. 'None' = unconstrained sum.")
+    constraint_value = 0.0
+    if constraint_type != "None":
+        if constraint_type == "Oil rate":
+            constraint_value = cc2.number_input(
+                f"Max combined oil rate ({ulabel('oil_rate', units)})",
+                min_value=0.0,
+                value=from_field(150000.0, "oil_rate", units),
+                step=from_field(10000.0, "oil_rate", units),
+                key="portfolio_constraint_oil",
+                help="Shared host / export oil capacity.")
+        else:
+            constraint_value = cc2.number_input(
+                f"Max combined gas rate ({ulabel('gas_rate', units)})",
+                min_value=0.0,
+                value=from_field(400.0, "gas_rate", units),
+                step=from_field(50.0, "gas_rate", units),
+                key="portfolio_constraint_gas",
+                help="Shared export pipeline / processing capacity.")
+
+    if not st.button("Build portfolio", key="build_portfolio_btn",
+                      type="primary"):
+        return
+
+    # ---- Run every field ----
+    fields = {}
+    errors = []
+    with st.spinner(f"Running {len(chosen)} field(s)…"):
+        for nm in chosen:
+            try:
+                target = next(c for c in cases if c["name"] == nm)
+                case = fh.load_case(target["filename"])
+                payload = case["payload"]
+                c_units = payload.get("scalar", {}).get("units", units)
+                c_fluid = payload.get("scalar", {}).get("fluid", fluid)
+                c_strategy = payload.get("scalar", {}).get(
+                    "strategy", "Depletion")
+                wells_s, reservoirs_s, meta, econ_dict = \
+                    _wells_from_payload_tables(payload, c_units,
+                                                asm.start_date, c_fluid)
+                if not wells_s:
+                    errors.append(f"{nm}: no producers in saved case.")
+                    continue
+                well_links_s = _well_links_from_payload(payload)
+                asm_s = _build_asm_for_scenario(
+                    meta, c_fluid, c_strategy,
+                    reservoirs=reservoirs_s, well_links=well_links_s)
+                econ_s = EconInputs(**econ_dict)
+                df_s, _, _ = run_simulation(wells_s, asm_s)
+                is_oil_s = FLUID_SYSTEMS[c_fluid]["primary"] == "oil"
+                df_e_s = compute_economics(df_s, is_oil_s, econ_s, wells_s)
+                fields[nm] = {"df": df_s, "df_e": df_e_s}
+            except Exception as e:
+                errors.append(f"{nm}: {e}")
+    for err in errors:
+        st.warning(err)
+    if len(fields) < 2:
+        st.error("Need at least two fields to roll up.")
+        return
+
+    # ---- Align on a common monthly calendar ----
+    all_dates = sorted(set().union(
+        *[set(pd.to_datetime(f["df"]["date"])) for f in fields.values()]))
+    cal = pd.DatetimeIndex(all_dates)
+    n = len(cal)
+
+    def _aligned(df, col):
+        s = pd.Series(df[col].values,
+                      index=pd.to_datetime(df["date"]))
+        return s.reindex(cal, fill_value=0.0).values
+
+    # ---- Sum the portfolio ----
+    port_oil = np.zeros(n)
+    port_gas = np.zeros(n)
+    port_cf = np.zeros(n)
+    per_field = {}
+    for nm, f in fields.items():
+        oil = _aligned(f["df"], "oil_rate")
+        gas = _aligned(f["df"], "gas_rate")
+        cf = _aligned(f["df_e"], "cashflow") if "cashflow" in f["df_e"] \
+            else np.zeros(n)
+        per_field[nm] = {"oil": oil, "gas": gas, "cf": cf}
+        port_oil += oil
+        port_gas += gas
+        port_cf += cf
+
+    # ---- Apply the shared constraint ----
+    deferred_note = None
+    if constraint_type == "Oil rate" and constraint_value > 0:
+        limit_field = to_field(constraint_value, "oil_rate", units)
+        uncon = port_oil.copy()
+        port_oil = np.minimum(port_oil, limit_field)
+        deferred = np.maximum(uncon - limit_field, 0.0)
+        deferred_vol = float(np.sum(deferred) * DAYS_PER_MONTH / 1e6)
+        if deferred_vol > 0:
+            deferred_note = (
+                f"The shared oil constraint defers "
+                f"{from_field(deferred_vol, 'oil_vol', units):,.1f} "
+                f"{ulabel('oil_vol', units)} of production — the combined "
+                f"fields exceed the host / export capacity. Consider "
+                f"sequencing the fields or expanding capacity.")
+    elif constraint_type == "Gas rate" and constraint_value > 0:
+        limit_field = to_field(constraint_value, "gas_rate", units)
+        uncon = port_gas.copy()
+        port_gas = np.minimum(port_gas, limit_field)
+        deferred = np.maximum(uncon - limit_field, 0.0)
+        deferred_vol = float(np.sum(deferred) * DAYS_PER_MONTH / 1e9)
+        if deferred_vol > 0:
+            deferred_note = (
+                f"The shared gas constraint defers "
+                f"{from_field(deferred_vol, 'gas_vol', units):,.1f} "
+                f"{ulabel('gas_vol', units)} of production — the combined "
+                f"fields exceed the export capacity. Consider sequencing "
+                f"or expanding capacity.")
+
+    # ---- Headline KPIs ----
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Fields in portfolio", f"{len(fields)}")
+    cum_oil_port = float(np.sum(port_oil) * DAYS_PER_MONTH / 1e6)
+    cum_gas_port = float(np.sum(port_gas) * DAYS_PER_MONTH / 1e9)
+    k2.metric(f"Portfolio oil ({ulabel('oil_vol', units)})",
+              f"{from_field(cum_oil_port, 'oil_vol', units):,.1f}")
+    k3.metric(f"Portfolio gas ({ulabel('gas_vol', units)})",
+              f"{from_field(cum_gas_port, 'gas_vol', units):,.1f}")
+    k4.metric("Portfolio NPV ($MM)",
+              f"{np.sum(port_cf)/1e6:,.0f}")
+    if deferred_note:
+        st.warning("⚠️ " + deferred_note)
+
+    # ---- Stacked production chart ----
+    _is_oil_port = FLUID_SYSTEMS[fluid]["primary"] == "oil"
+    st.markdown("#### Portfolio production — stacked by field")
+    fig_p = go.Figure()
+    for nm in fields:
+        stream = (per_field[nm]["oil"] if _is_oil_port
+                  else per_field[nm]["gas"])
+        kind = "oil_rate" if _is_oil_port else "gas_rate"
+        fig_p.add_trace(go.Scatter(
+            x=cal, y=from_field(stream, kind, units),
+            mode="lines", stackgroup="one", name=nm))
+    # constraint line
+    if constraint_type != "None" and constraint_value > 0:
+        relevant = ((constraint_type == "Oil rate") == _is_oil_port)
+        if relevant:
+            fh.safe_hline(fig_p, constraint_value,
+                          label="Shared capacity limit",
+                          color="#d62828", dash="dash")
+    fig_p.update_layout(
+        title="Combined field production (stacked)",
+        xaxis_title="Date",
+        yaxis_title=(f"Oil rate ({ulabel('oil_rate', units)})"
+                     if _is_oil_port
+                     else f"Gas rate ({ulabel('gas_rate', units)})"),
+        height=420, legend=dict(orientation="h", y=-0.2))
+    st.plotly_chart(fh.apply_plot_template(fig_p),
+                    use_container_width=True)
+
+    # ---- Portfolio cashflow ----
+    st.markdown("#### Portfolio cashflow")
+    fig_cf = go.Figure()
+    fig_cf.add_trace(go.Bar(
+        x=cal, y=port_cf / 1e6, name="Monthly cashflow",
+        marker_color="#2a6f97"))
+    fig_cf.add_trace(go.Scatter(
+        x=cal, y=np.cumsum(port_cf) / 1e6, name="Cumulative",
+        mode="lines", line=dict(color="#d62828", width=3),
+        yaxis="y2"))
+    fig_cf.update_layout(
+        title="Portfolio cashflow ($MM)",
+        height=380, xaxis_title="Date",
+        yaxis=dict(title="Monthly ($MM)"),
+        yaxis2=dict(title="Cumulative ($MM)", overlaying="y",
+                    side="right"),
+        legend=dict(orientation="h", y=-0.2))
+    st.plotly_chart(fh.apply_plot_template(fig_cf),
+                    use_container_width=True)
+
+    # ---- Per-field summary table ----
+    rows = []
+    for nm, f in fields.items():
+        rows.append({
+            "Field": nm,
+            f"Cum oil ({ulabel('oil_vol', units)})": round(from_field(
+                float(np.sum(per_field[nm]["oil"]) * DAYS_PER_MONTH / 1e6),
+                "oil_vol", units), 1),
+            f"Cum gas ({ulabel('gas_vol', units)})": round(from_field(
+                float(np.sum(per_field[nm]["gas"]) * DAYS_PER_MONTH / 1e9),
+                "gas_vol", units), 1),
+            "NPV ($MM)": round(float(np.sum(per_field[nm]["cf"])) / 1e6, 0),
+        })
+    st.markdown("#### Per-field contribution")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                 hide_index=True)
+    st.caption(
+        "Portfolio totals are the simple sum of the individual fields, "
+        "aligned on a common calendar. The shared constraint, if set, caps "
+        "the combined rate — deferred volume is production the "
+        "infrastructure cannot take when fields overlap in time.")
 
 
 # =============================================================================

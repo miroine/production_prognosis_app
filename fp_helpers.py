@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "3.6"
+FP_HELPERS_VERSION = "3.9"
 
 import io
 import json
@@ -3397,19 +3397,23 @@ def build_development_concept(spec: dict) -> dict:
         warnings.append(f"Flowline diameter {flowline_diam:.0f}\" is outside "
                         "the typical 6-30\" screening range — check the value.")
 
-    # ---- Schematic SVG ----------------------------------------------------
+    # ---- Schematic SVGs ---------------------------------------------------
     # Enrich the spec with the derived slot capacity / template type so the
-    # schematic can draw slot-accurate template shapes.
+    # schematics can draw slot-accurate template shapes.
     _schematic_spec = dict(spec)
     _schematic_spec["slot_capacity"] = slot_capacity
     _schematic_spec["template_type"] = template_type
     schematic = _concept_schematic_svg(_schematic_spec, concept_type)
+    aerial = _concept_aerial_svg(_schematic_spec, concept_type)
+    geometry_3d = concept_3d_geometry(_schematic_spec, concept_type)
 
     return {
         "capex_rows": capex_rows,
         "summary": summary,
         "warnings": warnings,
         "schematic": schematic,
+        "aerial": aerial,
+        "geometry_3d": geometry_3d,
         "hpht_tier": hpht_tier,
         "hpht_uplift": hpht_uplift,
         "template_type": template_type,
@@ -3687,6 +3691,372 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
 
     parts.append('</svg>')
     return "".join(parts)
+
+
+def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
+    """Generate an aerial (plan-view) SVG of the subsea development layout.
+
+    Where _concept_schematic_svg is a side-view cross-section, this is a
+    top-down map: templates as slot-accurate rectangles, wells as dots,
+    flowlines and the umbilical routing to the host, manifolds, boosting
+    stations and the export line. Gives the user a 'field layout' view.
+    """
+    def g(key, default=None):
+        return spec.get(key, default)
+
+    n_subsea = int(g("n_subsea_wells", 0))
+    n_dry = int(g("n_dry_wells", 0))
+    n_templates = max(0, int(g("n_templates", 0)))
+    n_boosting = int(g("n_boosting_stations", 0))
+    n_manifolds = int(g("n_manifolds", 0))
+    flowline_km = float(g("flowline_km", 0.0))
+    host_distance_km = float(g("host_distance_km", 0.0))
+    export_km = float(g("export_pipeline_km", 0.0))
+    umbilical_km = float(g("umbilical_km", 0.0))
+    slot_capacity = int(g("slot_capacity", 4) or 4)
+    template_type = str(g("template_type", "4-slot (4 wells)"))
+    template_layout = str(g("template_layout", "clustered"))
+    host_type = str(g("host_type", ""))
+
+    W, H = 720, 440
+    parts = []
+    parts.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
+                 f'height="{H}" viewBox="0 0 {W} {H}" '
+                 f'font-family="sans-serif">')
+    # Seabed background with a subtle bathymetry grid
+    parts.append(f'<rect x="0" y="0" width="{W}" height="{H}" '
+                 f'fill="#e8eef2"/>')
+    for gx in range(0, W, 60):
+        parts.append(f'<line x1="{gx}" y1="0" x2="{gx}" y2="{H}" '
+                     f'stroke="#dde6ec" stroke-width="1"/>')
+    for gy in range(0, H, 60):
+        parts.append(f'<line x1="0" y1="{gy}" x2="{W}" y2="{gy}" '
+                     f'stroke="#dde6ec" stroke-width="1"/>')
+    # North arrow
+    parts.append(f'<g transform="translate(680,52)">'
+                 f'<line x1="0" y1="14" x2="0" y2="-14" stroke="#33648a" '
+                 f'stroke-width="2"/>'
+                 f'<path d="M0,-16 L-5,-6 L5,-6 Z" fill="#33648a"/>'
+                 f'<text x="0" y="-20" font-size="11" fill="#33648a" '
+                 f'text-anchor="middle">N</text></g>')
+    parts.append(f'<text x="12" y="24" font-size="13" fill="#234" '
+                 f'font-weight="bold">Field layout — plan view</text>')
+
+    is_onshore = (concept_type == "Standalone"
+                  and "Onshore" in host_type)
+    if is_onshore:
+        parts.append(f'<text x="{W/2}" y="{H/2}" font-size="14" '
+                     f'fill="#888" text-anchor="middle">Aerial view is '
+                     f'for offshore subsea layouts.</text>')
+        parts.append('</svg>')
+        return "".join(parts)
+
+    # ---- Host position (right side) ----
+    host_x, host_y = 612, 210
+    floating = any(k in host_type for k in
+                   ("FPSO", "Semi", "Spar", "TLP", "Compliant"))
+    if floating:
+        # FPSO drawn as a ship-shaped hull from above
+        parts.append(
+            f'<ellipse cx="{host_x}" cy="{host_y}" rx="46" ry="20" '
+            f'fill="#8a96a0" stroke="#33414d" stroke-width="2"/>')
+        parts.append(
+            f'<path d="M{host_x+46},{host_y} l14,0 l-14,-8 z" '
+            f'fill="#8a96a0" stroke="#33414d" stroke-width="1"/>')
+    else:
+        # fixed platform — square deck from above
+        parts.append(
+            f'<rect x="{host_x-28}" y="{host_y-28}" width="56" height="56" '
+            f'rx="4" fill="#8a96a0" stroke="#33414d" stroke-width="2"/>')
+        for dx in (-18, 18):
+            for dy in (-18, 18):
+                parts.append(f'<circle cx="{host_x+dx}" cy="{host_y+dy}" '
+                              f'r="3.5" fill="#33414d"/>')
+    _host_label = ("Existing host" if concept_type == "Subsea tie-in"
+                   else (host_type or "Host facility"))
+    parts.append(f'<text x="{host_x}" y="{host_y+42}" font-size="11" '
+                 f'fill="#33414d" text-anchor="middle">{_host_label}</text>')
+
+    # ---- Template positions (left field area) ----
+    n_t = max(1, n_templates)
+    field_cx, field_cy = 150, 220
+    if template_layout == "spread" and n_t > 1:
+        # spread vertically across the field
+        t_positions = [(field_cx + (i - (n_t - 1) / 2) * 30,
+                        field_cy + (i - (n_t - 1) / 2) * 78)
+                       for i in range(n_t)]
+    else:
+        # clustered — a tight grid
+        cols = min(n_t, 2)
+        t_positions = []
+        for i in range(n_t):
+            r, c = divmod(i, cols)
+            t_positions.append((field_cx + c * 66 - (cols - 1) * 33,
+                                 field_cy + r * 70 - 35))
+
+    wells_left = n_subsea
+    drawn_well_pts = []
+    for ti, (tx, ty) in enumerate(t_positions):
+        # template body — rectangle sized to slot count
+        t_w = 26 + min(slot_capacity, 6) * 7
+        t_h = 26
+        parts.append(
+            f'<rect x="{tx - t_w/2:.0f}" y="{ty - t_h/2:.0f}" '
+            f'width="{t_w:.0f}" height="{t_h}" rx="3" '
+            f'fill="#c4566a" stroke="#5a2030" stroke-width="2"/>')
+        # well slots as dots in a row; filled = well present
+        this_wells = min(slot_capacity, wells_left)
+        for s in range(slot_capacity):
+            sx = (tx - t_w/2 + 9 +
+                  s * ((t_w - 18) / max(1, slot_capacity - 1)
+                       if slot_capacity > 1 else 0))
+            filled = s < this_wells
+            parts.append(
+                f'<circle cx="{sx:.0f}" cy="{ty:.0f}" r="3.6" '
+                f'fill="{"#1a1a1a" if filled else "#ece0e3"}" '
+                f'stroke="#5a2030" stroke-width="1"/>')
+            if filled:
+                drawn_well_pts.append((sx, ty))
+        wells_left -= this_wells
+        parts.append(
+            f'<text x="{tx:.0f}" y="{ty - t_h/2 - 5:.0f}" font-size="9" '
+            f'fill="#5a2030" text-anchor="middle">'
+            f'T{ti+1} · {template_type.split(" ")[0]}</text>')
+
+    # ---- Manifold (if separate from templates) ----
+    man_x, man_y = field_cx + 90, field_cy
+    if n_manifolds > 0:
+        parts.append(
+            f'<rect x="{man_x-13}" y="{man_y-13}" width="26" height="26" '
+            f'fill="#3b7a57" stroke="#1f3f2d" stroke-width="2" '
+            f'transform="rotate(45 {man_x} {man_y})"/>')
+        parts.append(f'<text x="{man_x}" y="{man_y+26}" font-size="9" '
+                     f'fill="#1f3f2d" text-anchor="middle">'
+                     f'Manifold ×{n_manifolds}</text>')
+        gather_x, gather_y = man_x, man_y
+        # in-field lines: each template to the manifold
+        for (tx, ty) in t_positions:
+            parts.append(
+                f'<line x1="{tx:.0f}" y1="{ty:.0f}" x2="{man_x}" '
+                f'y2="{man_y}" stroke="#888" stroke-width="2"/>')
+    else:
+        gather_x, gather_y = t_positions[-1]
+        # if multiple templates, link them in-field
+        if n_t > 1:
+            for i in range(len(t_positions) - 1):
+                (x1, y1) = t_positions[i]
+                (x2, y2) = t_positions[i + 1]
+                parts.append(
+                    f'<line x1="{x1:.0f}" y1="{y1:.0f}" x2="{x2:.0f}" '
+                    f'y2="{y2:.0f}" stroke="#888" stroke-width="2" '
+                    f'stroke-dasharray="4,3"/>')
+
+    # ---- Production flowline: gathering point -> host ----
+    mid_x = (gather_x + host_x) / 2
+    parts.append(
+        f'<path d="M{gather_x:.0f},{gather_y:.0f} '
+        f'C{mid_x:.0f},{gather_y:.0f} {mid_x:.0f},{host_y} '
+        f'{host_x-30:.0f},{host_y}" fill="none" stroke="#246" '
+        f'stroke-width="4"/>')
+    parts.append(f'<text x="{mid_x:.0f}" y="{(gather_y+host_y)/2 - 8:.0f}" '
+                 f'font-size="10" fill="#246" text-anchor="middle">'
+                 f'Flowline {flowline_km:.0f} km</text>')
+    # Umbilical — drawn parallel, offset, dashed
+    parts.append(
+        f'<path d="M{gather_x:.0f},{gather_y+10:.0f} '
+        f'C{mid_x:.0f},{gather_y+10:.0f} {mid_x:.0f},{host_y+12} '
+        f'{host_x-30:.0f},{host_y+12}" fill="none" stroke="#b07ac0" '
+        f'stroke-width="2" stroke-dasharray="6,3"/>')
+    parts.append(f'<text x="{mid_x:.0f}" y="{(gather_y+host_y)/2 + 20:.0f}" '
+                 f'font-size="9" fill="#8a4f9a" text-anchor="middle">'
+                 f'Umbilical {umbilical_km:.0f} km</text>')
+
+    # ---- Boosting station on the flowline ----
+    if n_boosting > 0:
+        bx, by = mid_x, (gather_y + host_y) / 2
+        parts.append(f'<circle cx="{bx:.0f}" cy="{by:.0f}" r="9" '
+                     f'fill="#fa3" stroke="#7a4a00" stroke-width="2"/>')
+        parts.append(f'<text x="{bx:.0f}" y="{by+22:.0f}" font-size="9" '
+                     f'fill="#a60" text-anchor="middle">'
+                     f'Boosting ×{n_boosting}</text>')
+
+    # ---- Export pipeline leaving the host ----
+    if export_km > 0:
+        parts.append(
+            f'<line x1="{host_x+34}" y1="{host_y}" x2="{W-12}" '
+            f'y2="{host_y}" stroke="#555" stroke-width="3" '
+            f'stroke-dasharray="2,2"/>')
+        parts.append(f'<text x="{host_x+90}" y="{host_y-8}" font-size="9" '
+                     f'fill="#555">Export {export_km:.0f} km →</text>')
+
+    # ---- Legend ----
+    ly = H - 26
+    parts.append(f'<rect x="12" y="{ly-12}" width="14" height="10" '
+                 f'fill="#c4566a"/>')
+    parts.append(f'<text x="30" y="{ly-3}" font-size="9" fill="#444">'
+                 f'Template</text>')
+    parts.append(f'<line x1="110" y1="{ly-7}" x2="134" y2="{ly-7}" '
+                 f'stroke="#246" stroke-width="4"/>')
+    parts.append(f'<text x="140" y="{ly-3}" font-size="9" fill="#444">'
+                 f'Flowline</text>')
+    parts.append(f'<line x1="210" y1="{ly-7}" x2="234" y2="{ly-7}" '
+                 f'stroke="#b07ac0" stroke-width="2" '
+                 f'stroke-dasharray="6,3"/>')
+    parts.append(f'<text x="240" y="{ly-3}" font-size="9" fill="#444">'
+                 f'Umbilical</text>')
+    parts.append(f'<circle cx="318" cy="{ly-7}" r="3.6" fill="#1a1a1a"/>')
+    parts.append(f'<text x="328" y="{ly-3}" font-size="9" fill="#444">'
+                 f'Well slot ({n_subsea} wells)</text>')
+
+    parts.append('</svg>')
+    return "".join(parts)
+
+
+def concept_3d_geometry(spec: dict, concept_type: str) -> dict:
+    """Build the 3D geometry of a subsea development concept.
+
+    Returns a structured dict of 3D coordinates that the app turns into an
+    interactive Plotly scene the user can rotate. Keeping the geometry here
+    (and the Plotly figure in the app) avoids a Plotly dependency in the
+    helper module.
+
+    Coordinate convention: x = along the tie-back, y = lateral spread,
+    z = elevation (0 = seabed, positive = up towards the sea surface).
+
+    Returns dict with keys:
+        available    : bool — False for onshore (no 3D layout)
+        sea_z        : z of the sea surface
+        seabed_z     : z of the seabed (0)
+        templates    : list of {x, y, label, slots, wells}
+        wells        : list of {x, y} well-slot ground positions
+        host         : {x, y, floating} or None
+        flowline     : list of (x, y, z) polyline points
+        riser        : list of (x, y, z) polyline points (S-curve)
+        umbilical    : list of (x, y, z) polyline points
+        export       : list of (x, y, z) polyline points or None
+        boosting     : list of {x, y, z}
+        labels       : list of {x, y, z, text}
+    """
+    def g(key, default=None):
+        return spec.get(key, default)
+
+    host_type = str(g("host_type", ""))
+    if concept_type == "Standalone" and "Onshore" in host_type:
+        return {"available": False}
+
+    n_subsea = int(g("n_subsea_wells", 0))
+    n_templates = max(1, int(g("n_templates", 0)))
+    n_boosting = int(g("n_boosting_stations", 0))
+    slot_capacity = int(g("slot_capacity", 4) or 4)
+    template_type = str(g("template_type", "4-slot (4 wells)"))
+    template_layout = str(g("template_layout", "clustered"))
+    flowline_km = float(g("flowline_km", 0.0))
+    host_distance_km = float(g("host_distance_km", 0.0))
+    export_km = float(g("export_pipeline_km", 0.0))
+    umbilical_km = float(g("umbilical_km", 0.0))
+
+    # Water depth -> sea-surface elevation (a representative mid-band depth).
+    wd_class = str(g("water_depth_class", "Mid (150-600 m)"))
+    wd_mid = {"Shallow (<150 m)": 100.0, "Mid (150-600 m)": 375.0,
+              "Deep (600-1500 m)": 1050.0,
+              "Ultra-deep (>1500 m)": 1800.0}.get(wd_class, 375.0)
+    sea_z = wd_mid
+    seabed_z = 0.0
+
+    # Tie-back distance sets the x-extent of the layout.
+    tieback = max(host_distance_km, flowline_km, 1.0)
+    host_x = tieback
+    host_y = 0.0
+
+    # ---- Template positions on the seabed ----
+    templates = []
+    if template_layout == "spread" and n_templates > 1:
+        ys = [(i - (n_templates - 1) / 2) * (tieback * 0.18)
+              for i in range(n_templates)]
+        xs = [tieback * 0.10 + i * (tieback * 0.06)
+              for i in range(n_templates)]
+    else:
+        ys = [(i % 2 - 0.5) * (tieback * 0.10) for i in range(n_templates)]
+        xs = [tieback * 0.10 + (i // 2) * (tieback * 0.07)
+              for i in range(n_templates)]
+    wells_left = n_subsea
+    wells = []
+    for ti in range(n_templates):
+        tx, ty = xs[ti], ys[ti]
+        this_wells = min(slot_capacity, wells_left)
+        templates.append({"x": tx, "y": ty,
+                           "label": f"T{ti+1}", "slots": slot_capacity,
+                           "wells": this_wells})
+        # well slots spread laterally on the template
+        for s in range(this_wells):
+            off = (s - (this_wells - 1) / 2) * (tieback * 0.012)
+            wells.append({"x": tx, "y": ty + off})
+        wells_left -= this_wells
+
+    # Gathering point — last template (or their centroid)
+    gather_x = xs[-1] + tieback * 0.05
+    gather_y = ys[-1]
+
+    # ---- Flowline: gathering point -> base of the riser ----
+    riser_base_x = host_x - tieback * 0.04
+    flowline = [(gather_x, gather_y, seabed_z),
+                ((gather_x + riser_base_x) / 2,
+                 (gather_y + host_y) / 2, seabed_z),
+                (riser_base_x, host_y, seabed_z)]
+
+    # ---- Riser: S-curve from seabed up to the host ----
+    riser = []
+    n_seg = 14
+    for i in range(n_seg + 1):
+        f = i / n_seg
+        # z rises smoothly; x eases in with a slight S in the mid-water
+        z = seabed_z + f * (sea_z - seabed_z)
+        x = riser_base_x + (host_x - riser_base_x) * (
+            3 * f ** 2 - 2 * f ** 3)
+        # lateral S wiggle for the lazy-S look
+        y = host_y + math.sin(f * math.pi) * (tieback * 0.03)
+        riser.append((x, y, z))
+
+    # ---- Umbilical: parallel to flowline, slightly offset ----
+    umb_off = tieback * 0.03
+    umbilical = [(gather_x, gather_y + umb_off, seabed_z),
+                 ((gather_x + riser_base_x) / 2,
+                  (gather_y + host_y) / 2 + umb_off, seabed_z),
+                 (riser_base_x, host_y + umb_off, seabed_z)]
+
+    # ---- Export pipeline leaving the host ----
+    export = None
+    if export_km > 0:
+        export = [(host_x, host_y, sea_z * 0.0 if False else seabed_z),
+                  (host_x + tieback * 0.5, host_y, seabed_z)]
+
+    # ---- Boosting stations on the flowline ----
+    boosting = []
+    for i in range(n_boosting):
+        f = (i + 1) / (n_boosting + 1)
+        bx = gather_x + (riser_base_x - gather_x) * f
+        boosting.append({"x": bx, "y": gather_y, "z": seabed_z})
+
+    floating = any(k in host_type for k in
+                   ("FPSO", "Semi", "Spar", "TLP", "Compliant"))
+
+    return {
+        "available": True,
+        "sea_z": sea_z,
+        "seabed_z": seabed_z,
+        "tieback_km": tieback,
+        "templates": templates,
+        "wells": wells,
+        "host": {"x": host_x, "y": host_y, "floating": floating,
+                 "type": host_type or "Host"},
+        "flowline": flowline,
+        "riser": riser,
+        "umbilical": umbilical,
+        "export": export,
+        "boosting": boosting,
+        "n_subsea": n_subsea,
+        "template_type": template_type,
+    }
 
 
 # =============================================================================
@@ -4515,6 +4885,44 @@ METHODOLOGY_DOCS = [
             "(primary) and gas_rate / qgas / WGPR (secondary).",
             "Daily data is averaged to monthly; a date or an integer month "
             "column are both accepted.",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Retrograde condensate drop-out",
+        "summary":
+            "In a gas-condensate reservoir, once the pressure falls below "
+            "the dew point, liquid condenses in the reservoir pores. That "
+            "liquid is largely immobile, so the producible condensate-gas "
+            "ratio (CGR) falls — the produced condensate stream declines "
+            "faster than the gas. When retrograde modelling is enabled, the "
+            "condensate is recomputed from the gas rate and a "
+            "pressure-dependent producible CGR.",
+        "equations": [
+            r"\text{CGR}(p) = \begin{cases} "
+            r"\text{CGR}_i & p \ge p_{dew} \\[4pt] "
+            r"\text{CGR}_i\left(1 - \phi\,\frac{p_{dew}-p}"
+            r"{p_{dew}-p_{min}}\right) & p_{min} < p < p_{dew} \\[4pt] "
+            r"\text{CGR}_i\,(1 - \phi) & p \le p_{min} \end{cases}",
+            r"q_{cond} = \frac{q_{gas}}{1000}\,\cdot\,\text{CGR}(p)",
+        ],
+        "where": [
+            (r"\text{CGR}(p)", "producible condensate-gas ratio "
+                               "(stb/MMscf)"),
+            (r"\text{CGR}_i", "initial CGR above the dew point"),
+            (r"p_{dew}", "dew-point pressure"),
+            (r"p_{min}", "pressure of maximum liquid drop-out "
+                         "(~50% of the dew point)"),
+            (r"\phi", "maximum fractional CGR loss at peak drop-out"),
+            (r"q_{gas}", "gas rate (Mscf/d)"),
+            (r"q_{cond}", "producible condensate rate (stb/d)"),
+        ],
+        "notes": [
+            "This is a screening representation — it ignores revaporisation "
+            "at very low pressure and does not track the compositional "
+            "change of the gas itself.",
+            "If the reservoir never crosses the dew point, the CGR stays "
+            "constant and the result is identical to a fixed-yield model.",
         ],
     },
     {
