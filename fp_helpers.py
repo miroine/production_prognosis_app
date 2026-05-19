@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "3.5"
+FP_HELPERS_VERSION = "3.6"
 
 import io
 import json
@@ -1149,6 +1149,70 @@ def apply_plot_template(fig):
     return fig
 
 
+def safe_vline(fig, x, label=None, color="#333", dash="dot", width=1,
+               row=None, col=None, label_position="top",
+               label_font_size=10, label_color=None, textangle=0):
+    """Add a vertical reference line WITHOUT triggering Plotly's annotation
+    bug on datetime axes.
+
+    Plotly's add_vline(annotation_text=...) computes the mean of the shape's
+    x-endpoints to position the label. On a datetime axis recent pandas
+    raises 'Addition/subtraction of integers ... with Timestamp is no longer
+    supported' inside that code path. This helper draws the line with
+    add_vline (no annotation) and, if a label is wanted, places it with a
+    separate add_annotation using an explicit xref/yref — sidestepping the
+    internal mean() call entirely.
+    """
+    line = dict(color=color, dash=dash, width=width)
+    kw = {}
+    if row is not None and col is not None:
+        kw = dict(row=row, col=col)
+    fig.add_vline(x=x, line=line, **kw)
+    if label:
+        yanchor = "bottom" if label_position == "bottom" else "top"
+        y_pos = 0.02 if label_position == "bottom" else 0.98
+        ann = dict(
+            x=x, y=y_pos, xref="x", yref="paper",
+            text=str(label), showarrow=False,
+            font=dict(size=label_font_size,
+                      color=label_color or color),
+            yanchor=yanchor, textangle=textangle,
+        )
+        if row is not None and col is not None:
+            # for subplot axes, let Plotly resolve the right xref via add_annotation
+            ann.pop("xref", None); ann.pop("yref", None)
+            fig.add_annotation(**ann, row=row, col=col)
+        else:
+            fig.add_annotation(**ann)
+    return fig
+
+
+def safe_hline(fig, y, label=None, color="#333", dash="dash", width=1,
+               row=None, col=None, label_font_size=10, label_color=None):
+    """Horizontal reference line without the Plotly datetime-annotation bug.
+    Horizontal lines are less affected (y is usually numeric), but this keeps
+    the annotation handling consistent and explicit.
+    """
+    line = dict(color=color, dash=dash, width=width)
+    kw = {}
+    if row is not None and col is not None:
+        kw = dict(row=row, col=col)
+    fig.add_hline(y=y, line=line, **kw)
+    if label:
+        ann = dict(
+            x=0.99, y=y, xref="paper", yref="y",
+            text=str(label), showarrow=False,
+            font=dict(size=label_font_size, color=label_color or color),
+            xanchor="right", yanchor="bottom",
+        )
+        if row is not None and col is not None:
+            ann.pop("xref", None); ann.pop("yref", None)
+            fig.add_annotation(**ann, row=row, col=col)
+        else:
+            fig.add_annotation(**ann)
+    return fig
+
+
 DISCLAIMER_TEXT = (
     "⚠️ <b>Disclaimer:</b> This application is intended for "
     "<b>early-phase screening</b> analysis only. It uses simplified PVT correlations, "
@@ -1899,6 +1963,185 @@ def parse_decline_csv(text_or_buffer) -> pd.DataFrame:
     out["rate"] = pd.to_numeric(out["rate"], errors="coerce")
     out["well"] = out["well"].astype(str)
     return out.dropna(subset=["rate"]).reset_index(drop=True)
+
+
+# Column-name synonyms for production-profile import. Keys are the canonical
+# names the engine wants; values are lower-cased synonyms seen in the wild
+# (generic exports, Eclipse summary vectors, commercial packages).
+_PROFILE_COL_SYNONYMS = {
+    "month":          ["month", "t", "period", "step", "tstep", "months"],
+    "date":           ["date", "datetime", "time", "day"],
+    "primary_rate":   ["primary_rate", "oil_rate", "qoil", "qo", "oil",
+                        "oil_prod_rate", "wopr", "fopr", "opr", "oprh",
+                        "liquid_rate", "qliq"],
+    "secondary_rate": ["secondary_rate", "gas_rate", "qgas", "qg", "gas",
+                        "gas_prod_rate", "wgpr", "fgpr", "gpr", "gprh"],
+    "water_rate":     ["water_rate", "qwater", "qw", "water", "wwpr",
+                        "fwpr", "wpr"],
+}
+
+
+def parse_production_profile(file_or_text, filename: str = "",
+                              field_is_oil: bool = True) -> dict:
+    """Parse a user-supplied production profile from a CSV or an Eclipse
+    summary export into the per-well monthly profile the engine consumes.
+
+    Handles:
+      - generic CSV with flexible column names (oil_rate / qoil / WOPR ...)
+      - a time column that is either an integer month index or a date
+      - Eclipse RSM / summary-style exports (whitespace-delimited, a DATE
+        or TIME column, vector names like WOPR, FOPR, WGPR)
+      - daily or monthly data — daily data is resampled to monthly averages
+
+    Returns a dict:
+        {"profiles": {well_name: DataFrame[month, primary_rate,
+                                            secondary_rate, water_rate]},
+         "n_wells":  int,
+         "n_months": int,
+         "source":   "eclipse" | "csv",
+         "warnings": list[str],
+         "notes":    list[str]}
+    """
+    import io as _io
+    warnings, notes = [], []
+
+    # ---- Read raw text -------------------------------------------------
+    if hasattr(file_or_text, "read"):
+        raw = file_or_text.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+    else:
+        raw = str(file_or_text)
+
+    is_eclipse = False
+    low = raw[:4000].lower()
+    # Eclipse RSM files announce themselves; summary exports usually carry
+    # vector names like WOPR / FOPR and a DATE/TIME column.
+    if ("summary" in low and "eclipse" in low) or "\tdate\t" in low \
+            or any(v in low for v in ("wopr", "fopr", "wgpr", "fgpr")):
+        is_eclipse = True
+
+    # ---- Parse into a DataFrame ---------------------------------------
+    df = None
+    for sep in (",", r"\s+", "\t", ";"):
+        try:
+            cand = pd.read_csv(_io.StringIO(raw), sep=sep,
+                               engine="python", comment="#")
+            if cand.shape[1] >= 2:
+                df = cand
+                break
+        except Exception:
+            continue
+    if df is None or df.shape[1] < 2:
+        raise ValueError("Could not parse the file as a table — check it is "
+                         "a CSV or a whitespace-delimited Eclipse export.")
+
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    def _find(canon):
+        for syn in _PROFILE_COL_SYNONYMS[canon]:
+            if syn in df.columns:
+                return syn
+        return None
+
+    well_col = next((c for c in df.columns
+                     if c in ("well", "name", "uwi", "wellname")), None)
+    month_col = _find("month")
+    date_col = _find("date")
+    prim_col = _find("primary_rate")
+    sec_col = _find("secondary_rate")
+    water_col = _find("water_rate")
+
+    # For an Eclipse field-summary export the primary vector might be FOPR
+    # (field) rather than WOPR (well) — treat the whole file as one synthetic
+    # well in that case.
+    if prim_col is None and sec_col is None:
+        # last resort: first two numeric non-time columns
+        numerics = [c for c in df.columns
+                    if c not in (well_col, month_col, date_col)
+                    and pd.api.types.is_numeric_dtype(df[c])]
+        if not numerics:
+            raise ValueError("No numeric rate columns found in the file.")
+        prim_col = numerics[0]
+        sec_col = numerics[1] if len(numerics) > 1 else None
+        notes.append(f"Rate columns not recognised by name — using "
+                     f"'{prim_col}'"
+                     + (f" and '{sec_col}'" if sec_col else "")
+                     + " as the primary"
+                     + (" and secondary" if sec_col else "")
+                     + " stream(s).")
+
+    # ---- Time axis -> integer month index -----------------------------
+    if month_col is not None:
+        df["__month__"] = pd.to_numeric(df[month_col], errors="coerce")
+        # If it looks like it starts at 1, shift to 0-based
+        if df["__month__"].min() == 1:
+            df["__month__"] = df["__month__"] - 1
+            notes.append("Month column appeared 1-based; shifted to "
+                         "0-based (month 0 = first producing month).")
+    elif date_col is not None:
+        dts = pd.to_datetime(df[date_col], errors="coerce", dayfirst=False)
+        if dts.isna().all():
+            raise ValueError(f"Could not parse the '{date_col}' column "
+                             f"as dates.")
+        base = dts.min()
+        df["__month__"] = ((dts.dt.year - base.year) * 12
+                           + (dts.dt.month - base.month))
+        # detect daily data: many rows within the same month
+        if df["__month__"].duplicated().sum() > 0.5 * len(df):
+            notes.append("Input looks like daily (or sub-monthly) data — "
+                         "resampled to monthly averages.")
+    else:
+        df["__month__"] = np.arange(len(df))
+        notes.append("No time column found — assumed rows are consecutive "
+                     "months in chronological order.")
+
+    df = df.dropna(subset=["__month__"])
+    df["__month__"] = df["__month__"].astype(int)
+
+    if well_col is None:
+        df["__well__"] = "Imported well"
+        well_col = "__well__"
+        if is_eclipse:
+            notes.append("No well column — treated the file as a single "
+                         "field/well profile.")
+
+    # ---- Build per-well monthly profiles ------------------------------
+    profiles = {}
+    for wname, g in df.groupby(well_col):
+        sub = pd.DataFrame()
+        sub["month"] = g["__month__"].values
+        sub["primary_rate"] = pd.to_numeric(
+            g[prim_col], errors="coerce").values if prim_col else 0.0
+        sub["secondary_rate"] = pd.to_numeric(
+            g[sec_col], errors="coerce").values if sec_col else 0.0
+        sub["water_rate"] = pd.to_numeric(
+            g[water_col], errors="coerce").values if water_col else 0.0
+        sub = sub.fillna(0.0)
+        # collapse duplicate months (daily->monthly) by averaging the rates
+        if sub["month"].duplicated().any():
+            sub = sub.groupby("month", as_index=False).mean(numeric_only=True)
+        sub = sub.sort_values("month").reset_index(drop=True)
+        # negative-rate guard
+        if (sub[["primary_rate", "secondary_rate", "water_rate"]] < 0).any().any():
+            warnings.append(f"{wname}: negative rates found and clipped "
+                            f"to zero.")
+            for c in ("primary_rate", "secondary_rate", "water_rate"):
+                sub[c] = sub[c].clip(lower=0.0)
+        profiles[str(wname)] = sub
+
+    n_months = max((len(p) for p in profiles.values()), default=0)
+    if n_months == 0:
+        raise ValueError("The file parsed but produced no usable rows.")
+
+    return {
+        "profiles": profiles,
+        "n_wells": len(profiles),
+        "n_months": n_months,
+        "source": "eclipse" if is_eclipse else "csv",
+        "warnings": warnings,
+        "notes": notes,
+    }
 
 
 # =============================================================================
@@ -4006,6 +4249,187 @@ FEATURE_DOCS = [
 
 
 # =============================================================================
+# Field validation — benchmark against published NCS production histories
+# =============================================================================
+# To give the engine a track record, FieldVista ships a small set of
+# reference fields with publicly reported annual production. The validation
+# tool sets up a screening model with the field's published parameters,
+# runs the engine, and reports how closely the modelled profile matches the
+# reported history.
+#
+# Data sources: annual production volumes are from public Sokkeldirektoratet
+# (SODIR / Norwegian Offshore Directorate) field data. The annual figures
+# below are rounded screening values compiled from that public domain — they
+# are illustrative reference shapes, not an official restatement of the
+# operator's reported numbers. Reservoir parameters are public-domain
+# screening estimates (PDO summaries, published field reviews).
+#
+# Each reference field provides:
+#   key parameters to seed the model + a list of (year, oil_MMstb) pairs.
+VALIDATION_FIELDS = {
+    "Draugen (NCS, oil)": {
+        "description":
+            "Mature NCS oil field in the Norwegian Sea (Haltenbanken), on "
+            "stream since 1993. A simple structure with a clear plateau "
+            "then long decline — a good shape to validate decline "
+            "behaviour. Operated by OKEA (formerly Shell).",
+        "fluid_system": "Oil with associated gas",
+        "first_production_year": 1993,
+        "ooip_oil_MMstb": 1400.0,      # screening STOIIP estimate
+        "ogip_gas_Bscf": 0.0,
+        "rf_expected": 0.66,           # high RF — strong waterdrive + WAG
+        "plateau_oil_kstbd": 230.0,    # approx plateau oil rate
+        "api": 39.0,
+        "drive": "Strong water drive + water injection",
+        # Approximate annual oil production, MMstb/yr (screening values from
+        # public SODIR field data — rounded).
+        "annual_oil_MMstb": [
+            (1993, 12), (1994, 38), (1995, 55), (1996, 68), (1997, 78),
+            (1998, 80), (1999, 81), (2000, 80), (2001, 78), (2002, 74),
+            (2003, 69), (2004, 63), (2005, 57), (2006, 50), (2007, 44),
+            (2008, 39), (2009, 34), (2010, 30), (2011, 26), (2012, 23),
+            (2013, 20), (2014, 18), (2015, 16), (2016, 14), (2017, 12),
+            (2018, 11), (2019, 10), (2020, 9), (2021, 8), (2022, 7),
+        ],
+        "notes":
+            "Draugen's recovery factor is exceptionally high (~66%) thanks "
+            "to a strong natural aquifer plus water injection. A simple "
+            "screening model with depletion only will under-predict the "
+            "tail — enable aquifer support / injection to reproduce it.",
+    },
+    "Generic NCS gas field": {
+        "description":
+            "A representative NCS gas field — long plateau held by "
+            "deliverability contracts, then p/Z depletion decline. Use to "
+            "validate gas-reservoir behaviour.",
+        "fluid_system": "Dry gas",
+        "first_production_year": 2000,
+        "ooip_oil_MMstb": 0.0,
+        "ogip_gas_Bscf": 4200.0,
+        "rf_expected": 0.78,
+        "plateau_gas_MMscfd": 600.0,
+        "drive": "Volumetric depletion (p/Z)",
+        "annual_gas_Bscf": [
+            (2000, 90), (2001, 175), (2002, 210), (2003, 215), (2004, 215),
+            (2005, 214), (2006, 210), (2007, 205), (2008, 196), (2009, 183),
+            (2010, 168), (2011, 150), (2012, 132), (2013, 115), (2014, 99),
+            (2015, 85), (2016, 72), (2017, 61), (2018, 52), (2019, 44),
+        ],
+        "notes":
+            "Gas fields hold a long contractual plateau, then decline on "
+            "the p/Z trend. A multi-segment decline (plateau + exponential) "
+            "reproduces this shape well.",
+    },
+}
+
+
+def validate_against_field(field_key: str, modelled_annual: list) -> dict:
+    """Compare a modelled annual production profile against a reference
+    field's published history.
+
+    Args:
+        field_key       : key into VALIDATION_FIELDS.
+        modelled_annual : list of (year, volume) the engine produced, in the
+                          same unit as the reference (MMstb oil / Bscf gas).
+
+    Returns dict:
+        ref_series   : list of (year, volume) reference
+        model_series : list of (year, volume) modelled, aligned to ref years
+        metrics      : dict of fit statistics
+        verdict      : short text summary
+        warnings     : list[str]
+    """
+    if field_key not in VALIDATION_FIELDS:
+        raise ValueError(f"Unknown validation field: {field_key}")
+    fld = VALIDATION_FIELDS[field_key]
+    is_oil = fld["fluid_system"] in ("Oil with associated gas",
+                                     "Black oil (no gas)")
+    ref = fld.get("annual_oil_MMstb" if is_oil else "annual_gas_Bscf", [])
+    ref_years = [y for (y, _v) in ref]
+    ref_vals = np.array([v for (_y, v) in ref], dtype=float)
+
+    # Align the modelled series to the reference years (by ordinal position
+    # — the model starts at year 0 = first production year).
+    model_map = {int(y): float(v) for (y, v) in modelled_annual}
+    # The modelled years may be calendar years or 0-based; normalise both
+    # to position from first producing year.
+    model_sorted = sorted(model_map.items())
+    model_vals_by_pos = [v for (_y, v) in model_sorted]
+
+    n = min(len(ref_vals), len(model_vals_by_pos))
+    warnings = []
+    if n == 0:
+        raise ValueError("No overlapping years to compare.")
+    if len(model_vals_by_pos) < len(ref_vals):
+        warnings.append(
+            f"Model covers {len(model_vals_by_pos)} years but the reference "
+            f"history is {len(ref_vals)} years — comparison truncated to "
+            f"the overlapping {n} years. Extend the forecast horizon for a "
+            f"full comparison.")
+    ref_c = ref_vals[:n]
+    mod_c = np.array(model_vals_by_pos[:n], dtype=float)
+    aligned_years = ref_years[:n]
+
+    # ---- Fit metrics ----
+    resid = mod_c - ref_c
+    mae = float(np.mean(np.abs(resid)))
+    rmse = float(np.sqrt(np.mean(resid ** 2)))
+    ss_res = float(np.sum(resid ** 2))
+    ss_tot = float(np.sum((ref_c - np.mean(ref_c)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    cum_ref = float(np.sum(ref_c))
+    cum_mod = float(np.sum(mod_c))
+    cum_err_pct = (100.0 * (cum_mod - cum_ref) / cum_ref
+                   if cum_ref > 0 else 0.0)
+    # peak comparison
+    peak_ref = float(np.max(ref_c))
+    peak_mod = float(np.max(mod_c))
+    peak_err_pct = (100.0 * (peak_mod - peak_ref) / peak_ref
+                    if peak_ref > 0 else 0.0)
+    # mean absolute percentage error
+    nz = ref_c > 1e-9
+    mape = (float(np.mean(np.abs(resid[nz] / ref_c[nz]))) * 100.0
+            if nz.any() else 0.0)
+
+    metrics = {
+        "n_years": n,
+        "r2": r2,
+        "mae": mae,
+        "rmse": rmse,
+        "mape_pct": mape,
+        "cum_ref": cum_ref,
+        "cum_model": cum_mod,
+        "cum_error_pct": cum_err_pct,
+        "peak_ref": peak_ref,
+        "peak_model": peak_mod,
+        "peak_error_pct": peak_err_pct,
+    }
+
+    # ---- Verdict ----
+    if r2 >= 0.9 and abs(cum_err_pct) <= 10:
+        verdict = ("Strong match — the screening model reproduces the "
+                   "published history closely.")
+    elif r2 >= 0.7 and abs(cum_err_pct) <= 25:
+        verdict = ("Reasonable match for a screening tool — the overall "
+                   "shape and cumulative are captured, with some deviation "
+                   "in detail.")
+    else:
+        verdict = ("Weak match — the screening assumptions do not "
+                   "reproduce this field well. Try adjusting the decline, "
+                   "the in-place volume, or the drive mechanism.")
+
+    return {
+        "field": field_key,
+        "unit": "MMstb" if is_oil else "Bscf",
+        "ref_series": list(zip(aligned_years, ref_c.tolist())),
+        "model_series": list(zip(aligned_years, mod_c.tolist())),
+        "metrics": metrics,
+        "verdict": verdict,
+        "warnings": warnings,
+    }
+
+
+# =============================================================================
 # Methodology & equations — full traceability documentation
 # =============================================================================
 # Each entry documents how a quantity is calculated, with the governing
@@ -4034,6 +4458,63 @@ METHODOLOGY_DOCS = [
             "The annual decline D_i entered in the UI is the nominal "
             "decline. Time is handled in months internally: t = months / 12.",
             "Water cut is ramped separately and applied to gross liquid.",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Multi-segment (piecewise-Arps) decline",
+        "summary":
+            "A well can follow a sequence of decline segments instead of a "
+            "single curve — a plateau, then decline, optionally a bean-up "
+            "ramp at the start or a re-stimulation bump late in life. Each "
+            "segment k has its own model and parameters; segments run "
+            "back-to-back and are rate-continuous unless a step multiplier "
+            "is applied at a boundary.",
+        "equations": [
+            r"q(t) = m_k \cdot q_{k}^{0}\,/\,"
+            r"\left(1 + b_k D_k (t - T_{k-1})\right)^{1/b_k}, "
+            r"\quad T_{k-1} \le t < T_k",
+            r"q_{k}^{0} = q_{k-1}(T_{k-1}) \quad "
+            r"\text{(rate carried from the previous segment)}",
+        ],
+        "where": [
+            (r"q_{k}^{0}", "rate entering segment k, before the step"),
+            (r"m_k", "step multiplier at the start of segment k "
+                     "(1 = continuous, >1 = bean-up / re-stimulation, "
+                     "<1 = choke-back)"),
+            (r"D_k,\,b_k", "Arps parameters of segment k "
+                           "(a Plateau segment holds the rate flat)"),
+            (r"T_{k-1},\,T_k", "start and end time of segment k"),
+        ],
+        "notes": [
+            "The final segment is extrapolated to the end of the forecast.",
+            "A bean-up is modelled as a short first segment with a negative "
+            "decline (rate ramping up to plateau).",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Imported production profiles",
+        "summary":
+            "Instead of a decline model, a well can use a measured or "
+            "simulated rate history imported from a CSV or an Eclipse "
+            "summary export. The importer auto-detects the format and "
+            "flexible column names, converts the time axis to a monthly "
+            "index, and resamples sub-monthly data to monthly averages.",
+        "equations": [
+            r"q(\text{month}) = \text{profile}[\,\text{month}\,] "
+            r"\cdot s_f \cdot u",
+        ],
+        "where": [
+            (r"\text{profile}", "the imported per-month rate table"),
+            (r"s_f", "the well's scale factor"),
+            (r"u", "the well's uptime fraction"),
+        ],
+        "notes": [
+            "Recognised rate columns include oil_rate / qoil / WOPR / FOPR "
+            "(primary) and gas_rate / qgas / WGPR (secondary).",
+            "Daily data is averaged to monthly; a date or an integer month "
+            "column are both accepted.",
         ],
     },
     {

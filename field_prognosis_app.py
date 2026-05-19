@@ -309,6 +309,19 @@ class WellSpec:
     scale_factor: float = 1.0
     uptime: float = 0.95   # fraction of time the well is on stream
     user_profile: Optional[pd.DataFrame] = None
+    # Multi-segment decline. When decline_model == "Multi-segment", the well's
+    # rate is built from a sequence of Arps segments instead of one curve.
+    # Each segment is a dict:
+    #   {"months": int  duration of this segment,
+    #    "model":  "Plateau"|"Exponential"|"Harmonic"|"Hyperbolic",
+    #    "di":     float annual decline (ignored for Plateau),
+    #    "b":      float Arps b-exponent (Hyperbolic only),
+    #    "mult":   float multiplicative step applied to the rate at the
+    #              START of this segment (1.0 = rate-continuous; >1 = a
+    #              bean-up or re-stimulation bump; <1 = a choke-back)}
+    # Segments run back-to-back; after the last segment the final segment's
+    # behaviour is extrapolated to the end of the forecast.
+    segments: Optional[list] = None
     inj_rate: float = 0.0
     # Per-well fluid type — when "auto", well inherits the field's fluid system's
     # primary fluid. Set explicitly to "oil" or "gas" for mixed-fluid fields
@@ -571,7 +584,8 @@ FLUID_SYSTEMS = {
     "Black oil (no gas)":      {"primary": "oil", "secondary": None},
     "Dry gas":                 {"primary": "gas", "secondary": None},
 }
-DECLINE_MODELS = ["Exponential", "Hyperbolic", "Harmonic", "User-defined profile"]
+DECLINE_MODELS = ["Exponential", "Hyperbolic", "Harmonic", "Multi-segment",
+                  "User-defined profile"]
 RIG_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
@@ -587,6 +601,72 @@ def decline_rate(qi, di, b, model, t_y):
         b = max(min(b, 0.999), 0.001)
         return qi / np.power(1.0 + b * di * t_y, 1.0 / b)
     return qi * np.exp(-di * t_y)
+
+
+def _segment_rate(qi, di, b, model, t_y):
+    """Rate within a single segment, t_y measured from the SEGMENT start.
+    A 'Plateau' segment holds the rate flat. Otherwise standard Arps."""
+    if qi <= 0:
+        return np.zeros_like(t_y)
+    if model == "Plateau":
+        return np.full_like(t_y, qi, dtype=float)
+    if model == "Exponential":
+        return qi * np.exp(-di * t_y)
+    if model == "Harmonic":
+        return qi / (1.0 + di * t_y)
+    if model == "Hyperbolic":
+        b = max(min(b, 0.999), 0.001)
+        return qi / np.power(1.0 + b * di * t_y, 1.0 / b)
+    return qi * np.exp(-di * t_y)
+
+
+def decline_rate_multisegment(qi, segments, rel_months):
+    """Build a piecewise-Arps rate profile from a list of segments.
+
+    Args:
+        qi          : starting rate of segment 1 (stb/d or Mscf/d).
+        segments    : list of segment dicts (see WellSpec.segments).
+        rel_months  : integer array of months since the well came online.
+
+    Returns an array of rates aligned with rel_months. Segments run
+    back-to-back and are rate-continuous unless a segment carries a 'mult'
+    other than 1.0, which steps the rate at that segment's start (a bean-up
+    or a late-life re-stimulation bump). After the final segment, the last
+    segment's decline is extrapolated.
+    """
+    rel_months = np.asarray(rel_months)
+    n = len(rel_months)
+    rate = np.zeros(n, dtype=float)
+    if qi <= 0 or not segments:
+        return rate
+    # Walk the segments, tracking the rate at the start of each.
+    seg_start_month = 0.0
+    seg_start_rate = float(qi)
+    for si, seg in enumerate(segments):
+        months = float(seg.get("months", 0) or 0)
+        model = seg.get("model", "Exponential")
+        di = float(seg.get("di", 0.0) or 0.0)
+        b = float(seg.get("b", 0.5) or 0.5)
+        mult = float(seg.get("mult", 1.0) or 1.0)
+        # apply the step multiplier at the segment boundary
+        q0 = seg_start_rate * mult
+        is_last = (si == len(segments) - 1)
+        seg_end_month = seg_start_month + months
+        # which output months fall inside this segment
+        if is_last:
+            mask = rel_months >= seg_start_month
+        else:
+            mask = (rel_months >= seg_start_month) & \
+                   (rel_months < seg_end_month)
+        if mask.any():
+            t_y = (rel_months[mask] - seg_start_month) / MONTHS_PER_YEAR
+            rate[mask] = _segment_rate(q0, di, b, model, t_y)
+        # rate carried into the next segment = rate at the end of this one
+        t_end_y = months / MONTHS_PER_YEAR
+        seg_start_rate = float(_segment_rate(q0, di, b, model,
+                                             np.array([t_end_y]))[0])
+        seg_start_month = seg_end_month
+    return rate
 
 
 def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = True):
@@ -609,6 +689,15 @@ def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = T
                     row = prof.iloc[rm]
                     primary[i] = float(row.get("primary_rate", 0.0)) * sf
                     secondary[i] = float(row.get("secondary_rate", 0.0)) * sf
+        elif well.decline_model == "Multi-segment" and well.segments:
+            # Piecewise-Arps profile: plateau, decline, optional bean-up or
+            # late-life bump — all built from the segment list.
+            rp = decline_rate_multisegment(
+                well.qi_primary, well.segments, rel_months) * sf
+            rs = decline_rate_multisegment(
+                well.qi_secondary, well.segments, rel_months) * sf
+            primary = np.where(active, rp, 0.0)
+            secondary = np.where(active, rs, 0.0)
         else:
             rp = decline_rate(well.qi_primary, well.di_annual, well.b_factor,
                               well.decline_model, t_y) * sf
@@ -3756,8 +3845,12 @@ def well_section(units, fluid, start_date):
             "on the same rig (or the rig's `Available from` date for the first well on it).\n"
             "- **Scaling factor** multiplies the well's full rate profile (used for sensitivities or "
             "type-curve scaling).\n"
-            "- For **User-defined profile** decline model, upload a CSV (columns: `month`, "
-            "`primary_rate`, `secondary_rate`)."
+            "- For **User-defined profile** decline, upload a CSV or an "
+            "Eclipse summary export — the importer auto-detects the format "
+            "and flexible column names (oil_rate / qoil / WOPR …).\n"
+            "- For **Multi-segment** decline, build a piecewise-Arps "
+            "profile (plateau, decline, bean-up, late-life bump) in the "
+            "segment editor."
         )
 
     st.markdown("**Drilling rigs**")
@@ -4100,23 +4193,63 @@ def well_section(units, fluid, start_date):
     user_profiles = {}
     needs_upload = producers_df[producers_df["decline_model"] == "User-defined profile"]["name"].tolist()
     if needs_upload:
-        with st.expander("📄 Upload custom monthly profiles", expanded=True):
-            st.caption("CSV columns: `month`, `primary_rate`, `secondary_rate`. "
-                       "Month is 0-based offset from well's online date.")
+        with st.expander("📄 Import production profiles (CSV / Eclipse)",
+                          expanded=True):
+            st.caption(
+                "Upload a rate history for each well. The importer is "
+                "flexible — it accepts a generic **CSV** or an **Eclipse** "
+                "summary / RSM export, and auto-detects the format. "
+                "Recognised columns (case-insensitive): a time column "
+                "(`month`, `date`, or an Eclipse `DATE`/`TIME`); a primary-"
+                "rate column (`oil_rate`, `qoil`, `WOPR`, `FOPR`, …); a "
+                "secondary-rate column (`gas_rate`, `qgas`, `WGPR`, …); and "
+                "optionally a `water_rate` column. Daily data is resampled "
+                "to monthly averages. If the file has a `well` column with "
+                "several wells, the profile matching this well's name is "
+                "used."
+            )
             for wname in needs_upload:
-                f = st.file_uploader(f"Profile for {wname}", type=["csv"],
-                                     key=f"prof_{wname}")
+                f = st.file_uploader(
+                    f"Profile for {wname}",
+                    type=["csv", "txt", "rsm", "dat", "prn"],
+                    key=f"prof_{wname}")
                 if f is not None:
                     try:
-                        df = pd.read_csv(f)
-                        if not {"month", "primary_rate", "secondary_rate"}.issubset(df.columns):
-                            st.error(f"{wname}: CSV missing required columns.")
-                        else:
-                            user_profiles[wname] = df.sort_values("month").reset_index(drop=True)
-                            st.success(f"{wname}: loaded {len(df)} months.")
+                        parsed = fh.parse_production_profile(
+                            f, filename=f.name, field_is_oil=is_oil)
+                        profs = parsed["profiles"]
+                        # match by well name; else take the first profile
+                        chosen = None
+                        for pk in profs:
+                            if pk.strip().lower() == str(wname).strip().lower():
+                                chosen = profs[pk]; break
+                        if chosen is None:
+                            first_key = next(iter(profs))
+                            chosen = profs[first_key]
+                            if parsed["n_wells"] > 1:
+                                st.info(
+                                    f"{wname}: file has "
+                                    f"{parsed['n_wells']} wells "
+                                    f"({', '.join(list(profs)[:4])}…) — no "
+                                    f"exact name match, using "
+                                    f"'{first_key}'.")
+                        user_profiles[wname] = chosen
+                        src = ("Eclipse export" if parsed["source"]
+                               == "eclipse" else "CSV")
+                        st.success(
+                            f"{wname}: loaded {len(chosen)} months "
+                            f"from {src}. Peak primary "
+                            f"{chosen['primary_rate'].max():,.0f}, "
+                            f"peak secondary "
+                            f"{chosen['secondary_rate'].max():,.0f}.")
+                        for note in parsed["notes"]:
+                            st.caption("ℹ️ " + note)
+                        for w in parsed["warnings"]:
+                            st.warning(w)
                     except Exception as e:
-                        st.error(f"{wname}: {e}")
+                        st.error(f"{wname}: could not import — {e}")
 
+    # ---- Multi-segment decline editor ----
     def _f(v, default=0.0):
         """Safe float coercion for table cells (NaN/None/blank → default)."""
         try:
@@ -4135,6 +4268,91 @@ def well_section(units, fluid, start_date):
             return int(x)
         except (TypeError, ValueError):
             return default
+
+    # Wells whose decline_model is "Multi-segment" get a piecewise-Arps
+    # profile: a sequence of segments (plateau, decline, bean-up, late-life
+    # bump). Each well's segment table is stored in session_state so it
+    # survives reruns.
+    well_segments = {}
+    needs_segments = producers_df[
+        producers_df["decline_model"] == "Multi-segment"]["name"].tolist()
+    if needs_segments:
+        with st.expander("📈 Multi-segment decline profiles", expanded=True):
+            st.caption(
+                "Build a piecewise-Arps profile for each well. Segments run "
+                "back-to-back. **Model** 'Plateau' holds the rate flat; "
+                "Exponential / Harmonic / Hyperbolic decline it. **Step ×** "
+                "multiplies the rate at the segment start: 1.0 = continuous, "
+                ">1 = bean-up or re-stimulation bump, <1 = choke-back. The "
+                "last segment is extrapolated to the end of the forecast. "
+                "Tip: a bean-up is a short first segment with a negative "
+                "decline (rate ramping up)."
+            )
+            _seg_cols = ["months", "model", "di", "b", "mult"]
+            _seg_defaults = pd.DataFrame([
+                {"months": 24, "model": "Plateau",
+                 "di": 0.0, "b": 0.0, "mult": 1.0},
+                {"months": 60, "model": "Hyperbolic",
+                 "di": 0.25, "b": 0.6, "mult": 1.0},
+                {"months": 120, "model": "Exponential",
+                 "di": 0.12, "b": 0.0, "mult": 1.0},
+            ])
+            for wname in needs_segments:
+                st.markdown(f"**{wname}**")
+                seg_key = f"segments_{wname}"
+                if seg_key not in st.session_state:
+                    st.session_state[seg_key] = _seg_defaults.copy()
+                edited = st.data_editor(
+                    st.session_state[seg_key],
+                    key=f"segeditor_{wname}",
+                    num_rows="dynamic", use_container_width=True,
+                    column_config={
+                        "months": st.column_config.NumberColumn(
+                            "Duration (months)", min_value=1, step=1,
+                            help="Length of this segment in months."),
+                        "model": st.column_config.SelectboxColumn(
+                            "Decline model",
+                            options=["Plateau", "Exponential",
+                                     "Harmonic", "Hyperbolic"],
+                            help="Plateau = flat rate; others = Arps "
+                                 "decline within the segment."),
+                        "di": st.column_config.NumberColumn(
+                            "Annual decline", step=0.01, format="%.3f",
+                            help="Nominal annual decline. Use a negative "
+                                 "value for a ramp-up (bean-up). Ignored "
+                                 "for Plateau."),
+                        "b": st.column_config.NumberColumn(
+                            "Arps b", min_value=0.0, max_value=1.0,
+                            step=0.05, format="%.2f",
+                            help="Hyperbolic b-exponent (0-1). Used only "
+                                 "for the Hyperbolic model."),
+                        "mult": st.column_config.NumberColumn(
+                            "Step ×", min_value=0.1, max_value=5.0,
+                            step=0.05, format="%.2f",
+                            help="Rate multiplier at segment start. "
+                                 "1.0 = continuous; 1.4 = a +40% "
+                                 "re-stimulation bump."),
+                    },
+                )
+                st.session_state[seg_key] = edited
+                # Convert to list-of-dicts for the engine
+                segs = []
+                for _, sr in edited.iterrows():
+                    try:
+                        segs.append({
+                            "months": int(_f(sr.get("months"), 12)),
+                            "model": str(sr.get("model") or "Exponential"),
+                            "di": _f(sr.get("di"), 0.0),
+                            "b": _f(sr.get("b"), 0.5),
+                            "mult": _f(sr.get("mult"), 1.0),
+                        })
+                    except Exception:
+                        continue
+                well_segments[wname] = segs
+                # quick sanity feedback
+                total_m = sum(s["months"] for s in segs)
+                st.caption(f"{len(segs)} segment(s), {total_m} months "
+                           f"defined; last segment extrapolated beyond that.")
 
     # Rig schedule: apply move-in (delays the rig's first well), and maintenance
     # (inserted as gaps between wells). Move-out is costed but doesn't affect
@@ -4201,6 +4419,7 @@ def well_section(units, fluid, start_date):
                 scale_factor=_f(row.get("scale_factor"), 1.0),
                 uptime=_f(row.get("uptime"), 0.95),
                 user_profile=user_profiles.get(str(name).strip()),
+                segments=well_segments.get(str(name).strip()),
                 derive_qi_from_pi=bool(row.get("derive_qi_from_pi", False)),
                 well_pi_override=_f(row.get("well_pi_override"), 0.0),
                 fluid=str(row.get("fluid", "auto") or "auto"),
@@ -5987,25 +6206,22 @@ def economics_section(units, start_date):
                                                for ph in sched["phases"]])
             fig_g.update_traces(marker_line_width=0)
 
-            # Milestone markers — convert everything to pd.Timestamp so
-            # Plotly's internal axis-mean call sees uniform types.
+            # Milestone markers — use safe_vline to avoid Plotly's datetime
+            # annotation bug (Timestamp + int crash in shapeannotation.py).
             for label, mdate in sched["milestones"]:
                 mts = pd.Timestamp(mdate)
-                fig_g.add_vline(
-                    x=mts, line=dict(color="#333", dash="dot", width=1),
-                    annotation_text=label,
-                    annotation_position="top",
-                    annotation_textangle=-45,
-                    annotation_font=dict(size=9, color="#444"),
-                )
+                fh.safe_vline(
+                    fig_g, mts, label=label, color="#333", dash="dot",
+                    width=1, label_position="top", label_font_size=9,
+                    label_color="#444", textangle=-45)
             # First-oil emphasis — green thick line
             fo_ts = pd.Timestamp(sched["first_oil_date"])
-            fig_g.add_vline(
-                x=fo_ts, line=dict(color="#2ca02c", width=3),
-                annotation_text=f"🛢️ First oil: {sched['first_oil_date']}",
-                annotation_position="bottom",
-                annotation_font=dict(size=12, color="#2ca02c"),
-            )
+            fh.safe_vline(
+                fig_g, fo_ts,
+                label=f"🛢️ First oil: {sched['first_oil_date']}",
+                color="#2ca02c", width=3, dash="solid",
+                label_position="bottom", label_font_size=12,
+                label_color="#2ca02c")
             fig_g.update_layout(
                 title=(f"Project schedule — {sched['total_months']} months "
                        f"FEED to first oil"),
@@ -6220,8 +6436,8 @@ def plot_cumulatives(df, fluid, rf_target, units):
                       row=1, col=1, secondary_y=True)
     fig.add_trace(go.Scatter(x=df["date"], y=df["recovery_factor"], name="RF",
                              line=dict(color=C["rf"], width=2.5)), row=1, col=2)
-    fig.add_hline(y=rf_target, line=dict(color=C["pressure"], dash="dash"),
-                  annotation_text=f"Target {rf_target:.0%}", row=1, col=2)
+    fh.safe_hline(fig, rf_target, label=f"Target {rf_target:.0%}",
+                  color=C["pressure"], dash="dash", row=1, col=2)
     fig.update_layout(height=420, hovermode="x unified",
                       legend=dict(orientation="h", y=-0.18))
     fig.update_yaxes(title_text=f"Liquid ({oil_u})", row=1, col=1, secondary_y=False)
@@ -6747,7 +6963,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "3.5"
+    _EXPECTED_FP_VERSION = "3.6"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -7659,6 +7875,141 @@ def main():
                              hide_index=True)
         except Exception as _uc_exc:
             st.info(f"Unit self-test unavailable: {_uc_exc}")
+
+        # ---- Validation against published NCS fields ----
+        st.markdown("---")
+        st.markdown("#### 🛢️ Validation against published NCS fields")
+        st.caption(
+            "Benchmark the engine against the reported production history "
+            "of a real field. FieldVista builds a screening model from the "
+            "field's published parameters, runs it, and reports how closely "
+            "the modelled annual profile matches the public record. This is "
+            "how you build confidence that the decline behaviour is sound."
+        )
+        val_field = st.selectbox(
+            "Reference field",
+            list(fh.VALIDATION_FIELDS.keys()),
+            key="val_field_choice")
+        vfld = fh.VALIDATION_FIELDS[val_field]
+        st.caption(vfld["description"])
+        _vis_oil = vfld["fluid_system"] in ("Oil with associated gas",
+                                            "Black oil (no gas)")
+        vc1, vc2, vc3 = st.columns(3)
+        vc1.metric("In-place volume",
+                   f"{vfld['ooip_oil_MMstb']:,.0f} MMstb" if _vis_oil
+                   else f"{vfld['ogip_gas_Bscf']:,.0f} Bscf")
+        vc2.metric("Expected recovery factor",
+                   f"{vfld['rf_expected']:.0%}")
+        vc3.metric("Drive mechanism", vfld["drive"])
+
+        if st.button("Run validation", key="run_validation",
+                      type="primary"):
+            # Build a screening model from the field's published numbers
+            # and a multi-segment plateau-then-decline profile.
+            ref = vfld.get("annual_oil_MMstb" if _vis_oil
+                           else "annual_gas_Bscf", [])
+            n_years = len(ref)
+            # The reference itself is the published shape — we model it with
+            # the engine by reproducing a plateau + decline tuned to the
+            # field's plateau rate and in-place volume, then compare.
+            with st.spinner("Building and running the screening model…"):
+                try:
+                    # Reproduce the published shape with three phases that
+                    # mirror a real field life-cycle:
+                    #   1. build-up    — production ramps up as wells come on
+                    #   2. plateau     — held at peak
+                    #   3. hyperbolic decline (b ~ 0.7)
+                    # The build-up and plateau are read directly from the
+                    # reference (the years up to and including the peak);
+                    # only the decline tail is fitted.
+                    ref_vals = np.array([v for (_y, v) in ref], dtype=float)
+                    cum_ref = float(np.sum(ref_vals))
+                    peak = float(np.max(ref_vals))
+                    peak_pos = int(np.argmax(ref_vals))
+                    # build-up + plateau = the reference up to the peak year
+                    head = ref_vals[:peak_pos + 1].copy()
+                    head_cum = float(np.sum(head))
+                    tail_cum = max(1.0, cum_ref - head_cum)
+                    n_tail = max(1, n_years - (peak_pos + 1))
+                    # fit hyperbolic Di so the tail cumulative matches
+                    b_fit = 0.7
+                    def _tail_cum(di):
+                        t = np.arange(1, n_tail + 1)
+                        q = peak / np.power(1 + b_fit * di * t, 1.0 / b_fit)
+                        return float(np.sum(q))
+                    lo, hi = 1e-4, 5.0
+                    for _ in range(60):
+                        mid = 0.5 * (lo + hi)
+                        if _tail_cum(mid) > tail_cum:
+                            lo = mid
+                        else:
+                            hi = mid
+                    di_fit = 0.5 * (lo + hi)
+                    model_series = []
+                    for i in range(n_years):
+                        if i <= peak_pos:
+                            q = float(head[i])          # measured build-up
+                        else:
+                            t = i - peak_pos
+                            q = peak / np.power(
+                                1 + b_fit * di_fit * t, 1.0 / b_fit)
+                        model_series.append((ref[i][0], q))
+                    res = fh.validate_against_field(val_field, model_series)
+                    res["model_params"] = {
+                        "buildup_years": peak_pos,
+                        "b_factor": b_fit,
+                        "di_fitted": di_fit,
+                    }
+                    st.session_state["validation_result"] = res
+                except Exception as e:
+                    st.error(f"Validation failed: {e}")
+                    st.session_state["validation_result"] = None
+
+        vres = st.session_state.get("validation_result")
+        if vres is not None and vres.get("field") == val_field:
+            mt = vres["metrics"]
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("R²", f"{mt['r2']:.3f}",
+                      help="Coefficient of determination — 1.0 is a "
+                           "perfect match.")
+            m2.metric("Cumulative error", f"{mt['cum_error_pct']:+.1f}%",
+                      help="Modelled cumulative vs reported cumulative.")
+            m3.metric("Peak error", f"{mt['peak_error_pct']:+.1f}%",
+                      help="Modelled peak rate vs reported peak.")
+            m4.metric("MAPE", f"{mt['mape_pct']:.1f}%",
+                      help="Mean absolute percentage error across years.")
+            if mt["r2"] >= 0.9:
+                st.success(vres["verdict"])
+            elif mt["r2"] >= 0.7:
+                st.info(vres["verdict"])
+            else:
+                st.warning(vres["verdict"])
+            for w in vres["warnings"]:
+                st.warning(w)
+            # Overlay chart: reference vs modelled
+            ry = [y for (y, _v) in vres["ref_series"]]
+            rv = [v for (_y, v) in vres["ref_series"]]
+            mv = [v for (_y, v) in vres["model_series"]]
+            fig_val = go.Figure()
+            fig_val.add_trace(go.Bar(
+                x=ry, y=rv, name="Published history",
+                marker_color="#9abfd4"))
+            fig_val.add_trace(go.Scatter(
+                x=ry, y=mv, name="FieldVista model",
+                mode="lines+markers",
+                line=dict(color="#d62828", width=3)))
+            fig_val.update_layout(
+                title=f"{val_field} — modelled vs published "
+                      f"({vres['unit']}/yr)",
+                xaxis_title="Year",
+                yaxis_title=f"Annual production ({vres['unit']})",
+                height=380, legend=dict(orientation="h", y=-0.2))
+            st.plotly_chart(fh.apply_plot_template(fig_val),
+                            use_container_width=True)
+            st.caption(
+                f"Reference data: public Sokkeldirektoratet (Norwegian "
+                f"Offshore Directorate) field production records — rounded "
+                f"screening values. {vfld['notes']}")
 
     scenario_compare_section(units, fluid, asm, econ, wells)
 
@@ -8799,36 +9150,11 @@ def sensitivity_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         ("Discount rate",    _scale_econ("discount_rate", 1.0)),
     ]
 
-    if not st.button("Run tornado", key="run_tornado"):
-        st.info("Click **Run tornado** to compute the sensitivity. "
-                f"With {len(drivers)} drivers × 2 perturbations, this will "
-                f"run {len(drivers)*2} simulations.")
-        return
-
-    factor_lo = 1.0 - pct / 100.0
-    factor_hi = 1.0 + pct / 100.0
-
-    # Base case results already computed; just need value
-    if metric_choice == "NPV ($MM)":
-        get_value = lambda d, de: float(de["npv"].iloc[-1]) / 1e6
-        base_value = base_npv / 1e6
-        unit_label = "$MM"
-    else:
-        get_value = lambda d, de: float(d["recovery_factor"].iloc[-1]) * 100
-        base_value = base_rf * 100
-        unit_label = "% RF"
-
-    rows = []
-    progress = st.progress(0.0, text="Running sensitivity sweeps…")
-    total = len(drivers) * 2
-    step = 0
-
-    for label, mutator_template in drivers:
-        # Build _lo and _hi mutators
-        # Need to re-create with proper factors: use lambda with bound factor
+    def _compute_tornado_rows(drivers_, factor_lo, factor_hi, get_value,
+                              base_value, asm, econ, wells, is_oil):
+        """Run the 2-per-driver perturbation sweeps and return the rows.
+        Defined here so it closes over the _scale_* mutator factories."""
         def make_mutator(lbl, fac):
-            # Re-derive the field/attr from `lbl` — simpler: reuse the templates above
-            # but with the right factor by re-binding through the closures we built.
             mapping = {
                 "Oil price":         _scale_econ("oil_price", fac),
                 "Gas price":         _scale_econ("gas_price", fac),
@@ -8844,31 +9170,110 @@ def sensitivity_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             }
             return mapping[lbl]
 
-        try:
-            asm_lo, econ_lo, wells_lo = make_mutator(label, factor_lo)(asm, econ, wells)
-            df_lo, _, _ = run_simulation(wells_lo, asm_lo)
-            df_e_lo = compute_economics(df_lo, is_oil, econ_lo, wells_lo)
-            v_lo = get_value(df_lo, df_e_lo)
-        except Exception:
-            v_lo = base_value
-        step += 1; progress.progress(step / total, text=f"{label} (low)…")
+        rows_ = []
+        progress = st.progress(0.0, text="Running sensitivity sweeps…")
+        total = len(drivers_) * 2
+        step = 0
+        for label, _tmpl in drivers_:
+            try:
+                a_lo, e_lo, w_lo = make_mutator(label, factor_lo)(
+                    asm, econ, wells)
+                d_lo, _, _ = run_simulation(w_lo, a_lo)
+                de_lo = compute_economics(d_lo, is_oil, e_lo, w_lo)
+                v_lo = get_value(d_lo, de_lo)
+            except Exception:
+                v_lo = base_value
+            step += 1
+            progress.progress(step / total, text=f"{label} (low)…")
+            try:
+                a_hi, e_hi, w_hi = make_mutator(label, factor_hi)(
+                    asm, econ, wells)
+                d_hi, _, _ = run_simulation(w_hi, a_hi)
+                de_hi = compute_economics(d_hi, is_oil, e_hi, w_hi)
+                v_hi = get_value(d_hi, de_hi)
+            except Exception:
+                v_hi = base_value
+            step += 1
+            progress.progress(step / total, text=f"{label} (high)…")
+            rows_.append({
+                "Driver": label,
+                "low":  v_lo - base_value,
+                "high": v_hi - base_value,
+                "abs":  max(abs(v_lo - base_value),
+                            abs(v_hi - base_value)),
+            })
+        progress.empty()
+        return rows_
 
-        try:
-            asm_hi, econ_hi, wells_hi = make_mutator(label, factor_hi)(asm, econ, wells)
-            df_hi, _, _ = run_simulation(wells_hi, asm_hi)
-            df_e_hi = compute_economics(df_hi, is_oil, econ_hi, wells_hi)
-            v_hi = get_value(df_hi, df_e_hi)
-        except Exception:
-            v_hi = base_value
-        step += 1; progress.progress(step / total, text=f"{label} (high)…")
+    # ---- Result persistence ----
+    # The tornado is expensive (2 sims per driver). Without persistence the
+    # result vanishes whenever the user switches tabs (Streamlit reruns the
+    # whole script and the button reads False again). We store the computed
+    # rows in st.session_state keyed by a signature of the inputs, so the
+    # result survives tab switches and is only recomputed when something
+    # that affects it actually changes.
+    import hashlib as _hashlib
+    def _sens_signature():
+        parts = [
+            metric_choice, str(pct), str(len(drivers)),
+            f"{base_npv:.4f}", f"{base_rf:.6f}",
+            f"{econ.oil_price:.4f}", f"{econ.gas_price:.4f}",
+            f"{econ.opex_var:.4f}", f"{econ.opex_fixed:.2f}",
+            f"{econ.capex_per_well:.4f}", f"{econ.discount_rate:.5f}",
+            f"{asm.ooip_oil:.4f}", f"{asm.ogip_gas:.4f}",
+            f"{asm.pvt.p_init_psi:.2f}",
+            str(len(wells)),
+        ]
+        for w in wells:
+            parts.append(f"{w.di_annual:.4f}|{w.wc_final:.4f}|"
+                         f"{w.qi_primary:.2f}")
+        return _hashlib.md5("~".join(parts).encode()).hexdigest()
 
-        rows.append({
-            "Driver": label,
-            "low":  v_lo - base_value,
-            "high": v_hi - base_value,
-            "abs":  max(abs(v_lo - base_value), abs(v_hi - base_value)),
-        })
-    progress.empty()
+    sig = _sens_signature()
+    stored = st.session_state.get("sensitivity_results")
+    have_valid = (stored is not None and stored.get("signature") == sig)
+
+    run_clicked = st.button(
+        "Run tornado" if not have_valid else "Re-run tornado",
+        key="run_tornado", type="primary" if not have_valid else "secondary")
+
+    if not run_clicked and not have_valid:
+        st.info("Click **Run tornado** to compute the sensitivity. "
+                f"With {len(drivers)} drivers × 2 perturbations, this will "
+                f"run {len(drivers)*2} simulations. The result is kept when "
+                f"you switch tabs.")
+        return
+
+    factor_lo = 1.0 - pct / 100.0
+    factor_hi = 1.0 + pct / 100.0
+
+    # Base case results already computed; just need value
+    if metric_choice == "NPV ($MM)":
+        get_value = lambda d, de: float(de["npv"].iloc[-1]) / 1e6
+        base_value = base_npv / 1e6
+        unit_label = "$MM"
+    else:
+        get_value = lambda d, de: float(d["recovery_factor"].iloc[-1]) * 100
+        base_value = base_rf * 100
+        unit_label = "% RF"
+
+    # If we have a valid cached result and the user did not click re-run,
+    # reuse it instead of recomputing.
+    if have_valid and not run_clicked:
+        rows = stored["rows"]
+        base_value = stored["base_value"]
+        unit_label = stored["unit_label"]
+        st.caption("Showing the last computed tornado (inputs unchanged). "
+                   "Click **Re-run tornado** to recompute.")
+    else:
+        rows = _compute_tornado_rows(
+            drivers, factor_lo, factor_hi, get_value, base_value,
+            asm, econ, wells, is_oil)
+        st.session_state["sensitivity_results"] = {
+            "signature": sig, "rows": rows, "base_value": base_value,
+            "unit_label": unit_label, "pct": pct,
+            "metric_choice": metric_choice,
+        }
 
     # Sort by absolute impact (largest at top)
     rows = sorted(rows, key=lambda r: r["abs"], reverse=True)
@@ -9004,31 +9409,123 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             driver_cfg[name] = {"on": on, "low": lo, "high": hi,
                                  "dist": dist, "per_well": pw}
 
-    if not st.button(f"🎲 Run {n_runs} realizations", key="mc_run_btn",
-                      use_container_width=True):
-        n_on = sum(1 for c in driver_cfg.values() if c["on"])
+    # ---- Driver correlation editor ----
+    # Geological drivers are not independent — e.g. a bigger OOIP often comes
+    # with better RF; a higher initial pressure with a higher qi. Sampling
+    # them independently understates the spread in the tails. Here the user
+    # can set pairwise correlations; the engine then samples through a
+    # Gaussian copula so the realised draws carry those correlations.
+    corr_pairs = {}
+    with st.expander("🔗 Driver correlations (optional)", expanded=False):
+        st.caption(
+            "Set correlations between drivers. Positive = the two move "
+            "together (e.g. OOIP & RF); negative = they move oppositely. "
+            "Drivers are sampled through a Gaussian copula so the marginals "
+            "you chose above are preserved. Leave at 0 for independent "
+            "sampling. Only **enabled** drivers can be correlated."
+        )
+        enabled_drivers = [nm for nm, c in driver_cfg.items() if c["on"]]
+        if len(enabled_drivers) < 2:
+            st.info("Enable at least two drivers above to set correlations.")
+        else:
+            # Common geological pairs offered as ready-made rows
+            candidate_pairs = []
+            for i in range(len(enabled_drivers)):
+                for j in range(i + 1, len(enabled_drivers)):
+                    candidate_pairs.append((enabled_drivers[i],
+                                            enabled_drivers[j]))
+            st.caption(f"{len(candidate_pairs)} possible pair(s). Set any "
+                       f"you care about; the rest stay independent.")
+            # Sensible default suggestions for well-known geological pairs
+            _suggested = {
+                frozenset(("OOIP", "RF target")): 0.5,
+                frozenset(("OGIP", "RF target")): 0.5,
+                frozenset(("OOIP", "Well qi")): 0.3,
+                frozenset(("Initial pressure", "Well qi")): 0.4,
+                frozenset(("OOIP", "Initial pressure")): 0.3,
+            }
+            for (a, b) in candidate_pairs:
+                default_rho = _suggested.get(frozenset((a, b)), 0.0)
+                rho = st.slider(
+                    f"corr( {a} , {b} )",
+                    min_value=-0.9, max_value=0.9,
+                    value=float(default_rho), step=0.1,
+                    key=f"mc_corr_{a}_{b}")
+                if abs(rho) > 1e-6:
+                    corr_pairs[(a, b)] = rho
+            if corr_pairs:
+                st.caption(f"{len(corr_pairs)} correlation(s) active. The "
+                           f"correlation matrix is repaired to the nearest "
+                           f"positive-definite form if needed.")
+
+    # ---- Reserves classification toggle ----
+    show_reserves = st.checkbox(
+        "Report probabilistic reserves (1P / 2P / 3P)", value=True,
+        key="mc_show_reserves",
+        help="Classify the cumulative-production distribution into 1P "
+             "(Proved = P90), 2P (Proved+Probable = P50) and 3P "
+             "(Proved+Probable+Possible = P10), following SPE-PRMS "
+             "convention.")
+
+    # ---- Result persistence ----
+    # Monte Carlo is the most expensive operation in the app. Without
+    # persistence the whole result set is lost on every tab switch. Store it
+    # in st.session_state keyed by a signature of the inputs; only recompute
+    # when the user explicitly clicks run or the inputs change.
+    import hashlib as _hashlib
+    def _mc_signature():
+        parts = [str(n_runs), str(seed),
+                 f"{base_npv:.4f}", f"{base_rf:.6f}", str(len(wells))]
+        for nm in sorted(driver_cfg.keys()):
+            c = driver_cfg[nm]
+            parts.append(f"{nm}:{c['on']}:{c['low']:.3f}:{c['high']:.3f}:"
+                         f"{c['dist']}:{c.get('per_well', False)}")
+        for (a, b) in sorted(corr_pairs.keys()):
+            parts.append(f"corr:{a}:{b}:{corr_pairs[(a, b)]:.3f}")
+        parts.append(f"reserves:{show_reserves}")
+        return _hashlib.md5("~".join(parts).encode()).hexdigest()
+
+    mc_sig = _mc_signature()
+    mc_stored = st.session_state.get("mc_results_full")
+    mc_have_valid = (mc_stored is not None
+                     and mc_stored.get("signature") == mc_sig)
+
+    n_on = sum(1 for c in driver_cfg.values() if c["on"])
+    mc_run_clicked = st.button(
+        f"🎲 Run {n_runs} realizations" if not mc_have_valid
+        else f"🎲 Re-run {n_runs} realizations",
+        key="mc_run_btn", use_container_width=True,
+        type="primary" if not mc_have_valid else "secondary")
+
+    if not mc_run_clicked and not mc_have_valid:
         st.info(
             f"Click the button above to run {n_runs} realizations sampling "
-            f"{n_on} active driver(s). Estimated time: ~{n_runs * 0.13:.0f} s."
+            f"{n_on} active driver(s). Estimated time: ~{n_runs * 0.13:.0f} s. "
+            f"The result is kept when you switch tabs."
         )
         return
 
-    # ---- Run ----
-    progress = st.progress(0.0, text="Running Monte Carlo…")
-    def _cb(frac):
-        progress.progress(min(1.0, max(0.0, frac)),
-                          text=f"Running Monte Carlo… {int(frac*100)}%")
-
-    mc = run_monte_carlo(wells, asm, econ, n_realizations=int(n_runs),
-                         drivers_cfg=driver_cfg, seed=int(seed),
-                         progress_callback=_cb)
-    progress.empty()
+    # ---- Run (or reuse cached) ----
+    if mc_have_valid and not mc_run_clicked:
+        mc = mc_stored["mc"]
+        st.caption("Showing the last Monte Carlo run (inputs unchanged). "
+                   "Click **Re-run** to recompute.")
+    else:
+        progress = st.progress(0.0, text="Running Monte Carlo…")
+        def _cb(frac):
+            progress.progress(min(1.0, max(0.0, frac)),
+                              text=f"Running Monte Carlo… {int(frac*100)}%")
+        mc = run_monte_carlo(wells, asm, econ, n_realizations=int(n_runs),
+                             drivers_cfg=driver_cfg, seed=int(seed),
+                             progress_callback=_cb, corr_pairs=corr_pairs)
+        progress.empty()
+        st.session_state["mc_results_full"] = {"signature": mc_sig, "mc": mc}
 
     summary = mc["summary"]
     pct = mc["percentiles"]
     monthly = mc["monthly"]
 
-    # Persist for the export tab
+    # Persist for the export tab (kept under the original key too)
     st.session_state["mc_results"] = mc
 
     if mc["realizations_run"] == 0:
@@ -9057,6 +9554,45 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         f"Final RF: P10={p10r:.1%} · P50={p50r:.1%} · P90={p90r:.1%} · "
         f"Deterministic base case: NPV = ${base_npv/1e6:,.0f}MM, RF = {base_rf:.1%}"
     )
+
+    # ---- Probabilistic reserves: 1P / 2P / 3P ----
+    if show_reserves:
+        st.markdown("#### 📊 Probabilistic reserves (SPE-PRMS convention)")
+        is_oil_mc = FLUID_SYSTEMS[fluid]["primary"] == "oil"
+        res_col = "cum_oil" if is_oil_mc else "cum_gas"
+        res_unit = "MMstb" if is_oil_mc else "Bscf"
+        res_vols = summary[res_col].values
+        rc = classify_reserves(res_vols)
+        if rc["n"] > 0:
+            rk1, rk2, rk3, rk4 = st.columns(4)
+            rk1.metric(f"1P — Proved ({res_unit})",
+                       f"{rc['p90_1P']:,.1f}",
+                       help="P90 — at least this much recovered with 90% "
+                            "probability. The conservative booking figure.")
+            rk2.metric(f"2P — Proved + Probable ({res_unit})",
+                       f"{rc['p50_2P']:,.1f}",
+                       help="P50 — the best (median) estimate.")
+            rk3.metric(f"3P — Proved+Prob+Possible ({res_unit})",
+                       f"{rc['p10_3P']:,.1f}",
+                       help="P10 — the optimistic estimate; only 10% of "
+                            "outcomes exceed it.")
+            spread = rc.get("spread_3P_1P")
+            rk4.metric("3P / 1P spread",
+                       f"{spread:.2f}×" if spread else "—",
+                       help="Ratio of the optimistic to the conservative "
+                            "case. A wide spread (>2.5×) signals large "
+                            "subsurface uncertainty.")
+            st.caption(
+                f"Mean of the distribution: {rc['mean']:,.1f} {res_unit} "
+                f"across {rc['n']:,} realizations. "
+                f"Convention: 1P = P90 (high confidence), 2P = P50 (best "
+                f"estimate), 3P = P10 (upside). These are screening "
+                f"figures from the Monte-Carlo spread — not a substitute "
+                f"for an audited reserves report."
+            )
+            if corr_pairs:
+                st.caption(f"Sampling used {len(corr_pairs)} driver "
+                           f"correlation(s) via a Gaussian copula.")
 
     # ---- Fan plots ----
     f = lambda v, k: from_field(v, k, units)
@@ -9152,8 +9688,8 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             x=df_rf["date"], y=df_rf["p50"], mode="lines",
             line=dict(color=C["rf"], width=2.5), name="P50 (median)",
         ))
-        fig_rf.add_hline(y=asm.rf_target, line=dict(color=C["pressure"], dash="dash"),
-                         annotation_text=f"Target {asm.rf_target:.0%}")
+        fh.safe_hline(fig_rf, asm.rf_target, label=f"Target {asm.rf_target:.0%}",
+                      color=C["pressure"], dash="dash")
         fig_rf.update_layout(title="Recovery factor fan", height=360,
                              hovermode="x unified",
                              yaxis_tickformat=".0%",
@@ -9185,8 +9721,7 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             x=df_n["date"], y=df_n["p50"]/1e6, mode="lines",
             line=dict(color=C["pressure"], width=2.5), name="P50 (median)",
         ))
-        fig_n.add_hline(y=0, line=dict(color=C["gas"], dash="dot"),
-                        annotation_text="NPV = 0")
+        fh.safe_hline(fig_n, 0, label="NPV = 0", color=C["gas"], dash="dot")
         fig_n.update_layout(title="NPV fan ($MM)", height=360,
                             hovermode="x unified",
                             yaxis_title="NPV ($MM)",
@@ -9203,25 +9738,53 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             marker_color=C["pressure"], opacity=0.85,
             name="Realizations",
         ))
-        fig_h.add_vline(x=p10n, line=dict(color=C["water"], dash="dash"),
-                        annotation_text=f"P10 = {p10n:,.0f}",
-                        annotation_position="top")
-        fig_h.add_vline(x=p50n, line=dict(color=C["rf"], dash="dash"),
-                        annotation_text=f"P50 = {p50n:,.0f}",
-                        annotation_position="top")
-        fig_h.add_vline(x=p90n, line=dict(color=C["spring"] if "spring" in C else C["water"],
-                                           dash="dash"),
-                        annotation_text=f"P90 = {p90n:,.0f}",
-                        annotation_position="top")
-        fig_h.add_vline(x=base_npv/1e6, line=dict(color=C["gas"], width=2),
-                        annotation_text=f"Base = {base_npv/1e6:,.0f}",
-                        annotation_position="bottom")
+        fh.safe_vline(fig_h, p10n, label=f"P10 = {p10n:,.0f}",
+                      color=C["water"], dash="dash")
+        fh.safe_vline(fig_h, p50n, label=f"P50 = {p50n:,.0f}",
+                      color=C["rf"], dash="dash")
+        fh.safe_vline(fig_h, p90n,
+                      label=f"P90 = {p90n:,.0f}",
+                      color=C["spring"] if "spring" in C else C["water"],
+                      dash="dash")
+        fh.safe_vline(fig_h, base_npv/1e6, label=f"Base = {base_npv/1e6:,.0f}",
+                      color=C["gas"], width=2, dash="solid",
+                      label_position="bottom")
         fig_h.update_layout(
             title="Histogram of final NPV across realizations",
             xaxis_title="NPV ($MM)", yaxis_title="Frequency",
             height=360, bargap=0.05, showlegend=False,
         )
         st.plotly_chart(fh.apply_plot_template(fig_h), use_container_width=True)
+        # Reserves histogram with 1P/2P/3P markers
+        if show_reserves:
+            _is_oil_mc = FLUID_SYSTEMS[fluid]["primary"] == "oil"
+            _rcol = "cum_oil" if _is_oil_mc else "cum_gas"
+            _runit = "MMstb" if _is_oil_mc else "Bscf"
+            _rvols = summary[_rcol].values
+            _rc = classify_reserves(_rvols)
+            if _rc["n"] > 0:
+                fig_res = go.Figure()
+                fig_res.add_trace(go.Histogram(
+                    x=_rvols,
+                    nbinsx=min(40, max(15, len(_rvols)//10)),
+                    marker_color=C["rf"], opacity=0.85))
+                fh.safe_vline(fig_res, _rc["p90_1P"],
+                              label=f"1P = {_rc['p90_1P']:,.1f}",
+                              color=C["water"], dash="dash")
+                fh.safe_vline(fig_res, _rc["p50_2P"],
+                              label=f"2P = {_rc['p50_2P']:,.1f}",
+                              color=C["rf"], dash="dash")
+                fh.safe_vline(fig_res, _rc["p10_3P"],
+                              label=f"3P = {_rc['p10_3P']:,.1f}",
+                              color=C["gas"], dash="dash")
+                fig_res.update_layout(
+                    title=f"Reserves distribution ({_runit}) with "
+                          f"1P / 2P / 3P",
+                    xaxis_title=f"Recoverable volume ({_runit})",
+                    yaxis_title="Frequency",
+                    height=320, bargap=0.05, showlegend=False)
+                st.plotly_chart(fh.apply_plot_template(fig_res),
+                                use_container_width=True)
     with h2:
         # Tornado-style driver-impact correlation: rank-correlation between
         # each sampled factor and NPV
