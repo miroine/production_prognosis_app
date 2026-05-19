@@ -1473,6 +1473,7 @@ def run_simulation(wells, asm: FieldAssumptions):
     # decline; with it, the condensate declines faster than the gas once
     # the reservoir crosses the dew point.
     retro_info = None
+    retro_cgr_series = None
     _is_gas_condensate = (not is_oil and
                           FLUID_SYSTEMS[asm.fluid_system]["secondary"]
                           == "condensate")
@@ -1488,12 +1489,17 @@ def run_simulation(wells, asm: FieldAssumptions):
         #                                  × CGR (stb/MMscf)
         new_condensate = field_gas_rate / 1000.0 * retro["cgr"]
         field_oil_rate = new_condensate
+        # NOTE: retro_info holds ONLY scalars. Numpy arrays must never go
+        # into df.attrs — pandas 3.x propagates attrs through concat and
+        # compares them, and comparing arrays raises an ambiguous-truth
+        # ValueError. The CGR series is added as a real DataFrame column
+        # further below instead.
+        retro_cgr_series = np.asarray(retro["cgr"], dtype=float)
         retro_info = {
-            "active": retro["retrograde_active"],
-            "min_cgr": retro["min_cgr"],
-            "cgr0": cgr0,
-            "cgr_series": retro["cgr"],
-            "p_dew": p_dew,
+            "active": bool(retro["retrograde_active"]),
+            "min_cgr": float(retro["min_cgr"]),
+            "cgr0": float(cgr0),
+            "p_dew": float(p_dew),
         }
 
     # Override the legacy field_p / field_s / cum_p / cum_s with the unit-correct
@@ -1632,6 +1638,11 @@ def run_simulation(wells, asm: FieldAssumptions):
         "active_producers": active_p, "active_injectors": active_i,
         "choke_factor": choke,
     })
+
+    # Retrograde producible-CGR series as a real column (never in df.attrs —
+    # arrays in attrs break pandas concat).
+    if retro_cgr_series is not None and len(retro_cgr_series) == n_months:
+        df["producible_cgr"] = retro_cgr_series
 
     # ---- Profile robustness checks ----
     # A set of sanity checks on the generated profile. Anything that looks
@@ -5840,6 +5851,101 @@ def economics_section(units, start_date):
                      "the chosen layout.")
         else:
             template_layout = "clustered"
+
+        # ---- Per-template detailed configuration ----
+        # With 2+ templates the user can optionally define each template
+        # individually: its own slot count and its tie-in topology (which
+        # template or the host it connects to, plus the flowline/umbilical
+        # leg length). This overrides the single-type simple mode.
+        templates_detail = None
+        if n_templates > 1:
+            use_detail = st.checkbox(
+                "Configure each template individually (slots + tie-in)",
+                value=False, key="dc_use_template_detail",
+                help="Off — every template is the same type above. On — "
+                     "set each template's slot count and how it ties in "
+                     "(to the host directly, or daisy-chained to another "
+                     "template), with the flowline / umbilical leg length "
+                     "for that connection. In-field tie-in legs are costed "
+                     "separately from the main tie-back.")
+            if use_detail:
+                tie_options = ["Host"] + [f"T{i+1}"
+                                          for i in range(int(n_templates))]
+                _td_key = f"dc_templates_detail_{int(n_templates)}"
+                if _td_key not in st.session_state:
+                    st.session_state[_td_key] = pd.DataFrame([
+                        {"Template": f"T{i+1}", "Slots": 4,
+                         "Tie-in to": "Host" if i == 0 else "T1",
+                         "Flowline leg (km)": 15.0 if i == 0 else 4.0,
+                         "Umbilical leg (km)": 16.0 if i == 0 else 4.0}
+                        for i in range(int(n_templates))])
+                # keep the row count in sync with n_templates
+                _cur = st.session_state[_td_key]
+                if len(_cur) != int(n_templates):
+                    _cur = pd.DataFrame([
+                        {"Template": f"T{i+1}",
+                         "Slots": int(_cur["Slots"].iloc[i])
+                         if i < len(_cur) else 4,
+                         "Tie-in to": _cur["Tie-in to"].iloc[i]
+                         if i < len(_cur) else ("Host" if i == 0 else "T1"),
+                         "Flowline leg (km)":
+                             float(_cur["Flowline leg (km)"].iloc[i])
+                             if i < len(_cur) else 4.0,
+                         "Umbilical leg (km)":
+                             float(_cur["Umbilical leg (km)"].iloc[i])
+                             if i < len(_cur) else 4.0}
+                        for i in range(int(n_templates))])
+                    st.session_state[_td_key] = _cur
+                edited_td = st.data_editor(
+                    st.session_state[_td_key],
+                    key=f"dc_td_editor_{int(n_templates)}",
+                    use_container_width=True, hide_index=True,
+                    column_config={
+                        "Template": st.column_config.TextColumn(
+                            "Template", disabled=True),
+                        "Slots": st.column_config.NumberColumn(
+                            "Slots", min_value=1, max_value=12, step=1,
+                            help="Well slots on this template."),
+                        "Tie-in to": st.column_config.SelectboxColumn(
+                            "Tie-in to", options=tie_options,
+                            help="Where this template's production routes — "
+                                 "the host, or another template "
+                                 "(daisy-chained)."),
+                        "Flowline leg (km)":
+                            st.column_config.NumberColumn(
+                                "Flowline leg (km)", min_value=0.0,
+                                step=1.0, format="%.1f",
+                                help="Length of the flowline from this "
+                                     "template to its tie-in point."),
+                        "Umbilical leg (km)":
+                            st.column_config.NumberColumn(
+                                "Umbilical leg (km)", min_value=0.0,
+                                step=1.0, format="%.1f"),
+                    })
+                st.session_state[_td_key] = edited_td
+                templates_detail = []
+                for i, row in edited_td.iterrows():
+                    templates_detail.append({
+                        "slots": int(row["Slots"]),
+                        "tie_to": str(row["Tie-in to"]),
+                        "flowline_km": float(row["Flowline leg (km)"]),
+                        "umbilical_km": float(row["Umbilical leg (km)"]),
+                    })
+                # validation feedback
+                _det_slots = sum(t["slots"] for t in templates_detail)
+                if n_subsea_wells > _det_slots:
+                    st.error(f"⚠️ {n_subsea_wells} wells > {_det_slots} "
+                             f"slots across {n_templates} templates.")
+                else:
+                    st.success(f"✓ {n_subsea_wells} wells fit in "
+                               f"{_det_slots} slots "
+                               f"({n_templates} templates).")
+                # self-tie / loop check
+                for i, t in enumerate(templates_detail):
+                    if t["tie_to"] == f"T{i+1}":
+                        st.warning(f"T{i+1} is tied to itself — change its "
+                                   f"tie-in to the host or another "
+                                   f"template.")
         rs1, rs2 = st.columns(2)
         riser_type = rs1.selectbox(
             "Riser type",
@@ -6077,6 +6183,7 @@ def economics_section(units, start_date):
             "template_type": template_type,
             "template_layout": template_layout,
             "n_templates": n_templates,
+            "templates_detail": templates_detail,
             "n_subsea_wells": n_subsea_wells,
             "n_dry_wells": n_dry_wells,
             "n_total_wells": n_subsea_wells + n_dry_wells,
@@ -7450,7 +7557,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "3.9"
+    _EXPECTED_FP_VERSION = "4.0"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -10789,6 +10896,26 @@ def portfolio_section(units, fluid, asm):
         st.info("Pick at least two fields.")
         return
 
+    # ---- Field sequencing ----
+    # Each field can be delayed by a number of months. This is the core
+    # hub-development lever: two fields that both peak at the same time
+    # overwhelm a shared host, but staggering one of them lets the
+    # portfolio fit the capacity. The offset shifts that field's whole
+    # profile later on the common calendar.
+    st.markdown("**Field sequencing** — delay each field's start to test "
+                "staggered development against the shared constraint.")
+    seq_offsets = {}
+    seq_cols = st.columns(min(len(chosen), 4))
+    for i, nm in enumerate(chosen):
+        with seq_cols[i % len(seq_cols)]:
+            seq_offsets[nm] = st.number_input(
+                f"{nm} — delay (months)", min_value=0, max_value=240,
+                value=0, step=6, key=f"portfolio_offset_{nm}",
+                help="Months to delay this field's first production. "
+                     "0 = starts on the common calendar origin. Use this "
+                     "to sequence fields so their peaks do not collide at "
+                     "the shared facility.")
+
     # Shared constraint
     cc1, cc2 = st.columns(2)
     constraint_type = cc1.selectbox(
@@ -10855,15 +10982,33 @@ def portfolio_section(units, fluid, asm):
         st.error("Need at least two fields to roll up.")
         return
 
-    # ---- Align on a common monthly calendar ----
-    all_dates = sorted(set().union(
+    # ---- Align on a common monthly calendar (with sequencing offsets) ----
+    # Each field can be delayed by seq_offsets[nm] months. A delay shifts
+    # that field's whole production profile later on the shared calendar.
+    # The common calendar must be wide enough to hold the most-delayed
+    # field's full life, so it is extended by the largest offset.
+    max_off = max((int(seq_offsets.get(nm, 0)) for nm in fields),
+                  default=0)
+    base_dates = sorted(set().union(
         *[set(pd.to_datetime(f["df"]["date"])) for f in fields.values()]))
-    cal = pd.DatetimeIndex(all_dates)
+    cal = pd.DatetimeIndex(base_dates)
+    if max_off > 0:
+        # extend the calendar by max_off months so delayed fields fit
+        last = cal[-1]
+        extra = pd.date_range(last + pd.DateOffset(months=1),
+                              periods=max_off, freq="MS")
+        cal = cal.append(pd.DatetimeIndex(extra))
     n = len(cal)
 
-    def _aligned(df, col):
-        s = pd.Series(df[col].values,
-                      index=pd.to_datetime(df["date"]))
+    def _aligned(df, col, offset_months=0):
+        """Align a field's series onto the common calendar, optionally
+        shifted later by offset_months."""
+        idx = pd.to_datetime(df["date"])
+        if offset_months:
+            idx = idx + pd.DateOffset(months=int(offset_months))
+        s = pd.Series(df[col].values, index=idx)
+        # collapse any duplicate months created by the offset, then reindex
+        s = s[~s.index.duplicated(keep="first")]
         return s.reindex(cal, fill_value=0.0).values
 
     # ---- Sum the portfolio ----
@@ -10872,11 +11017,13 @@ def portfolio_section(units, fluid, asm):
     port_cf = np.zeros(n)
     per_field = {}
     for nm, f in fields.items():
-        oil = _aligned(f["df"], "oil_rate")
-        gas = _aligned(f["df"], "gas_rate")
-        cf = _aligned(f["df_e"], "cashflow") if "cashflow" in f["df_e"] \
-            else np.zeros(n)
-        per_field[nm] = {"oil": oil, "gas": gas, "cf": cf}
+        off = int(seq_offsets.get(nm, 0))
+        oil = _aligned(f["df"], "oil_rate", off)
+        gas = _aligned(f["df"], "gas_rate", off)
+        cf = (_aligned(f["df_e"], "cashflow", off)
+              if "cashflow" in f["df_e"] else np.zeros(n))
+        per_field[nm] = {"oil": oil, "gas": gas, "cf": cf,
+                         "offset": off}
         port_oil += oil
         port_gas += gas
         port_cf += cf
@@ -10977,6 +11124,7 @@ def portfolio_section(units, fluid, asm):
     for nm, f in fields.items():
         rows.append({
             "Field": nm,
+            "Start delay (mo)": int(per_field[nm].get("offset", 0)),
             f"Cum oil ({ulabel('oil_vol', units)})": round(from_field(
                 float(np.sum(per_field[nm]["oil"]) * DAYS_PER_MONTH / 1e6),
                 "oil_vol", units), 1),
@@ -10988,11 +11136,17 @@ def portfolio_section(units, fluid, asm):
     st.markdown("#### Per-field contribution")
     st.dataframe(pd.DataFrame(rows), use_container_width=True,
                  hide_index=True)
+    _any_offset = any(per_field[nm].get("offset", 0) for nm in fields)
     st.caption(
-        "Portfolio totals are the simple sum of the individual fields, "
-        "aligned on a common calendar. The shared constraint, if set, caps "
-        "the combined rate — deferred volume is production the "
-        "infrastructure cannot take when fields overlap in time.")
+        "Portfolio totals are the sum of the individual fields, aligned on "
+        "a common calendar"
+        + (" with each field's start delay applied" if _any_offset
+           else "")
+        + ". The shared constraint, if set, caps the combined rate — "
+        "deferred volume is production the infrastructure cannot take when "
+        "fields overlap in time."
+        + (" Try increasing a field's delay to stagger the peaks and "
+           "reduce deferred volume." if not _any_offset else ""))
 
 
 # =============================================================================

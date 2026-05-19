@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "3.9"
+FP_HELPERS_VERSION = "4.0"
 
 import io
 import json
@@ -2704,6 +2704,25 @@ _TEMPLATE_SLOT_CAPACITY = {
     "4-slot (4 wells)":       4,
     "6-slot (6 wells)":       6,
 }
+
+
+def template_cost_for_slots(n_slots: int) -> float:
+    """Cost (MMUSD) of a subsea template with an arbitrary slot count.
+
+    The named template types give anchor points (1/2/4/6 slots). For slot
+    counts in between or beyond, the cost is interpolated / extrapolated on
+    the slot count — a template's cost rises with slots but with economies
+    of scale, so a linear fit on the 2-/4-/6-slot anchors is used (the
+    single-slot point sits slightly above that line because of fixed
+    structural overhead, which the linear 2-6 fit captures conservatively).
+    """
+    n = max(1, int(n_slots))
+    anchors = {1: 24.0, 2: 40.0, 4: 70.0, 6: 96.0}
+    if n in anchors:
+        return anchors[n]
+    # linear fit through the 2- and 6-slot anchors: 14 MMUSD per slot + 12
+    # fixed. (40 = 2·14+12 ; 96 = 6·14+12.)
+    return 12.0 + 14.0 * n
 # HIPPS — High Integrity Pressure Protection System. A safety-instrumented
 # system that protects downstream equipment rated below shut-in pressure;
 # effectively mandatory for HPHT subsea developments where the flowline /
@@ -3054,13 +3073,45 @@ def build_development_concept(spec: dict) -> dict:
     # Subsea templates / manifolds — slot-count-aware. The template type sets
     # both the per-template cost and how many wells each template can host.
     # HPHT uplift applies (higher-spec structures and connectors).
+    #
+    # Two modes:
+    #  - simple   : every template is the same `template_type`.
+    #  - detailed : a `templates_detail` list gives each template its own
+    #               slot count and tie-in topology (which template or the
+    #               host it connects to, and its flowline / umbilical
+    #               length). When present this overrides the simple mode.
     template_type = g("template_type", "4-slot (4 wells)")
-    slot_capacity = _TEMPLATE_SLOT_CAPACITY.get(template_type, 4)
-    per_template_cost = _TEMPLATE_SLOT_COST.get(template_type, _TEMPLATE_COST)
-    cost_templates = n_templates * per_template_cost * hpht_uplift
+    templates_detail = g("templates_detail", None)
     _hpht_sfx = f" [{hpht_tier}]" if hpht_tier != "Standard" else ""
-    _push(0, cost_templates,
-          f"{n_templates} × {template_type} template/manifold{_hpht_sfx}")
+
+    if templates_detail:
+        # detailed per-template mode
+        n_templates = len(templates_detail)
+        total_slots_detail = sum(int(t.get("slots", 4))
+                                 for t in templates_detail)
+        slot_capacity = (total_slots_detail // n_templates
+                         if n_templates else 4)
+        cost_templates = 0.0
+        for ti, t in enumerate(templates_detail):
+            t_slots = int(t.get("slots", 4))
+            t_cost = template_cost_for_slots(t_slots) * hpht_uplift
+            cost_templates += t_cost
+            _push(0, t_cost,
+                  f"Template T{ti+1} — {t_slots}-slot{_hpht_sfx}")
+        # in-field flowline / umbilical from each template's tie-in leg
+        detail_flowline_km = sum(float(t.get("flowline_km", 0.0))
+                                 for t in templates_detail)
+        detail_umbilical_km = sum(float(t.get("umbilical_km", 0.0))
+                                  for t in templates_detail)
+    else:
+        slot_capacity = _TEMPLATE_SLOT_CAPACITY.get(template_type, 4)
+        per_template_cost = _TEMPLATE_SLOT_COST.get(template_type,
+                                                    _TEMPLATE_COST)
+        cost_templates = n_templates * per_template_cost * hpht_uplift
+        _push(0, cost_templates,
+              f"{n_templates} × {template_type} template/manifold{_hpht_sfx}")
+        detail_flowline_km = 0.0
+        detail_umbilical_km = 0.0
 
     # HIPPS — High Integrity Pressure Protection System. Required for HPHT
     # developments where downstream equipment is not rated for full shut-in
@@ -3093,6 +3144,15 @@ def build_development_concept(spec: dict) -> dict:
     _push(180, cost_flowline,
           f"Flowline {flowline_km:.0f} km × {flowline_diam:.0f}\" "
           f"{flowline_material} (${fl_per_km:.2f}MM/km)")
+
+    # Detailed per-template tie-in legs (in-field flowline + umbilical).
+    # When the user specifies each template's tie-in topology, the in-field
+    # connecting legs are costed separately from the main tie-back flowline.
+    if templates_detail and detail_flowline_km > 0:
+        cost_infield_fl = detail_flowline_km * fl_per_km
+        _push(180, cost_infield_fl,
+              f"In-field tie-in flowlines {detail_flowline_km:.1f} km "
+              f"(template-to-template / template-to-host legs)")
 
     # Flowline insulation
     ins_per_km = _INSULATION_MMUSD_PER_KM.get(flowline_insulation, 0.0)
@@ -3135,6 +3195,11 @@ def build_development_concept(spec: dict) -> dict:
     _push(180, cost_umbilical,
           f"Umbilical {umbilical_km:.0f} km "
           f"(${_UMBILICAL_MMUSD_PER_KM:.1f}MM/km)")
+    if templates_detail and detail_umbilical_km > 0:
+        cost_infield_umb = detail_umbilical_km * _UMBILICAL_MMUSD_PER_KM
+        _push(180, cost_infield_umb,
+              f"In-field tie-in umbilicals {detail_umbilical_km:.1f} km "
+              f"(per-template control / chemical legs)")
 
     # Risers
     riser_unit = _RISER_COST.get(riser_type, 15.0)
@@ -3779,103 +3844,178 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
 
     # ---- Template positions (left field area) ----
     n_t = max(1, n_templates)
-    field_cx, field_cy = 150, 220
+    templates_detail = spec.get("templates_detail", None)
+    field_cx, field_cy = 165, 220
     if template_layout == "spread" and n_t > 1:
-        # spread vertically across the field
-        t_positions = [(field_cx + (i - (n_t - 1) / 2) * 30,
-                        field_cy + (i - (n_t - 1) / 2) * 78)
+        t_positions = [(field_cx + (i - (n_t - 1) / 2) * 26,
+                        field_cy + (i - (n_t - 1) / 2) * 82)
                        for i in range(n_t)]
     else:
-        # clustered — a tight grid
         cols = min(n_t, 2)
         t_positions = []
         for i in range(n_t):
             r, c = divmod(i, cols)
-            t_positions.append((field_cx + c * 66 - (cols - 1) * 33,
-                                 field_cy + r * 70 - 35))
+            t_positions.append((field_cx + c * 78 - (cols - 1) * 39,
+                                 field_cy + r * 80 - 40))
+
+    # per-template slot counts — from the detail list if present
+    def _slots_for(ti):
+        if templates_detail and ti < len(templates_detail):
+            return int(templates_detail[ti].get("slots", slot_capacity))
+        return slot_capacity
+
+    def _draw_template(tx, ty, ti, n_wells_here, n_slots):
+        """Draw a realistic subsea production template, plan view: an outer
+        structural frame, an internal manifold pipe-run, and well slots as
+        guide-funnels (filled = a well is present)."""
+        sub = []
+        # frame sized to slot count
+        fw = 34 + min(n_slots, 8) * 9
+        fh_ = 40
+        # outer structural frame (mudmat footprint)
+        sub.append(
+            f'<rect x="{tx-fw/2:.0f}" y="{ty-fh_/2:.0f}" width="{fw:.0f}" '
+            f'height="{fh_}" rx="4" fill="#b9c4cc" stroke="#3a4750" '
+            f'stroke-width="2"/>')
+        # corner piles
+        for dx in (-fw/2+5, fw/2-5):
+            for dy in (-fh_/2+5, fh_/2-5):
+                sub.append(f'<circle cx="{tx+dx:.0f}" cy="{ty+dy:.0f}" '
+                           f'r="3" fill="#3a4750"/>')
+        # internal manifold header pipe
+        sub.append(
+            f'<rect x="{tx-fw/2+8:.0f}" y="{ty-4:.0f}" '
+            f'width="{fw-16:.0f}" height="8" rx="3" '
+            f'fill="#5a6b78" stroke="#2a363d" stroke-width="1"/>')
+        # well slots — guide funnels along the header
+        slot_pts = []
+        for s in range(n_slots):
+            sx = (tx - fw/2 + 14 +
+                  s * ((fw - 28) / max(1, n_slots - 1) if n_slots > 1
+                       else 0))
+            filled = s < n_wells_here
+            # guide funnel: outer ring + inner bore
+            sub.append(
+                f'<circle cx="{sx:.0f}" cy="{ty-13:.0f}" r="5.5" '
+                f'fill="#d6dde2" stroke="#3a4750" stroke-width="1.4"/>')
+            sub.append(
+                f'<circle cx="{sx:.0f}" cy="{ty-13:.0f}" r="2.6" '
+                f'fill="{"#11150f" if filled else "#9aa6ad"}"/>')
+            # tie of the slot to the header
+            sub.append(
+                f'<line x1="{sx:.0f}" y1="{ty-8:.0f}" x2="{sx:.0f}" '
+                f'y2="{ty-4:.0f}" stroke="#2a363d" stroke-width="1.5"/>')
+            if filled:
+                slot_pts.append((sx, ty - 13))
+        return "".join(sub), slot_pts, fw
 
     wells_left = n_subsea
     drawn_well_pts = []
+    template_centres = []
+    template_frames = []
     for ti, (tx, ty) in enumerate(t_positions):
-        # template body — rectangle sized to slot count
-        t_w = 26 + min(slot_capacity, 6) * 7
-        t_h = 26
-        parts.append(
-            f'<rect x="{tx - t_w/2:.0f}" y="{ty - t_h/2:.0f}" '
-            f'width="{t_w:.0f}" height="{t_h}" rx="3" '
-            f'fill="#c4566a" stroke="#5a2030" stroke-width="2"/>')
-        # well slots as dots in a row; filled = well present
-        this_wells = min(slot_capacity, wells_left)
-        for s in range(slot_capacity):
-            sx = (tx - t_w/2 + 9 +
-                  s * ((t_w - 18) / max(1, slot_capacity - 1)
-                       if slot_capacity > 1 else 0))
-            filled = s < this_wells
-            parts.append(
-                f'<circle cx="{sx:.0f}" cy="{ty:.0f}" r="3.6" '
-                f'fill="{"#1a1a1a" if filled else "#ece0e3"}" '
-                f'stroke="#5a2030" stroke-width="1"/>')
-            if filled:
-                drawn_well_pts.append((sx, ty))
+        n_slots = _slots_for(ti)
+        this_wells = min(n_slots, wells_left)
+        svg_t, slot_pts, fw = _draw_template(tx, ty, ti, this_wells,
+                                             n_slots)
+        parts.append(svg_t)
+        drawn_well_pts.extend(slot_pts)
+        template_centres.append((tx, ty))
+        template_frames.append(fw)
         wells_left -= this_wells
+        _lbl = (f"T{ti+1} · {n_slots}-slot" if templates_detail
+                else f"T{ti+1}")
         parts.append(
-            f'<text x="{tx:.0f}" y="{ty - t_h/2 - 5:.0f}" font-size="9" '
-            f'fill="#5a2030" text-anchor="middle">'
-            f'T{ti+1} · {template_type.split(" ")[0]}</text>')
+            f'<text x="{tx:.0f}" y="{ty + 32:.0f}" font-size="9.5" '
+            f'fill="#2a363d" text-anchor="middle" '
+            f'font-weight="bold">{_lbl}</text>')
 
-    # ---- Manifold (if separate from templates) ----
-    man_x, man_y = field_cx + 90, field_cy
-    if n_manifolds > 0:
-        parts.append(
-            f'<rect x="{man_x-13}" y="{man_y-13}" width="26" height="26" '
-            f'fill="#3b7a57" stroke="#1f3f2d" stroke-width="2" '
-            f'transform="rotate(45 {man_x} {man_y})"/>')
-        parts.append(f'<text x="{man_x}" y="{man_y+26}" font-size="9" '
-                     f'fill="#1f3f2d" text-anchor="middle">'
-                     f'Manifold ×{n_manifolds}</text>')
-        gather_x, gather_y = man_x, man_y
-        # in-field lines: each template to the manifold
-        for (tx, ty) in t_positions:
+    # ---- Tie-in routing -------------------------------------------------
+    def _route(x1, y1, x2, y2, color, width, dash=None):
+        d = (f' stroke-dasharray="{dash}"' if dash else '')
+        # right-angle-ish routed leg with an eased bend
+        midx = (x1 + x2) / 2
+        return (f'<path d="M{x1:.0f},{y1:.0f} C{midx:.0f},{y1:.0f} '
+                f'{midx:.0f},{y2:.0f} {x2:.0f},{y2:.0f}" fill="none" '
+                f'stroke="{color}" stroke-width="{width}"{d}/>')
+
+    riser_base_x = host_x - 34
+    if templates_detail and len(templates_detail) == n_t:
+        # topology-driven routing — each template ties to its target
+        for ti, t in enumerate(templates_detail):
+            tx, ty = template_centres[ti]
+            tie = str(t.get("tie_to", "Host"))
+            fl = float(t.get("flowline_km", 0.0))
+            umb = float(t.get("umbilical_km", 0.0))
+            if tie.startswith("T") and tie[1:].isdigit():
+                j = int(tie[1:]) - 1
+                if 0 <= j < n_t and j != ti:
+                    jx, jy = template_centres[j]
+                    parts.append(_route(tx, ty, jx, jy, "#246", 3.5))
+                    parts.append(_route(tx, ty+9, jx, jy+9, "#b07ac0",
+                                        2, "6,3"))
+                    parts.append(
+                        f'<text x="{(tx+jx)/2:.0f}" '
+                        f'y="{(ty+jy)/2-6:.0f}" font-size="8" fill="#246" '
+                        f'text-anchor="middle">{fl:.0f} km</text>')
+                    continue
+            # ties to the host
+            parts.append(_route(tx, ty, riser_base_x, host_y, "#246", 3.5))
+            parts.append(_route(tx, ty+9, riser_base_x, host_y+11,
+                                "#b07ac0", 2, "6,3"))
             parts.append(
-                f'<line x1="{tx:.0f}" y1="{ty:.0f}" x2="{man_x}" '
-                f'y2="{man_y}" stroke="#888" stroke-width="2"/>')
+                f'<text x="{(tx+riser_base_x)/2:.0f}" '
+                f'y="{(ty+host_y)/2-6:.0f}" font-size="8" fill="#246" '
+                f'text-anchor="middle">{fl:.0f} km</text>')
+        gather_x, gather_y = riser_base_x, host_y
     else:
-        gather_x, gather_y = t_positions[-1]
-        # if multiple templates, link them in-field
-        if n_t > 1:
-            for i in range(len(t_positions) - 1):
-                (x1, y1) = t_positions[i]
-                (x2, y2) = t_positions[i + 1]
-                parts.append(
-                    f'<line x1="{x1:.0f}" y1="{y1:.0f}" x2="{x2:.0f}" '
-                    f'y2="{y2:.0f}" stroke="#888" stroke-width="2" '
-                    f'stroke-dasharray="4,3"/>')
+        # simple mode — manifold hub or chained templates, then to host
+        man_x, man_y = field_cx + 108, field_cy
+        if n_manifolds > 0:
+            parts.append(
+                f'<rect x="{man_x-14}" y="{man_y-14}" width="28" '
+                f'height="28" fill="#3b7a57" stroke="#1f3f2d" '
+                f'stroke-width="2" transform="rotate(45 {man_x} '
+                f'{man_y})"/>')
+            parts.append(f'<text x="{man_x}" y="{man_y+28}" font-size="9" '
+                         f'fill="#1f3f2d" text-anchor="middle">'
+                         f'Manifold ×{n_manifolds}</text>')
+            for (tx, ty) in template_centres:
+                parts.append(_route(tx, ty, man_x, man_y, "#888", 2.5))
+            gather_x, gather_y = man_x, man_y
+        else:
+            gather_x, gather_y = template_centres[-1]
+            if n_t > 1:
+                for i in range(len(template_centres) - 1):
+                    (x1, y1) = template_centres[i]
+                    (x2, y2) = template_centres[i + 1]
+                    parts.append(_route(x1, y1, x2, y2, "#888", 2.5,
+                                        "4,3"))
+        # main tie-back: gathering point -> host
+        parts.append(_route(gather_x, gather_y, riser_base_x, host_y,
+                            "#246", 4))
+        parts.append(f'<text x="{(gather_x+riser_base_x)/2:.0f}" '
+                     f'y="{(gather_y+host_y)/2-8:.0f}" font-size="10" '
+                     f'fill="#246" text-anchor="middle">'
+                     f'Flowline {flowline_km:.0f} km</text>')
+        parts.append(_route(gather_x, gather_y+10, riser_base_x,
+                            host_y+12, "#b07ac0", 2, "6,3"))
+        parts.append(f'<text x="{(gather_x+riser_base_x)/2:.0f}" '
+                     f'y="{(gather_y+host_y)/2+20:.0f}" font-size="9" '
+                     f'fill="#8a4f9a" text-anchor="middle">'
+                     f'Umbilical {umbilical_km:.0f} km</text>')
 
-    # ---- Production flowline: gathering point -> host ----
-    mid_x = (gather_x + host_x) / 2
-    parts.append(
-        f'<path d="M{gather_x:.0f},{gather_y:.0f} '
-        f'C{mid_x:.0f},{gather_y:.0f} {mid_x:.0f},{host_y} '
-        f'{host_x-30:.0f},{host_y}" fill="none" stroke="#246" '
-        f'stroke-width="4"/>')
-    parts.append(f'<text x="{mid_x:.0f}" y="{(gather_y+host_y)/2 - 8:.0f}" '
-                 f'font-size="10" fill="#246" text-anchor="middle">'
-                 f'Flowline {flowline_km:.0f} km</text>')
-    # Umbilical — drawn parallel, offset, dashed
-    parts.append(
-        f'<path d="M{gather_x:.0f},{gather_y+10:.0f} '
-        f'C{mid_x:.0f},{gather_y+10:.0f} {mid_x:.0f},{host_y+12} '
-        f'{host_x-30:.0f},{host_y+12}" fill="none" stroke="#b07ac0" '
-        f'stroke-width="2" stroke-dasharray="6,3"/>')
-    parts.append(f'<text x="{mid_x:.0f}" y="{(gather_y+host_y)/2 + 20:.0f}" '
-                 f'font-size="9" fill="#8a4f9a" text-anchor="middle">'
-                 f'Umbilical {umbilical_km:.0f} km</text>')
+    # tie-in porch at the host
+    parts.append(f'<circle cx="{riser_base_x:.0f}" cy="{host_y:.0f}" '
+                 f'r="6" fill="#246" stroke="#0d2030" stroke-width="1.5"/>')
 
-    # ---- Boosting station on the flowline ----
+    # ---- Boosting station ----
     if n_boosting > 0:
-        bx, by = mid_x, (gather_y + host_y) / 2
-        parts.append(f'<circle cx="{bx:.0f}" cy="{by:.0f}" r="9" '
-                     f'fill="#fa3" stroke="#7a4a00" stroke-width="2"/>')
+        bx = (gather_x + riser_base_x) / 2
+        by = (gather_y + host_y) / 2
+        parts.append(f'<rect x="{bx-9:.0f}" y="{by-9:.0f}" width="18" '
+                     f'height="18" rx="3" fill="#fa3" stroke="#7a4a00" '
+                     f'stroke-width="2"/>')
         parts.append(f'<text x="{bx:.0f}" y="{by+22:.0f}" font-size="9" '
                      f'fill="#a60" text-anchor="middle">'
                      f'Boosting ×{n_boosting}</text>')
@@ -3891,21 +4031,23 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
 
     # ---- Legend ----
     ly = H - 26
-    parts.append(f'<rect x="12" y="{ly-12}" width="14" height="10" '
-                 f'fill="#c4566a"/>')
-    parts.append(f'<text x="30" y="{ly-3}" font-size="9" fill="#444">'
+    parts.append(f'<rect x="12" y="{ly-12}" width="16" height="11" '
+                 f'rx="2" fill="#b9c4cc" stroke="#3a4750"/>')
+    parts.append(f'<text x="32" y="{ly-3}" font-size="9" fill="#444">'
                  f'Template</text>')
-    parts.append(f'<line x1="110" y1="{ly-7}" x2="134" y2="{ly-7}" '
+    parts.append(f'<line x1="108" y1="{ly-7}" x2="132" y2="{ly-7}" '
                  f'stroke="#246" stroke-width="4"/>')
-    parts.append(f'<text x="140" y="{ly-3}" font-size="9" fill="#444">'
+    parts.append(f'<text x="138" y="{ly-3}" font-size="9" fill="#444">'
                  f'Flowline</text>')
-    parts.append(f'<line x1="210" y1="{ly-7}" x2="234" y2="{ly-7}" '
+    parts.append(f'<line x1="206" y1="{ly-7}" x2="230" y2="{ly-7}" '
                  f'stroke="#b07ac0" stroke-width="2" '
                  f'stroke-dasharray="6,3"/>')
-    parts.append(f'<text x="240" y="{ly-3}" font-size="9" fill="#444">'
+    parts.append(f'<text x="236" y="{ly-3}" font-size="9" fill="#444">'
                  f'Umbilical</text>')
-    parts.append(f'<circle cx="318" cy="{ly-7}" r="3.6" fill="#1a1a1a"/>')
-    parts.append(f'<text x="328" y="{ly-3}" font-size="9" fill="#444">'
+    parts.append(f'<circle cx="312" cy="{ly-7}" r="4" fill="#d6dde2" '
+                 f'stroke="#3a4750"/>')
+    parts.append(f'<circle cx="312" cy="{ly-7}" r="2" fill="#11150f"/>')
+    parts.append(f'<text x="322" y="{ly-3}" font-size="9" fill="#444">'
                  f'Well slot ({n_subsea} wells)</text>')
 
     parts.append('</svg>')
