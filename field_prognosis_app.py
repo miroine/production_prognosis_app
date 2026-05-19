@@ -572,6 +572,19 @@ class FieldAssumptions:
     # in the reservoir.
     retrograde_enabled: bool = False
     retrograde_drop_fraction: float = 0.55
+    # Fractional-flow water cut (oil fields only). When enabled, the field
+    # water cut is derived from Corey relative-permeability curves and the
+    # cumulative recovery, rather than the per-well water-cut ramp.
+    fractional_flow_enabled: bool = False
+    ff_swc: float = 0.20         # connate water saturation
+    ff_sor: float = 0.25         # residual oil saturation
+    ff_krw_max: float = 0.30     # water rel-perm endpoint
+    ff_kro_max: float = 0.90     # oil rel-perm endpoint
+    ff_nw: float = 3.0           # Corey water exponent
+    ff_no: float = 2.0           # Corey oil exponent
+    ff_mu_oil: float = 1.5       # oil viscosity (cP)
+    ff_mu_water: float = 0.4     # water viscosity (cP)
+    ff_sweep: float = 0.70       # volumetric sweep efficiency
 
     def gas_disposition_sum(self) -> float:
         return (self.gas_export_fraction + self.gas_injection_fraction
@@ -592,6 +605,14 @@ FLUID_SYSTEMS = {
 }
 DECLINE_MODELS = ["Exponential", "Hyperbolic", "Harmonic", "Multi-segment",
                   "User-defined profile"]
+# Standard subsea template types -> well-slot capacity. Mirrors the cost
+# table in fp_helpers; used by the per-template detail editor.
+_TEMPLATE_SLOT_CAPACITY_UI = {
+    "Single-slot (1 well)":   1,
+    "Double-slot (2 wells)":  2,
+    "4-slot (4 wells)":       4,
+    "6-slot (6 wells)":       6,
+}
 RIG_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
               "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
@@ -1515,6 +1536,53 @@ def run_simulation(wells, asm: FieldAssumptions):
     cum_s = np.cumsum(field_s * days) / 1e6
     field_l = field_oil_rate + field_w  # liquid is always oil + water
 
+    # ---- Fractional-flow water cut (optional, physics-based) ----
+    # By default the field water cut is the sum of the per-well ramps the
+    # user entered. When fractional-flow mode is enabled (oil field), the
+    # water cut is instead derived from saturation physics: the cumulative
+    # oil recovery sets the average water saturation, the Corey rel-perm
+    # curves give the fractional flow, and the water rate is recomputed as
+    # oil_rate × f_w / (1 - f_w). This makes waterflood water cut emerge
+    # from the rock/fluid properties rather than a prescribed ramp.
+    ff_info = None
+    if (is_oil and getattr(asm, "fractional_flow_enabled", False)
+            and asm.ooip_oil and asm.ooip_oil > 0):
+        cum_oil_running = np.cumsum(field_oil_rate * days) / 1e6
+        rf_running = cum_oil_running / asm.ooip_oil
+        ff_params = {
+            "swc": getattr(asm, "ff_swc", 0.20),
+            "sor": getattr(asm, "ff_sor", 0.25),
+            "krw_max": getattr(asm, "ff_krw_max", 0.30),
+            "kro_max": getattr(asm, "ff_kro_max", 0.90),
+            "nw": getattr(asm, "ff_nw", 3.0),
+            "no": getattr(asm, "ff_no", 2.0),
+            "mu_oil": getattr(asm, "ff_mu_oil", 1.5),
+            "mu_water": getattr(asm, "ff_mu_water", 0.4),
+            "sweep_efficiency": getattr(asm, "ff_sweep", 0.7),
+        }
+        ff = fh.fractional_flow_watercut(rf_running, ff_params)
+        fw = np.clip(ff["water_cut"], 0.0, 0.999)
+        # water rate from the fractional-flow water cut:
+        #   fw = qw / (qo + qw)  ->  qw = qo * fw / (1 - fw)
+        field_w = field_oil_rate * fw / (1.0 - fw)
+        field_l = field_oil_rate + field_w
+        bt_date = None
+        if ff["bt_index"] >= 0 and ff["bt_index"] < len(dates):
+            bt_date = str(pd.Timestamp(dates[ff["bt_index"]]).date())
+        ff_info = {
+            "active": True,
+            "bt_index": ff["bt_index"],
+            "bt_date": bt_date,
+            "final_sw": float(ff["sw"][-1]) if len(ff["sw"]) else 0.0,
+            "final_wc": float(fw[-1]) if len(fw) else 0.0,
+        }
+        # store the saturation & water-cut series as real columns later
+        ff_sw_series = np.asarray(ff["sw"], dtype=float)
+        ff_wc_series = np.asarray(fw, dtype=float)
+    else:
+        ff_sw_series = None
+        ff_wc_series = None
+
     # ---- Volumetric consistency cap (decline curve vs material balance) ----
     # Decline curves are generated independently of the in-place volumes. A
     # user can specify well rates / declines that, integrated, would produce
@@ -1643,6 +1711,10 @@ def run_simulation(wells, asm: FieldAssumptions):
     # arrays in attrs break pandas concat).
     if retro_cgr_series is not None and len(retro_cgr_series) == n_months:
         df["producible_cgr"] = retro_cgr_series
+    # Fractional-flow saturation & water-cut series as real columns.
+    if ff_sw_series is not None and len(ff_sw_series) == n_months:
+        df["ff_water_saturation"] = ff_sw_series
+        df["ff_water_cut"] = ff_wc_series
 
     # ---- Profile robustness checks ----
     # A set of sanity checks on the generated profile. Anything that looks
@@ -1702,6 +1774,8 @@ def run_simulation(wells, asm: FieldAssumptions):
     df.attrs["profile_warnings"] = profile_warnings
     if retro_info is not None:
         df.attrs["retrograde_info"] = retro_info
+    if ff_info is not None:
+        df.attrs["fractional_flow_info"] = ff_info
 
     # Per-reservoir DataFrame: long format for easy plotting / aggregation
     res_rows = []
@@ -1802,37 +1876,59 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     opex = var_cost + fixed_cost + ngl_opex
 
     # ---- Economic limit / cessation timing ----
-    # In "economic" mode, find the month after which monthly operating
-    # cashflow (revenue − royalty − tariff − OPEX, excluding CAPEX) stays
-    # negative for `economic_cutoff_persistence` consecutive months. Production
-    # and all associated revenue / OPEX after that month are zeroed — the field
-    # is shut in rather than produced at a loss.
+    # The field stops at the EARLIER of two events:
+    #   (a) ultimate recovery — production has essentially finished (the
+    #       rate has fallen to/below the abandonment rate, or cumulative has
+    #       hit the volumetric limit);
+    #   (b) NPV turnover — the discounted cumulative cashflow stops growing,
+    #       i.e. monthly operating cashflow has gone persistently negative
+    #       so every further month destroys value.
+    # Production, revenue and OPEX after that month are zeroed; cessation
+    # (abandonment) is booked a few months later, and all costs finish by
+    # then.
     cutoff_mode = getattr(econ, "economic_cutoff_mode", "horizon")
     cutoff_idx = None
     if cutoff_mode == "economic":
         persistence = max(1, int(getattr(econ, "economic_cutoff_persistence", 6)))
         op_cf = (revenue - royalty - tariff - opex).values  # monthly operating CF
-        # Find the first month from which CF is negative for `persistence`
-        # consecutive months (and never recovers materially). We scan from the
-        # back: the economic limit is the last month with positive CF, +1.
         producing = (df["primary_rate"].values > 0)
         neg = op_cf < 0
-        # Rolling check: month i is the economic limit if neg[i:i+persistence] all True
+
+        # (b) NPV-turnover cutoff: first month from which operating CF is
+        #     negative for `persistence` consecutive months. Beyond this the
+        #     cumulative (discounted) cashflow only falls.
+        npv_cutoff = None
         for i in range(len(op_cf)):
             if not producing[i]:
                 continue
             window = neg[i:i + persistence]
             if len(window) > 0 and window.all():
-                cutoff_idx = i
+                npv_cutoff = i
                 break
+
+        # (a) Ultimate-recovery cutoff: the first month at/after which
+        #     production has effectively ceased — the primary rate has
+        #     dropped to zero (volumetric cap or decline to nil). The last
+        #     producing month + 1 is the recovery limit.
+        recovery_cutoff = None
+        prod_idx = np.where(producing)[0]
+        if len(prod_idx) > 0:
+            last_prod = int(prod_idx[-1])
+            if last_prod < len(df) - 1:
+                recovery_cutoff = last_prod + 1
+
+        # take the EARLIER of the two events
+        candidates = [c for c in (npv_cutoff, recovery_cutoff)
+                      if c is not None]
+        if candidates:
+            cutoff_idx = min(candidates)
+            df.attrs["economic_cutoff_reason"] = (
+                "NPV turnover" if cutoff_idx == npv_cutoff
+                else "ultimate recovery")
+
         if cutoff_idx is not None and cutoff_idx > 0:
             # Zero out production, revenue, opex from the cutoff onward
             mask_after = np.arange(len(df)) >= cutoff_idx
-            for arr_name in ["revenue", "rev_oil", "rev_gas", "rev_cond",
-                             "rev_ngl", "royalty", "tariff", "net_revenue",
-                             "opex", "var_cost", "ngl_opex"]:
-                if arr_name in dir():
-                    pass  # placeholder; explicit handling below
             # Explicit zeroing (these are pandas Series / np arrays)
             revenue = revenue.copy(); revenue[mask_after] = 0.0
             rev_oil = rev_oil.copy() if hasattr(rev_oil, "copy") else rev_oil
@@ -1946,13 +2042,23 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
 
     aban_cost = np.zeros(len(df))
     cutoff_idx_attr = df.attrs.get("economic_cutoff_idx")
+    # Cessation (abandonment) occurs a short while AFTER the field stops —
+    # rigs/vessels demobilise, wells are plugged. Book it a few months after
+    # the economic cutoff so all costs are finished shortly after production.
+    CESSATION_LAG_MONTHS = 3
     if cutoff_idx_attr is not None:
-        # Economic-limit mode: cessation booked at the economic cutoff month
-        aban_cost[int(cutoff_idx_attr)] = econ.abandonment_cost_MM * 1e6
+        aban_month = min(len(df) - 1,
+                         int(cutoff_idx_attr) + CESSATION_LAG_MONTHS)
+        aban_cost[aban_month] = econ.abandonment_cost_MM * 1e6
+        df.attrs["cessation_idx"] = int(aban_month)
+        df.attrs["cessation_date"] = str(df["date"].iloc[aban_month].date())
     elif (df["primary_rate"] > 0).any():
-        # Horizon mode: cessation at last producing month
-        last = df.index[df["primary_rate"] > 0].max()
-        aban_cost[int(last)] = econ.abandonment_cost_MM * 1e6
+        # Horizon mode: cessation a few months after last producing month
+        last = int(df.index[df["primary_rate"] > 0].max())
+        aban_month = min(len(df) - 1, last + CESSATION_LAG_MONTHS)
+        aban_cost[aban_month] = econ.abandonment_cost_MM * 1e6
+        df.attrs["cessation_idx"] = int(aban_month)
+        df.attrs["cessation_date"] = str(df["date"].iloc[aban_month].date())
 
     # ---- CO2 emissions (rough screening, tonnes/month) ----
     # Combustion of fuel + flare gas (kg CO2 per Mscf burnt → tonnes/month)
@@ -2176,9 +2282,24 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
             pretax = net_revenue - opex - capex - aban_cost - co2_cost
             cf = pretax.values - tax
         else:
+            # Standard Tax/Royalty. Tax is charged on taxable profit, but
+            # losses (CAPEX-heavy early years) are carried forward and
+            # shelter later profits — without this the tax is overstated
+            # and a sound project can show a spuriously negative NPV.
             pretax = net_revenue - opex - capex - aban_cost - co2_cost
-            tax = np.where(pretax > 0, pretax * econ.tax_rate, 0.0)
-            cf = pretax - tax
+            pretax_v = pretax.values
+            _n = len(df)
+            tax = np.zeros(_n)
+            tax_loss_cf = 0.0   # carried-forward taxable loss (positive)
+            for i in range(_n):
+                base = pretax_v[i] - tax_loss_cf
+                if base > 0:
+                    tax[i] = base * econ.tax_rate
+                    tax_loss_cf = 0.0
+                else:
+                    tax[i] = 0.0
+                    tax_loss_cf = -base
+            cf = pretax_v - tax
 
         df_e = df.copy()
         df_e["revenue_oil"] = rev_oil
@@ -2294,6 +2415,9 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 if "economic_cutoff_idx" in df_e.attrs:
                     df_e.attrs["economic_cutoff_idx"] = (
                         int(df_e.attrs["economic_cutoff_idx"]) + len(pre_dates))
+                if "cessation_idx" in df_e.attrs:
+                    df_e.attrs["cessation_idx"] = (
+                        int(df_e.attrs["cessation_idx"]) + len(pre_dates))
     except Exception:
         # If anything goes wrong, fall back to the un-padded df_e
         pass
@@ -3279,6 +3403,88 @@ def sidebar_inputs():
         p_bub_psi=to_field(p_bub_disp, "pressure", units),
     )
 
+    # ---- Fractional-flow water cut (oil fields) ----
+    ff_enabled = False
+    ff_params_ui = {}
+    _ff_is_oil = FLUID_SYSTEMS[fluid]["primary"] == "oil"
+    if _ff_is_oil:
+        with st.sidebar.expander("💧 Fractional-flow water cut",
+                                  expanded=False):
+            ff_enabled = st.checkbox(
+                "Derive water cut from saturation physics",
+                value=False, key="ff_enabled", on_change=mark_stale,
+                help="Off — field water cut is the sum of the per-well "
+                     "water-cut ramps you entered. On — the water cut is "
+                     "computed from Corey relative-permeability curves and "
+                     "the cumulative recovery: as oil is displaced the "
+                     "average water saturation rises, the fractional flow "
+                     "of water climbs its S-curve, and the produced water "
+                     "cut follows. This makes a waterflood's water cut "
+                     "emerge from the rock/fluid properties instead of a "
+                     "prescribed ramp — overrides the per-well ramps.")
+            if ff_enabled:
+                st.caption("Corey relative-permeability & fluid inputs:")
+                fc1, fc2 = st.columns(2)
+                ff_params_ui["swc"] = fc1.number_input(
+                    "Connate water Swc", min_value=0.0, max_value=0.5,
+                    value=0.20, step=0.05, key="ff_swc",
+                    on_change=mark_stale,
+                    help="Irreducible water saturation — the water cut "
+                         "starts rising from here.")
+                ff_params_ui["sor"] = fc2.number_input(
+                    "Residual oil Sor", min_value=0.0, max_value=0.5,
+                    value=0.25, step=0.05, key="ff_sor",
+                    on_change=mark_stale,
+                    help="Residual (unrecoverable) oil saturation. "
+                         "1 - Swc - Sor is the moveable oil window.")
+                ff_params_ui["krw_max"] = fc1.number_input(
+                    "krw endpoint", min_value=0.05, max_value=1.0,
+                    value=0.30, step=0.05, key="ff_krw_max",
+                    on_change=mark_stale,
+                    help="Water relative permeability at the residual-oil "
+                         "endpoint. Lower = more oil-wet, later water "
+                         "breakthrough.")
+                ff_params_ui["kro_max"] = fc2.number_input(
+                    "kro endpoint", min_value=0.1, max_value=1.0,
+                    value=0.90, step=0.05, key="ff_kro_max",
+                    on_change=mark_stale,
+                    help="Oil relative permeability at connate water.")
+                ff_params_ui["nw"] = fc1.number_input(
+                    "Corey water exp. nw", min_value=1.0, max_value=6.0,
+                    value=3.0, step=0.5, key="ff_nw", on_change=mark_stale,
+                    help="Curvature of the water rel-perm curve. Higher = "
+                         "more delayed water rise.")
+                ff_params_ui["no"] = fc2.number_input(
+                    "Corey oil exp. no", min_value=1.0, max_value=6.0,
+                    value=2.0, step=0.5, key="ff_no", on_change=mark_stale,
+                    help="Curvature of the oil rel-perm curve.")
+                ff_params_ui["mu_oil"] = fc1.number_input(
+                    "Oil viscosity (cP)", min_value=0.1, max_value=100.0,
+                    value=1.5, step=0.5, key="ff_mu_oil",
+                    on_change=mark_stale,
+                    help="In-situ oil viscosity. A higher oil viscosity "
+                         "(unfavourable mobility ratio) means earlier, "
+                         "sharper water breakthrough.")
+                ff_params_ui["mu_water"] = fc2.number_input(
+                    "Water viscosity (cP)", min_value=0.1, max_value=5.0,
+                    value=0.4, step=0.1, key="ff_mu_water",
+                    on_change=mark_stale)
+                ff_params_ui["sweep"] = st.slider(
+                    "Volumetric sweep efficiency", min_value=0.3,
+                    max_value=1.0, value=0.70, step=0.05, key="ff_sweep",
+                    on_change=mark_stale,
+                    help="Fraction of the reservoir the flood actually "
+                         "contacts. Lower sweep → the contacted region "
+                         "watered out sooner for a given field recovery.")
+                _mr = (ff_params_ui["mu_oil"] / max(ff_params_ui["mu_water"],
+                                                     1e-6))
+                st.caption(
+                    f"Mobility ratio (oil/water viscosity) ≈ {_mr:.1f}. "
+                    + ("Favourable — stable flood, gradual water rise."
+                       if _mr < 5 else
+                       "Unfavourable — expect early water breakthrough "
+                       "and viscous fingering."))
+
     with st.sidebar.expander("🌊 Aquifer support", expanded=False):
         aq_active = st.checkbox("Aquifer active", value=False,
                                 key="aq_active", on_change=mark_stale,
@@ -3490,6 +3696,8 @@ def sidebar_inputs():
         "ct_rock": ct_rock, "sw_init": sw_init,
         "retrograde_enabled": retrograde_enabled,
         "retrograde_drop_fraction": retrograde_drop_fraction,
+        "fractional_flow_enabled": ff_enabled,
+        "ff_params": ff_params_ui,
         "prod_eff": prod_eff,
         "auto_scale_rf": auto_scale_rf,
         "gas_export": gas_export, "gas_inj_frac": gas_inj_frac,
@@ -4668,6 +4876,85 @@ def well_section(units, fluid, start_date):
 
     # Stash rig metadata so the economics layer can cost move-in/out/maintenance
     st.session_state["_rig_meta"] = rig_meta
+
+    # ---- Per-well production preview ----
+    # Before running the full field model, let the user inspect each
+    # producer's standalone monthly profile and its cumulative volumes.
+    # This catches a mis-keyed decline or qi early, without waiting for the
+    # whole simulation.
+    producers_preview = [w for w in wells if w.is_producer]
+    if producers_preview:
+        with st.expander("🔍 Preview producer profiles "
+                         "(before running)", expanded=False):
+            st.caption(
+                "Each producer's standalone profile from its decline / "
+                "profile inputs — no field constraints, capacity caps or "
+                "material-balance effects applied yet. Use it to sanity-"
+                "check the per-well inputs before running the field model.")
+            _is_oil_prev = FLUID_SYSTEMS[fluid]["primary"] == "oil"
+            # build a monthly calendar covering all producers
+            _hor_years = int(st.session_state.get("horizon", 25))
+            _prev_dates = pd.date_range(
+                start_date, periods=_hor_years * 12, freq="MS")
+            prev_rows = []
+            fig_prev = go.Figure()
+            for w in producers_preview:
+                wm = well_monthly(w, _prev_dates, _is_oil_prev)
+                prim = wm["primary"]
+                days = DAYS_PER_MONTH
+                cum_prim = float(np.sum(prim) * days)
+                cum_sec = float(np.sum(wm["secondary"]) * days)
+                # peak and plateau
+                peak = float(np.max(prim)) if len(prim) else 0.0
+                on_months = int(np.sum(prim > 0.01))
+                # primary-stream cumulative in field display units
+                if _is_oil_prev:
+                    cum_disp = from_field(cum_prim / 1e6, "oil_vol", units)
+                    cum_unit = ulabel("oil_vol", units)
+                    peak_disp = from_field(peak, "oil_rate", units)
+                    peak_unit = ulabel("oil_rate", units)
+                else:
+                    cum_disp = from_field(cum_prim / 1e9, "gas_vol", units)
+                    cum_unit = ulabel("gas_vol", units)
+                    peak_disp = from_field(peak, "gas_rate", units)
+                    peak_unit = ulabel("gas_rate", units)
+                prev_rows.append({
+                    "Well": w.name,
+                    "Rig": w.rig,
+                    "Online": str(w.online_date),
+                    f"Peak ({peak_unit})": round(peak_disp, 1),
+                    f"Cum primary ({cum_unit})": round(cum_disp, 2),
+                    "Producing months": on_months,
+                })
+                fig_prev.add_trace(go.Scatter(
+                    x=_prev_dates,
+                    y=from_field(prim, "oil_rate" if _is_oil_prev
+                                 else "gas_rate", units),
+                    mode="lines", name=w.name))
+            fig_prev.update_layout(
+                title="Standalone producer profiles",
+                xaxis_title="Date",
+                yaxis_title=(f"Oil rate ({ulabel('oil_rate', units)})"
+                             if _is_oil_prev
+                             else f"Gas rate ({ulabel('gas_rate', units)})"),
+                height=340, legend=dict(orientation="h", y=-0.25))
+            st.plotly_chart(fh.apply_plot_template(fig_prev),
+                            use_container_width=True)
+            prev_df = pd.DataFrame(prev_rows)
+            st.dataframe(prev_df, use_container_width=True,
+                         hide_index=True)
+            # totals
+            _tot_col = [c for c in prev_df.columns
+                        if c.startswith("Cum primary")][0]
+            st.caption(
+                f"Combined standalone cumulative: "
+                f"{prev_df[_tot_col].sum():,.1f} "
+                f"{_tot_col.split('(')[1].rstrip(')')}. "
+                f"Note this is the simple sum of unconstrained well "
+                f"profiles — the field model will apply capacity limits, "
+                f"the volumetric cap and material-balance effects, so the "
+                f"final field total is normally lower.")
+
     return wells
 
 
@@ -5871,63 +6158,116 @@ def economics_section(units, start_date):
             if use_detail:
                 tie_options = ["Host"] + [f"T{i+1}"
                                           for i in range(int(n_templates))]
+                _std_types = list(_TEMPLATE_SLOT_CAPACITY_UI.keys())
                 _td_key = f"dc_templates_detail_{int(n_templates)}"
+
+                def _default_td_row(i):
+                    return {
+                        "Template": f"T{i+1}",
+                        "Name": f"Template {i+1}",
+                        "Type": "4-slot (4 wells)",
+                        "Slots": 4,
+                        "Role": "Producer",
+                        "Tie-in to": "Host" if i == 0 else "T1",
+                        "X (km)": float(-(14 + i * 6)),
+                        "Y (km)": float((i - (int(n_templates)-1)/2) * 6),
+                        "Flowline leg (km)": 14.0 if i == 0 else 6.0,
+                        "Umbilical leg (km)": 15.0 if i == 0 else 6.0,
+                    }
                 if _td_key not in st.session_state:
-                    st.session_state[_td_key] = pd.DataFrame([
-                        {"Template": f"T{i+1}", "Slots": 4,
-                         "Tie-in to": "Host" if i == 0 else "T1",
-                         "Flowline leg (km)": 15.0 if i == 0 else 4.0,
-                         "Umbilical leg (km)": 16.0 if i == 0 else 4.0}
-                        for i in range(int(n_templates))])
+                    st.session_state[_td_key] = pd.DataFrame(
+                        [_default_td_row(i) for i in range(int(n_templates))])
                 # keep the row count in sync with n_templates
                 _cur = st.session_state[_td_key]
                 if len(_cur) != int(n_templates):
-                    _cur = pd.DataFrame([
-                        {"Template": f"T{i+1}",
-                         "Slots": int(_cur["Slots"].iloc[i])
-                         if i < len(_cur) else 4,
-                         "Tie-in to": _cur["Tie-in to"].iloc[i]
-                         if i < len(_cur) else ("Host" if i == 0 else "T1"),
-                         "Flowline leg (km)":
-                             float(_cur["Flowline leg (km)"].iloc[i])
-                             if i < len(_cur) else 4.0,
-                         "Umbilical leg (km)":
-                             float(_cur["Umbilical leg (km)"].iloc[i])
-                             if i < len(_cur) else 4.0}
-                        for i in range(int(n_templates))])
+                    new_rows = []
+                    for i in range(int(n_templates)):
+                        if i < len(_cur):
+                            new_rows.append(_cur.iloc[i].to_dict())
+                        else:
+                            new_rows.append(_default_td_row(i))
+                    _cur = pd.DataFrame(new_rows)
                     st.session_state[_td_key] = _cur
+
+                st.caption(
+                    "Set each template's type, role, position (X/Y km from "
+                    "the host at 0,0) and tie-in. The aerial view places "
+                    "templates and host by these coordinates, to scale. "
+                    "Press **Apply template layout** to use the edits.")
                 edited_td = st.data_editor(
                     st.session_state[_td_key],
                     key=f"dc_td_editor_{int(n_templates)}",
                     use_container_width=True, hide_index=True,
                     column_config={
                         "Template": st.column_config.TextColumn(
-                            "Template", disabled=True),
+                            "ID", disabled=True),
+                        "Name": st.column_config.TextColumn(
+                            "Name", help="Display name on the schematic."),
+                        "Type": st.column_config.SelectboxColumn(
+                            "Template type", options=_std_types,
+                            help="Standard subsea template type — sets the "
+                                 "slot count and cost."),
                         "Slots": st.column_config.NumberColumn(
                             "Slots", min_value=1, max_value=12, step=1,
-                            help="Well slots on this template."),
+                            help="Well slots — auto-set from the type, but "
+                                 "can be overridden."),
+                        "Role": st.column_config.SelectboxColumn(
+                            "Role", options=["Producer", "Injector"],
+                            help="Producer or water-injector template — "
+                                 "colours the slots on the schematic."),
                         "Tie-in to": st.column_config.SelectboxColumn(
                             "Tie-in to", options=tie_options,
-                            help="Where this template's production routes — "
-                                 "the host, or another template "
-                                 "(daisy-chained)."),
+                            help="Where this template routes — the host or "
+                                 "another template (daisy-chained)."),
+                        "X (km)": st.column_config.NumberColumn(
+                            "X (km)", step=1.0, format="%.1f",
+                            help="East-west position relative to the host "
+                                 "(host at 0). Negative = west of host."),
+                        "Y (km)": st.column_config.NumberColumn(
+                            "Y (km)", step=1.0, format="%.1f",
+                            help="North-south position relative to the "
+                                 "host (host at 0)."),
                         "Flowline leg (km)":
                             st.column_config.NumberColumn(
                                 "Flowline leg (km)", min_value=0.0,
                                 step=1.0, format="%.1f",
-                                help="Length of the flowline from this "
-                                     "template to its tie-in point."),
+                                help="Flowline length from this template "
+                                     "to its tie-in point."),
                         "Umbilical leg (km)":
                             st.column_config.NumberColumn(
                                 "Umbilical leg (km)", min_value=0.0,
                                 step=1.0, format="%.1f"),
                     })
-                st.session_state[_td_key] = edited_td
+
+                _apply_td = st.button("✅ Apply template layout",
+                                       key=f"dc_apply_td_{int(n_templates)}",
+                                       help="Commit the template-table "
+                                            "edits and refresh the concept "
+                                            "and schematics.")
+                if _apply_td:
+                    # sync slot count to the chosen standard type
+                    _e = edited_td.copy()
+                    for i in _e.index:
+                        ttype = str(_e.at[i, "Type"])
+                        _e.at[i, "Slots"] = _TEMPLATE_SLOT_CAPACITY_UI.get(
+                            ttype, int(_e.at[i, "Slots"]))
+                    st.session_state[_td_key] = _e
+                    mark_stale()
+                    st.success("Template layout applied.")
+                    st.rerun()
+
+                _td_use = st.session_state[_td_key]
                 templates_detail = []
-                for i, row in edited_td.iterrows():
+                for i, row in _td_use.iterrows():
                     templates_detail.append({
+                        "name": str(row.get("Name", f"T{i+1}")),
+                        "template_type": str(row.get("Type",
+                                                     "4-slot (4 wells)")),
                         "slots": int(row["Slots"]),
+                        "role": str(row.get("Role", "Producer")).lower(),
                         "tie_to": str(row["Tie-in to"]),
+                        "x_km": float(row.get("X (km)", -14.0)),
+                        "y_km": float(row.get("Y (km)", 0.0)),
                         "flowline_km": float(row["Flowline leg (km)"]),
                         "umbilical_km": float(row["Umbilical leg (km)"]),
                     })
@@ -6170,6 +6510,23 @@ def economics_section(units, start_date):
                 value=max(1, int(n_templates)), step=1, key="dc_n_hipps",
                 help="Typically one HIPPS skid per template / drill centre.")
 
+        # Subsea multiphase flow metering
+        mpfm_on = st.checkbox(
+            "Include subsea multiphase flow meters",
+            value=False, key="dc_mpfm",
+            help="Per-well or per-template multiphase flow meters give "
+                 "continuous oil/gas/water allocation without subsea test "
+                 "separation. ~$3.2MM per meter (one per producing well "
+                 "by default). Common on modern NCS subsea developments.")
+        n_mpfm_ui = 0
+        if mpfm_on:
+            n_mpfm_ui = st.number_input(
+                "Number of multiphase meters", min_value=1,
+                value=max(1, int(n_subsea_wells)), step=1,
+                key="dc_n_mpfm",
+                help="Typically one per producing subsea well; some "
+                     "developments meter per template instead.")
+
         dc_spec = {
             "concept_type": concept_type,
             "host_type": host_type,
@@ -6180,6 +6537,8 @@ def economics_section(units, start_date):
             "reservoir_temp_F": _t_F,
             "hipps": hipps_on,
             "n_hipps": n_hipps_ui,
+            "multiphase_metering": mpfm_on,
+            "n_multiphase_meters": n_mpfm_ui,
             "template_type": template_type,
             "template_layout": template_layout,
             "n_templates": n_templates,
@@ -7347,6 +7706,30 @@ def plot_economics(df_e):
         "opex": "sum", "capex_well": "sum", "capex_facility": "sum",
         "tax": "sum", "abandonment": "sum", "cashflow": "sum"
     }).reset_index()
+    # The timeline starts when money first moves — the first year with any
+    # CAPEX (development investment usually precedes first oil) — and ends
+    # at cessation (the last year with any cost or revenue). Trim the annual
+    # frame to that span so the x-axis reflects the true project life.
+    annual["_cost"] = (annual["capex_well"].abs()
+                       + annual["capex_facility"].abs()
+                       + annual["abandonment"].abs()
+                       + annual["revenue"].abs())
+    active = annual[annual["_cost"] > 1.0]
+    if len(active) > 0:
+        y0, y1 = active["year"].min(), active["year"].max()
+        annual = annual[(annual["year"] >= y0)
+                        & (annual["year"] <= y1)].reset_index(drop=True)
+
+    # First-oil and cessation calendar years for reference markers
+    first_oil_year = None
+    if (df_e["revenue"] > 0).any():
+        first_oil_year = int(
+            pd.to_datetime(
+                df_e.loc[df_e["revenue"] > 0, "date"].iloc[0]).year)
+    cessation_year = None
+    cidx = df_e.attrs.get("cessation_idx")
+    if cidx is not None and cidx < len(df_e):
+        cessation_year = int(pd.to_datetime(df_e["date"].iloc[cidx]).year)
 
     fig = make_subplots(rows=1, cols=2,
                         subplot_titles=("Annual cashflow buildup ($MM)",
@@ -7364,6 +7747,14 @@ def plot_economics(df_e):
     for col, name, color, sign in bars:
         fig.add_trace(go.Bar(x=annual["year"], y=sign * annual[col]/1e6,
                              name=name, marker_color=color), row=1, col=1)
+    # mark first oil on the buildup chart
+    if first_oil_year is not None:
+        fh.safe_vline(fig, first_oil_year, label="First oil",
+                      color="#2ca02c", dash="dot", row=1, col=1)
+    if cessation_year is not None:
+        fh.safe_vline(fig, cessation_year, label="Cessation",
+                      color="#7f7f7f", dash="dot", row=1, col=1,
+                      label_position="bottom")
     fig.add_trace(go.Scatter(x=df_e["date"], y=df_e["cum_cashflow"]/1e6,
                              name="Cum CF", line=dict(color="#1f77b4", width=2)),
                   row=1, col=2)
@@ -7371,6 +7762,8 @@ def plot_economics(df_e):
                              name="NPV", line=dict(color="#ff7f0e", width=2, dash="dash")),
                   row=1, col=2)
     fig.add_hline(y=0, line=dict(color="grey", dash="dot"), row=1, col=2)
+    fig.update_xaxes(title_text="Calendar year", row=1, col=1)
+    fig.update_xaxes(title_text="Date", row=1, col=2)
     fig.update_layout(barmode="relative", height=450,
                       legend=dict(orientation="h", y=-0.2))
     return fh.apply_plot_template(fig)
@@ -7557,7 +7950,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "4.0"
+    _EXPECTED_FP_VERSION = "4.2"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -7678,6 +8071,99 @@ def main():
     # Multi-reservoir UI (after wells so we know well names)
     prod_names = [w.name for w in wells if w.is_producer]
     inj_names  = [w.name for w in wells if not w.is_producer]
+
+    # ---- Well-head shut-in pressure ----
+    # The shut-in well-head pressure is essential for the concept: the
+    # flowline, riser and host must be rated for it, or a HIPPS is needed.
+    with st.expander("🔧 Well-head shut-in pressure (concept design)",
+                     expanded=False):
+        st.caption(
+            "The shut-in well-head pressure (SIWHP) is the surface pressure "
+            "when the well is closed in — reservoir pressure minus the "
+            "hydrostatic head of the static fluid column. It sets the "
+            "design pressure for the flowline, riser and host, and decides "
+            "whether a HIPPS is required.")
+        pvt_in = inputs.get("pvt")
+        _p_res_disp = st.number_input(
+            f"Static reservoir pressure ({ulabel('pressure', units)})",
+            value=from_field(pvt_in.p_init_psi if pvt_in else 4000.0,
+                             "pressure", units),
+            key="siwhp_p_res",
+            help="Current static reservoir pressure at datum. Defaults to "
+                 "the PVT initial pressure; lower it to see the shut-in "
+                 "pressure later in field life.")
+        sc1, sc2 = st.columns(2)
+        _datum_disp = sc1.number_input(
+            f"Reservoir datum depth, TVD ({ulabel('depth', units)})",
+            value=from_field(8500.0, "depth", units),
+            key="siwhp_datum",
+            help="True vertical depth of the reservoir datum below the "
+                 "well-head.")
+        _wd_disp = sc2.number_input(
+            f"Water depth ({ulabel('depth', units)}) — 0 for a dry tree",
+            value=0.0, key="siwhp_wd",
+            help="For a subsea tree, the well-head sits at the mudline. "
+                 "The static column is datum → mudline, so a deeper water "
+                 "depth gives a shorter column and a higher SIWHP. Use 0 "
+                 "for a platform / dry tree.")
+        _t_wh = sc1.number_input(
+            f"Well-head temperature ({ulabel('temp', units)})",
+            value=from_field(40.0, "temp", units), key="siwhp_twh",
+            help="Temperature at the well-head — near seabed temperature "
+                 "for a subsea tree (~4°C), higher for a dry tree.")
+        _wc_siwhp = sc2.slider(
+            "Water cut in the column", 0.0, 1.0, 0.0, 0.05,
+            key="siwhp_wc",
+            help="Fraction of water in the wellbore liquid column. A "
+                 "higher water cut means a heavier column and a lower "
+                 "shut-in well-head pressure (oil wells only).")
+        if st.button("Compute shut-in well-head pressure",
+                     key="siwhp_compute"):
+            try:
+                res = fh.shutin_wellhead_pressure(
+                    reservoir_pressure_psi=to_field(_p_res_disp,
+                                                    "pressure", units),
+                    datum_depth_ft=to_field(_datum_disp, "depth", units),
+                    fluid_system=fluid,
+                    t_res_F=pvt_in.t_res_F if pvt_in else 200.0,
+                    t_wh_F=to_field(_t_wh, "temp", units),
+                    gas_grav=pvt_in.gas_grav if pvt_in else 0.7,
+                    api=pvt_in.api if pvt_in else 35.0,
+                    water_cut=_wc_siwhp,
+                    wellhead_depth_ft=to_field(_wd_disp, "depth", units))
+                siwhp_disp = from_field(res["shutin_whp_psi"],
+                                        "pressure", units)
+                head_disp = from_field(res["head_psi"], "pressure", units)
+                k1, k2, k3 = st.columns(3)
+                k1.metric(f"Shut-in WHP ({ulabel('pressure', units)})",
+                          f"{siwhp_disp:,.0f}")
+                k2.metric(f"Hydrostatic head ({ulabel('pressure', units)})",
+                          f"{head_disp:,.0f}")
+                k3.metric("Column type", res["column_kind"].title())
+                st.caption(
+                    f"Method: {res['method']}. "
+                    f"Static gradient ≈ {res['gradient_psi_ft']:.3f} "
+                    f"psi/ft."
+                    + (f" Mean gas Z ≈ {res['z_avg']:.3f}."
+                       if "z_avg" in res else
+                       f" Column specific gravity ≈ "
+                       f"{res.get('sg_column', 0):.3f}."))
+                # design-rating guidance
+                siwhp = res["shutin_whp_psi"]
+                std_ratings = [2500, 5000, 10000, 15000]
+                rating = next((r for r in std_ratings if r >= siwhp * 1.1),
+                              20000)
+                st.info(
+                    f"**Concept implication:** the flowline / riser / host "
+                    f"should be rated for at least the shut-in WHP plus a "
+                    f"margin — a standard **{rating:,} psi** class fits "
+                    f"here. If the chosen host or flowline is rated below "
+                    f"{siwhp:,.0f} psi, a **HIPPS** (High Integrity "
+                    f"Pressure Protection System) is required to protect "
+                    f"the downstream equipment.")
+            except Exception as e:
+                st.error(f"Could not compute shut-in pressure: {e}")
+
     reservoirs, well_links = reservoir_section(units, inputs, prod_names, inj_names)
 
     cap_sched = capacity_section(units, inputs["start_date"], inputs.get("strategy", "Injection"))
@@ -7706,6 +8192,17 @@ def main():
         retrograde_enabled=inputs.get("retrograde_enabled", False),
         retrograde_drop_fraction=inputs.get("retrograde_drop_fraction",
                                             0.55),
+        fractional_flow_enabled=inputs.get("fractional_flow_enabled",
+                                           False),
+        ff_swc=inputs.get("ff_params", {}).get("swc", 0.20),
+        ff_sor=inputs.get("ff_params", {}).get("sor", 0.25),
+        ff_krw_max=inputs.get("ff_params", {}).get("krw_max", 0.30),
+        ff_kro_max=inputs.get("ff_params", {}).get("kro_max", 0.90),
+        ff_nw=inputs.get("ff_params", {}).get("nw", 3.0),
+        ff_no=inputs.get("ff_params", {}).get("no", 2.0),
+        ff_mu_oil=inputs.get("ff_params", {}).get("mu_oil", 1.5),
+        ff_mu_water=inputs.get("ff_params", {}).get("mu_water", 0.4),
+        ff_sweep=inputs.get("ff_params", {}).get("sweep", 0.70),
     )
 
     st.divider()

@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "4.0"
+FP_HELPERS_VERSION = "4.2"
 
 import io
 import json
@@ -1206,7 +1206,12 @@ def safe_hline(fig, y, label=None, color="#333", dash="dash", width=1,
             xanchor="right", yanchor="bottom",
         )
         if row is not None and col is not None:
-            ann.pop("xref", None); ann.pop("yref", None)
+            # In a subplot the annotation must reference the subplot's
+            # axis domain — NOT be left bare. A bare x=0.99 is read as a
+            # data coordinate, and on a date axis 0.99 ≈ epoch (1970),
+            # which both misplaces the label and drags the axis to 1970.
+            ann["xref"] = "x domain"
+            ann["yref"] = "y"
             fig.add_annotation(**ann, row=row, col=col)
         else:
             fig.add_annotation(**ann)
@@ -1665,6 +1670,231 @@ def type_curve_preview_series(template: dict, months: int = 240) -> tuple[list, 
             r = qi * math.exp(-di * ty)
         rates.append(max(0.0, r))
     return months_arr, rates
+
+
+# =============================================================================
+# Fractional-flow water cut (Buckley-Leverett / Corey relative permeability)
+# =============================================================================
+# In a waterflood, the produced water cut is governed by the physics of the
+# displacement, not by an arbitrary ramp. As water sweeps the reservoir the
+# average water saturation behind the front rises, the water relative
+# permeability rises and the oil relative permeability falls, so the
+# fractional flow of water f_w climbs an S-shaped curve.
+#
+# This module gives an optional, physics-based water-cut mode:
+#   1. Corey relative-permeability curves k_rw(S_w), k_ro(S_w).
+#   2. The fractional-flow function f_w(S_w) from those curves and the
+#      oil/water viscosity ratio.
+#   3. A saturation tracker — average S_w in the swept region grows with the
+#      cumulative voidage / displaced volume — which maps each month's
+#      recovery to a saturation, and thus to a water cut.
+#
+# This is still a screening representation (a tank-averaged saturation, not a
+# 1-D Buckley-Leverett front), but the water cut now emerges from saturation
+# physics and the rel-perm inputs rather than from a user-set ramp.
+
+def corey_rel_perm(sw, swc, sor, krw_max, kro_max, nw, no):
+    """Corey relative-permeability curves.
+
+    Args:
+        sw      : water saturation (scalar or array).
+        swc     : connate (irreducible) water saturation.
+        sor     : residual oil saturation.
+        krw_max : water rel-perm endpoint (at S_w = 1 - sor).
+        kro_max : oil rel-perm endpoint (at S_w = swc).
+        nw, no  : Corey exponents for water and oil.
+
+    Returns (k_rw, k_ro).
+    """
+    sw = np.asarray(sw, dtype=float)
+    denom = max(1.0 - swc - sor, 1e-6)
+    # normalised water saturation, clipped to [0, 1]
+    swn = np.clip((sw - swc) / denom, 0.0, 1.0)
+    krw = krw_max * np.power(swn, nw)
+    kro = kro_max * np.power(1.0 - swn, no)
+    return krw, kro
+
+
+def fractional_flow(sw, swc, sor, krw_max, kro_max, nw, no,
+                    mu_oil, mu_water):
+    """Water fractional flow f_w(S_w) from Corey curves and viscosities.
+
+        f_w = 1 / (1 + (k_ro / mu_o) / (k_rw / mu_w))
+
+    At S_w = swc, f_w = 0 (no mobile water); at S_w = 1 - sor, f_w = 1.
+    """
+    krw, kro = corey_rel_perm(sw, swc, sor, krw_max, kro_max, nw, no)
+    mob_w = krw / max(mu_water, 1e-6)
+    mob_o = kro / max(mu_oil, 1e-6)
+    # guard the f_w = 0 endpoint where mob_w is ~0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fw = mob_w / (mob_w + mob_o)
+    fw = np.where(np.isfinite(fw), fw, 0.0)
+    return np.clip(fw, 0.0, 1.0)
+
+
+def fractional_flow_watercut(recovery_fraction, ff_params):
+    """Map a per-month oil-recovery fraction to a produced water cut via a
+    fractional-flow model.
+
+    The average water saturation in the contacted reservoir rises linearly
+    with the displacement: at zero recovery S_w = S_wc, and at the maximum
+    moveable recovery S_w reaches 1 - S_or. The water cut for each month is
+    f_w evaluated at that saturation.
+
+    Args:
+        recovery_fraction : array of cumulative oil recovery fraction
+                            (0 -> 1 of OOIP) per month.
+        ff_params         : dict with keys swc, sor, krw_max, kro_max,
+                            nw, no, mu_oil, mu_water, sweep_efficiency.
+
+    Returns dict:
+        water_cut : array of fractional water cut per month
+        sw        : array of average water saturation per month
+        bt_index  : index of water breakthrough (first month f_w > 0.01),
+                    or -1 if no breakthrough
+    """
+    rf = np.asarray(recovery_fraction, dtype=float)
+    swc = float(ff_params.get("swc", 0.20))
+    sor = float(ff_params.get("sor", 0.25))
+    krw_max = float(ff_params.get("krw_max", 0.30))
+    kro_max = float(ff_params.get("kro_max", 0.90))
+    nw = float(ff_params.get("nw", 3.0))
+    no = float(ff_params.get("no", 2.0))
+    mu_oil = float(ff_params.get("mu_oil", 1.5))
+    mu_water = float(ff_params.get("mu_water", 0.4))
+    sweep = float(ff_params.get("sweep_efficiency", 0.7))
+
+    # moveable oil saturation window
+    movable = max(1.0 - swc - sor, 1e-6)
+    # recovery fraction expressed against the *moveable* oil, capped by the
+    # sweep efficiency (unswept oil never contributes to rising S_w)
+    rf_movable = np.clip(rf / max(movable * sweep, 1e-6), 0.0, 1.0)
+    # average water saturation grows from swc to (1 - sor)
+    sw = swc + rf_movable * movable
+    water_cut = fractional_flow(sw, swc, sor, krw_max, kro_max, nw, no,
+                                mu_oil, mu_water)
+    bt = np.argmax(water_cut > 0.01) if np.any(water_cut > 0.01) else -1
+    return {"water_cut": water_cut, "sw": sw, "bt_index": int(bt)}
+
+
+# =============================================================================
+# Well-head shut-in pressure (SITHP / SIWHP)
+# =============================================================================
+# The shut-in well-head pressure is the pressure at the top of the well when
+# it is closed in: the reservoir pressure transmitted to surface through the
+# static fluid column, minus the hydrostatic head of that column.
+#
+#   Gas wells   — the column is gas; the head is small and pressure-
+#                 dependent. Solved with the average-temperature /
+#                 average-Z method (a compact Cullender-&-Smith style
+#                 iteration): P_wh = P_res * exp(-s), s = 0.01875·γg·H/(Z̄·T̄).
+#   Oil wells   — the column is liquid (oil, or oil over water); the head is
+#                 the fluid density gradient × the true vertical depth.
+#
+# The shut-in WHP drives concept decisions: the flowline, riser and host
+# must be rated for it, or a HIPPS is required.
+
+def _gas_z_factor(p_psi, t_F, gas_grav):
+    """Brill-Beggs / Standing-style gas compressibility factor Z."""
+    t_R = t_F + 460.0
+    ppc = 756.8 - 131.0 * gas_grav - 3.6 * gas_grav ** 2
+    tpc = 169.2 + 349.5 * gas_grav - 74.0 * gas_grav ** 2
+    ppr = max(p_psi, 14.7) / ppc
+    tpr = t_R / tpc
+    A = 1.39 * (max(tpr - 0.92, 0.0)) ** 0.5 - 0.36 * tpr - 0.101
+    E = 9.0 * (tpr - 1.0)
+    B = ((0.62 - 0.23 * tpr) * ppr
+         + (0.066 / (tpr - 0.86) - 0.037) * ppr ** 2
+         + 0.32 * ppr ** 6 / (10 ** min(E, 50)))
+    C = 0.132 - 0.32 * math.log10(tpr)
+    F = 0.3106 - 0.49 * tpr + 0.1824 * tpr ** 2
+    return max(A + (1.0 - A) / math.exp(min(B, 50)) + C * ppr ** F, 0.3)
+
+
+def shutin_wellhead_pressure(reservoir_pressure_psi, datum_depth_ft,
+                              fluid_system, t_res_F, t_wh_F,
+                              gas_grav=0.7, api=35.0, water_cut=0.0,
+                              wellhead_depth_ft=0.0):
+    """Compute the shut-in well-head pressure.
+
+    Args:
+        reservoir_pressure_psi : current static reservoir pressure.
+        datum_depth_ft         : true vertical depth of the reservoir datum.
+        fluid_system           : the field's fluid system string.
+        t_res_F, t_wh_F        : reservoir and well-head temperatures (°F).
+        gas_grav               : gas specific gravity (air = 1).
+        api                    : oil API gravity.
+        water_cut              : fraction of water in the liquid column
+                                  (raises the column density for oil wells).
+        wellhead_depth_ft      : water depth for a subsea tree (the well-head
+                                  sits below sea level); 0 for a dry tree.
+
+    Returns dict:
+        shutin_whp_psi  : shut-in well-head pressure
+        column_kind     : "gas" or "liquid"
+        gradient_psi_ft : effective static gradient of the column
+        head_psi        : total hydrostatic head subtracted
+        method          : short description of the method used
+    """
+    P_res = float(reservoir_pressure_psi)
+    # column height = reservoir datum minus the well-head elevation. A subsea
+    # tree sits at the mudline (wellhead_depth_ft below sea level), so the
+    # static column is datum -> mudline.
+    H = max(float(datum_depth_ft) - float(wellhead_depth_ft), 1.0)
+
+    # A field is a "gas column" well only when the primary produced fluid
+    # is gas. "Oil with associated gas" is an OIL well (liquid column) even
+    # though the string contains the word "gas", so match explicitly.
+    fl = fluid_system.lower()
+    gas_systems = ("dry gas", "gas with condensate", "wet gas",
+                   "gas condensate")
+    is_gas = any(g in fl for g in gas_systems)
+
+    if is_gas:
+        # Average-temperature / average-Z method. Iterate: guess P_wh,
+        # evaluate Z at the mean pressure & temperature, recompute.
+        t_avg_R = ((t_res_F + t_wh_F) / 2.0) + 460.0
+        p_wh = P_res * 0.85   # initial guess
+        for _ in range(30):
+            p_avg = 0.5 * (P_res + p_wh)
+            z_avg = _gas_z_factor(p_avg, (t_res_F + t_wh_F) / 2.0,
+                                  gas_grav)
+            # s is dimensionless: 0.01875 · γg · H / (Z̄ · T̄)
+            s = 0.01875 * gas_grav * H / (z_avg * t_avg_R)
+            new_p_wh = P_res / math.exp(s)
+            if abs(new_p_wh - p_wh) < 0.5:
+                p_wh = new_p_wh
+                break
+            p_wh = new_p_wh
+        p_avg = 0.5 * (P_res + p_wh)
+        z_avg = _gas_z_factor(p_avg, (t_res_F + t_wh_F) / 2.0, gas_grav)
+        head = P_res - p_wh
+        return {
+            "shutin_whp_psi": p_wh,
+            "column_kind": "gas",
+            "gradient_psi_ft": head / H,
+            "head_psi": head,
+            "z_avg": z_avg,
+            "method": "Average-T / average-Z gas-column method",
+        }
+    else:
+        # Liquid column. Oil density from API; blend with water by water cut.
+        sg_oil = 141.5 / (131.5 + max(api, 5.0))
+        sg_water = 1.03   # NCS-type formation water
+        sg_col = sg_oil * (1.0 - water_cut) + sg_water * water_cut
+        # static gradient: 0.433 psi/ft for fresh water (SG 1.0)
+        grad = 0.433 * sg_col
+        head = grad * H
+        p_wh = max(P_res - head, 0.0)
+        return {
+            "shutin_whp_psi": p_wh,
+            "column_kind": "liquid",
+            "gradient_psi_ft": grad,
+            "head_psi": head,
+            "sg_column": sg_col,
+            "method": "Static liquid-column hydrostatic method",
+        }
 
 
 # =============================================================================
@@ -2728,6 +2958,9 @@ def template_cost_for_slots(n_slots: int) -> float:
 # effectively mandatory for HPHT subsea developments where the flowline /
 # host is not rated for full reservoir shut-in pressure.
 _HIPPS_COST = 45.0   # $MM per HIPPS skid (NCS 2025 screening)
+# Subsea multiphase flow meter — measures oil/gas/water rates per well or
+# per template without test separation. $MM per meter, NCS 2025 screening.
+_MULTIPHASE_METER_COST = 3.2
 # Umbilical cost ($MM per km) — NCS 2025
 _UMBILICAL_MMUSD_PER_KM = 2.1
 # Subsea boosting (multiphase pump station) — $MM per station, NCS 2025
@@ -3126,6 +3359,17 @@ def build_development_concept(spec: dict) -> dict:
         cost_hipps = n_hipps * _HIPPS_COST * hpht_uplift
         _push(120, cost_hipps,
               f"{n_hipps} × HIPPS pressure-protection skid{_hpht_sfx}")
+
+    # Subsea multiphase flow meters — allocation metering per well or per
+    # template, avoiding the need for subsea test separation. Defaults to
+    # one per producing well when enabled.
+    if bool(g("multiphase_metering", False)):
+        n_mpfm = int(g("n_multiphase_meters", 0))
+        if n_mpfm <= 0:
+            n_mpfm = max(1, n_subsea_wells)
+        cost_mpfm = n_mpfm * _MULTIPHASE_METER_COST * hpht_uplift
+        _push(120, cost_mpfm,
+              f"{n_mpfm} × subsea multiphase flow meter{_hpht_sfx}")
 
     # Xmas trees — HPHT uplift applies (HPHT-rated trees cost materially more).
     cost_wet_trees = (n_subsea_wells * _XMAS_TREE_COST["Wet (subsea) tree"]
@@ -3758,20 +4002,96 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
     return "".join(parts)
 
 
-def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
-    """Generate an aerial (plan-view) SVG of the subsea development layout.
+def _draw_square_template(tx, ty, label, n_wells_here, n_slots,
+                          slot_kinds=None, size=46):
+    """Draw a 2x2-style subsea template in plan view (Gjøa/Nova style).
 
-    Where _concept_schematic_svg is a side-view cross-section, this is a
-    top-down map: templates as slot-accurate rectangles, wells as dots,
-    flowlines and the umbilical routing to the host, manifolds, boosting
-    stations and the export line. Gives the user a 'field layout' view.
+    A square structural frame with a 2x2 (or larger NxN) grid of slot
+    cells. Filled cells carry a well; cells are colour-coded by role:
+    green = oil producer, blue = water injector, hatched = spare/empty.
+
+    Args:
+        tx, ty       : centre of the template (SVG coords).
+        label        : template label text.
+        n_wells_here : number of wells installed on this template.
+        n_slots      : total slot count (the grid is sized to fit it).
+        slot_kinds   : optional list of "oil"/"water"/"spare" per slot.
+        size         : template square edge length in px.
+    Returns (svg_string, list_of_slot_centre_points).
+    """
+    sub = []
+    half = size / 2.0
+    # outer structural frame
+    sub.append(
+        f'<rect x="{tx-half:.1f}" y="{ty-half:.1f}" width="{size}" '
+        f'height="{size}" rx="3" fill="#cdd6dd" stroke="#2a363d" '
+        f'stroke-width="2.5"/>')
+    # corner foundation piles
+    for dx in (-half+5, half-5):
+        for dy in (-half+5, half-5):
+            sub.append(f'<circle cx="{tx+dx:.1f}" cy="{ty+dy:.1f}" '
+                       f'r="3" fill="#2a363d"/>')
+    # slot grid — make it as square as possible
+    grid = max(2, int(math.ceil(math.sqrt(max(n_slots, 1)))))
+    cell = (size - 12) / grid
+    pad = 6
+    slot_pts = []
+    for s in range(n_slots):
+        r, c = divmod(s, grid)
+        cx = tx - half + pad + cell * (c + 0.5)
+        cy = ty - half + pad + cell * (r + 0.5)
+        filled = s < n_wells_here
+        kind = (slot_kinds[s] if slot_kinds and s < len(slot_kinds)
+                else ("oil" if filled else "spare"))
+        if not filled:
+            kind = "spare"
+        if kind == "oil":
+            fill = "#3aa856"          # green — oil producer
+        elif kind == "water":
+            fill = "#2f6fb0"          # blue — water injector
+        elif kind == "gas":
+            fill = "#d98a2b"          # orange — gas producer
+        else:
+            fill = "#e7ecef"          # empty / spare
+        csz = cell * 0.74
+        sub.append(
+            f'<rect x="{cx-csz/2:.1f}" y="{cy-csz/2:.1f}" '
+            f'width="{csz:.1f}" height="{csz:.1f}" rx="2" '
+            f'fill="{fill}" stroke="#2a363d" stroke-width="1.3"/>')
+        if kind == "spare":
+            # cross-hatch a spare slot
+            o = csz / 2 * 0.7
+            sub.append(f'<line x1="{cx-o:.1f}" y1="{cy-o:.1f}" '
+                       f'x2="{cx+o:.1f}" y2="{cy+o:.1f}" '
+                       f'stroke="#9aa6ad" stroke-width="1.2"/>')
+            sub.append(f'<line x1="{cx-o:.1f}" y1="{cy+o:.1f}" '
+                       f'x2="{cx+o:.1f}" y2="{cy-o:.1f}" '
+                       f'stroke="#9aa6ad" stroke-width="1.2"/>')
+        if filled:
+            slot_pts.append((cx, cy))
+    sub.append(
+        f'<text x="{tx:.1f}" y="{ty - half - 6:.1f}" font-size="10.5" '
+        f'fill="#1a2730" text-anchor="middle" '
+        f'font-weight="bold">{label}</text>')
+    return "".join(sub), slot_pts
+
+
+def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
+    """Generate a coordinate-accurate aerial (plan-view) SVG of the subsea
+    development.
+
+    Templates and the host are placed by real-world (x, y) coordinates in
+    km — supplied per template in templates_detail, or derived from the
+    tie-in topology and leg lengths. A single km->pixel scale is computed
+    from the overall field extent so the distances drawn between templates,
+    manifolds and the host are to scale. Templates are drawn as 2x2-style
+    square subsea structures (Gjøa / Nova style).
     """
     def g(key, default=None):
         return spec.get(key, default)
 
     n_subsea = int(g("n_subsea_wells", 0))
-    n_dry = int(g("n_dry_wells", 0))
-    n_templates = max(0, int(g("n_templates", 0)))
+    n_templates = max(1, int(g("n_templates", 0) or 1))
     n_boosting = int(g("n_boosting_stations", 0))
     n_manifolds = int(g("n_manifolds", 0))
     flowline_km = float(g("flowline_km", 0.0))
@@ -3782,30 +4102,31 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
     template_type = str(g("template_type", "4-slot (4 wells)"))
     template_layout = str(g("template_layout", "clustered"))
     host_type = str(g("host_type", ""))
+    templates_detail = g("templates_detail", None)
 
-    W, H = 720, 440
+    W, H = 760, 470
     parts = []
     parts.append(f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
                  f'height="{H}" viewBox="0 0 {W} {H}" '
                  f'font-family="sans-serif">')
-    # Seabed background with a subtle bathymetry grid
     parts.append(f'<rect x="0" y="0" width="{W}" height="{H}" '
-                 f'fill="#e8eef2"/>')
+                 f'fill="#eef3f6"/>')
     for gx in range(0, W, 60):
         parts.append(f'<line x1="{gx}" y1="0" x2="{gx}" y2="{H}" '
-                     f'stroke="#dde6ec" stroke-width="1"/>')
+                     f'stroke="#e1e9ee" stroke-width="1"/>')
     for gy in range(0, H, 60):
         parts.append(f'<line x1="0" y1="{gy}" x2="{W}" y2="{gy}" '
-                     f'stroke="#dde6ec" stroke-width="1"/>')
+                     f'stroke="#e1e9ee" stroke-width="1"/>')
+    parts.append(f'<text x="14" y="26" font-size="13" fill="#234" '
+                 f'font-weight="bold">Field layout — plan view '
+                 f'(to scale)</text>')
     # North arrow
-    parts.append(f'<g transform="translate(680,52)">'
-                 f'<line x1="0" y1="14" x2="0" y2="-14" stroke="#33648a" '
+    parts.append(f'<g transform="translate(715,58)">'
+                 f'<line x1="0" y1="15" x2="0" y2="-15" stroke="#33648a" '
                  f'stroke-width="2"/>'
-                 f'<path d="M0,-16 L-5,-6 L5,-6 Z" fill="#33648a"/>'
-                 f'<text x="0" y="-20" font-size="11" fill="#33648a" '
+                 f'<path d="M0,-17 L-5,-7 L5,-7 Z" fill="#33648a"/>'
+                 f'<text x="0" y="-21" font-size="11" fill="#33648a" '
                  f'text-anchor="middle">N</text></g>')
-    parts.append(f'<text x="12" y="24" font-size="13" fill="#234" '
-                 f'font-weight="bold">Field layout — plan view</text>')
 
     is_onshore = (concept_type == "Standalone"
                   and "Onshore" in host_type)
@@ -3816,239 +4137,264 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
         parts.append('</svg>')
         return "".join(parts)
 
-    # ---- Host position (right side) ----
-    host_x, host_y = 612, 210
-    floating = any(k in host_type for k in
-                   ("FPSO", "Semi", "Spar", "TLP", "Compliant"))
-    if floating:
-        # FPSO drawn as a ship-shaped hull from above
-        parts.append(
-            f'<ellipse cx="{host_x}" cy="{host_y}" rx="46" ry="20" '
-            f'fill="#8a96a0" stroke="#33414d" stroke-width="2"/>')
-        parts.append(
-            f'<path d="M{host_x+46},{host_y} l14,0 l-14,-8 z" '
-            f'fill="#8a96a0" stroke="#33414d" stroke-width="1"/>')
+    # ---- Establish real-world (x, y) coordinates in km ---------------
+    # The host sits at the origin (0, 0). Each template gets a coordinate:
+    #  - taken directly from templates_detail x_km / y_km if provided;
+    #  - else derived: templates are laid out away from the host along
+    #    -x, separated laterally, at a distance equal to their tie-in
+    #    leg length (so the drawn distance reflects the real km).
+    host_xy = (0.0, 0.0)
+    tpl_xy = []
+    if templates_detail and len(templates_detail) == n_templates:
+        has_coords = all(("x_km" in t and "y_km" in t)
+                         for t in templates_detail)
+        if has_coords:
+            for t in templates_detail:
+                tpl_xy.append((float(t["x_km"]), float(t["y_km"])))
+        else:
+            # derive from tie-in topology + leg lengths
+            # template tied to host -> placed at (-flowline_km, lateral)
+            # template tied to Tj   -> placed leg_km beyond Tj
+            placed = {}
+            # first pass: host-tied templates
+            order = list(range(n_templates))
+            lateral = 0
+            for i in order:
+                t = templates_detail[i]
+                tie = str(t.get("tie_to", "Host"))
+                leg = float(t.get("flowline_km", flowline_km or 10.0))
+                if tie == "Host" or not (tie.startswith("T")
+                                         and tie[1:].isdigit()):
+                    y = (lateral - (n_templates - 1) / 2.0) * 4.0
+                    placed[i] = (-max(leg, 1.0), y)
+                    lateral += 1
+            # second pass: chained templates (may need repeats)
+            for _ in range(n_templates):
+                for i in order:
+                    if i in placed:
+                        continue
+                    t = templates_detail[i]
+                    tie = str(t.get("tie_to", "Host"))
+                    leg = float(t.get("flowline_km",
+                                      flowline_km or 5.0))
+                    if tie.startswith("T") and tie[1:].isdigit():
+                        j = int(tie[1:]) - 1
+                        if j in placed:
+                            jx, jy = placed[j]
+                            placed[i] = (jx - max(leg, 1.0), jy + 3.0)
+            for i in order:
+                tpl_xy.append(placed.get(
+                    i, (-(flowline_km or 10.0), (i - (n_templates-1)/2)*4)))
     else:
-        # fixed platform — square deck from above
-        parts.append(
-            f'<rect x="{host_x-28}" y="{host_y-28}" width="56" height="56" '
-            f'rx="4" fill="#8a96a0" stroke="#33414d" stroke-width="2"/>')
-        for dx in (-18, 18):
-            for dy in (-18, 18):
-                parts.append(f'<circle cx="{host_x+dx}" cy="{host_y+dy}" '
-                              f'r="3.5" fill="#33414d"/>')
-    _host_label = ("Existing host" if concept_type == "Subsea tie-in"
-                   else (host_type or "Host facility"))
-    parts.append(f'<text x="{host_x}" y="{host_y+42}" font-size="11" '
-                 f'fill="#33414d" text-anchor="middle">{_host_label}</text>')
+        # simple mode — fan the templates out from the host
+        base_dist = max(flowline_km, host_distance_km, 8.0)
+        for i in range(n_templates):
+            if template_layout == "spread" and n_templates > 1:
+                x = -(base_dist + i * base_dist * 0.18)
+                y = (i - (n_templates - 1) / 2.0) * base_dist * 0.32
+            else:
+                r, c = divmod(i, 2)
+                x = -(base_dist + r * 3.0)
+                y = (c - 0.5) * 5.0 if n_templates > 1 else 0.0
+            tpl_xy.append((x, y))
 
-    # ---- Template positions (left field area) ----
-    n_t = max(1, n_templates)
-    templates_detail = spec.get("templates_detail", None)
-    field_cx, field_cy = 165, 220
-    if template_layout == "spread" and n_t > 1:
-        t_positions = [(field_cx + (i - (n_t - 1) / 2) * 26,
-                        field_cy + (i - (n_t - 1) / 2) * 82)
-                       for i in range(n_t)]
-    else:
-        cols = min(n_t, 2)
-        t_positions = []
-        for i in range(n_t):
-            r, c = divmod(i, cols)
-            t_positions.append((field_cx + c * 78 - (cols - 1) * 39,
-                                 field_cy + r * 80 - 40))
+    # ---- km -> pixel scale from the overall extent -------------------
+    all_x = [host_xy[0]] + [p[0] for p in tpl_xy]
+    all_y = [host_xy[1]] + [p[1] for p in tpl_xy]
+    min_x, max_x = min(all_x), max(all_x)
+    min_y, max_y = min(all_y), max(all_y)
+    span_x = max(max_x - min_x, 1.0)
+    span_y = max(max_y - min_y, 1.0)
+    # drawing area inside margins
+    mL, mR, mT, mB = 90, 150, 56, 80
+    avail_w = W - mL - mR
+    avail_h = H - mT - mB
+    scale = min(avail_w / span_x, avail_h / span_y)   # px per km
 
-    # per-template slot counts — from the detail list if present
-    def _slots_for(ti):
-        if templates_detail and ti < len(templates_detail):
-            return int(templates_detail[ti].get("slots", slot_capacity))
-        return slot_capacity
+    def to_px(xy):
+        # world x grows east; we draw the field to the LEFT of the host,
+        # so larger world-x -> larger pixel-x. y grows north -> up.
+        px = mL + (xy[0] - min_x) * scale
+        py = mT + (max_y - xy[1]) * scale
+        return px, py
 
-    def _draw_template(tx, ty, ti, n_wells_here, n_slots):
-        """Draw a realistic subsea production template, plan view: an outer
-        structural frame, an internal manifold pipe-run, and well slots as
-        guide-funnels (filled = a well is present)."""
-        sub = []
-        # frame sized to slot count
-        fw = 34 + min(n_slots, 8) * 9
-        fh_ = 40
-        # outer structural frame (mudmat footprint)
-        sub.append(
-            f'<rect x="{tx-fw/2:.0f}" y="{ty-fh_/2:.0f}" width="{fw:.0f}" '
-            f'height="{fh_}" rx="4" fill="#b9c4cc" stroke="#3a4750" '
-            f'stroke-width="2"/>')
-        # corner piles
-        for dx in (-fw/2+5, fw/2-5):
-            for dy in (-fh_/2+5, fh_/2-5):
-                sub.append(f'<circle cx="{tx+dx:.0f}" cy="{ty+dy:.0f}" '
-                           f'r="3" fill="#3a4750"/>')
-        # internal manifold header pipe
-        sub.append(
-            f'<rect x="{tx-fw/2+8:.0f}" y="{ty-4:.0f}" '
-            f'width="{fw-16:.0f}" height="8" rx="3" '
-            f'fill="#5a6b78" stroke="#2a363d" stroke-width="1"/>')
-        # well slots — guide funnels along the header
-        slot_pts = []
-        for s in range(n_slots):
-            sx = (tx - fw/2 + 14 +
-                  s * ((fw - 28) / max(1, n_slots - 1) if n_slots > 1
-                       else 0))
-            filled = s < n_wells_here
-            # guide funnel: outer ring + inner bore
-            sub.append(
-                f'<circle cx="{sx:.0f}" cy="{ty-13:.0f}" r="5.5" '
-                f'fill="#d6dde2" stroke="#3a4750" stroke-width="1.4"/>')
-            sub.append(
-                f'<circle cx="{sx:.0f}" cy="{ty-13:.0f}" r="2.6" '
-                f'fill="{"#11150f" if filled else "#9aa6ad"}"/>')
-            # tie of the slot to the header
-            sub.append(
-                f'<line x1="{sx:.0f}" y1="{ty-8:.0f}" x2="{sx:.0f}" '
-                f'y2="{ty-4:.0f}" stroke="#2a363d" stroke-width="1.5"/>')
-            if filled:
-                slot_pts.append((sx, ty - 13))
-        return "".join(sub), slot_pts, fw
+    host_px = to_px(host_xy)
+    tpl_px = [to_px(p) for p in tpl_xy]
 
-    wells_left = n_subsea
-    drawn_well_pts = []
-    template_centres = []
-    template_frames = []
-    for ti, (tx, ty) in enumerate(t_positions):
-        n_slots = _slots_for(ti)
-        this_wells = min(n_slots, wells_left)
-        svg_t, slot_pts, fw = _draw_template(tx, ty, ti, this_wells,
-                                             n_slots)
-        parts.append(svg_t)
-        drawn_well_pts.extend(slot_pts)
-        template_centres.append((tx, ty))
-        template_frames.append(fw)
-        wells_left -= this_wells
-        _lbl = (f"T{ti+1} · {n_slots}-slot" if templates_detail
-                else f"T{ti+1}")
-        parts.append(
-            f'<text x="{tx:.0f}" y="{ty + 32:.0f}" font-size="9.5" '
-            f'fill="#2a363d" text-anchor="middle" '
-            f'font-weight="bold">{_lbl}</text>')
+    # ---- Scale bar ----------------------------------------------------
+    # choose a "nice" round km length close to ~25% of the x-span
+    nice_targets = [1, 2, 5, 10, 20, 25, 50, 100]
+    target_km = span_x * 0.3
+    bar_km = min(nice_targets, key=lambda v: abs(v - target_km))
+    bar_px = bar_km * scale
+    sb_x, sb_y = mL, H - 30
+    parts.append(f'<line x1="{sb_x}" y1="{sb_y}" x2="{sb_x+bar_px:.1f}" '
+                 f'y2="{sb_y}" stroke="#33414d" stroke-width="3"/>')
+    for xx in (sb_x, sb_x + bar_px):
+        parts.append(f'<line x1="{xx:.1f}" y1="{sb_y-4}" x2="{xx:.1f}" '
+                     f'y2="{sb_y+4}" stroke="#33414d" stroke-width="2"/>')
+    parts.append(f'<text x="{sb_x+bar_px/2:.1f}" y="{sb_y-7}" '
+                 f'font-size="10" fill="#33414d" text-anchor="middle">'
+                 f'{bar_km} km</text>')
 
-    # ---- Tie-in routing -------------------------------------------------
-    def _route(x1, y1, x2, y2, color, width, dash=None):
+    # ---- Routing helper ----------------------------------------------
+    def _leg(p1, p2, color, width, dash=None, label=None,
+             label_dy=-6, label_color=None):
+        out = []
         d = (f' stroke-dasharray="{dash}"' if dash else '')
-        # right-angle-ish routed leg with an eased bend
-        midx = (x1 + x2) / 2
-        return (f'<path d="M{x1:.0f},{y1:.0f} C{midx:.0f},{y1:.0f} '
-                f'{midx:.0f},{y2:.0f} {x2:.0f},{y2:.0f}" fill="none" '
-                f'stroke="{color}" stroke-width="{width}"{d}/>')
+        out.append(f'<line x1="{p1[0]:.1f}" y1="{p1[1]:.1f}" '
+                   f'x2="{p2[0]:.1f}" y2="{p2[1]:.1f}" stroke="{color}" '
+                   f'stroke-width="{width}"{d}/>')
+        if label:
+            mx, my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
+            out.append(f'<text x="{mx:.1f}" y="{my+label_dy:.1f}" '
+                       f'font-size="9" fill="{label_color or color}" '
+                       f'text-anchor="middle">{label}</text>')
+        return "".join(out)
 
-    riser_base_x = host_x - 34
-    if templates_detail and len(templates_detail) == n_t:
-        # topology-driven routing — each template ties to its target
-        for ti, t in enumerate(templates_detail):
-            tx, ty = template_centres[ti]
+    # ---- Draw the tie-in legs (under the structures) -----------------
+    riser_offset = 0  # legs land directly on the host marker
+    if templates_detail and len(templates_detail) == n_templates:
+        for i, t in enumerate(templates_detail):
             tie = str(t.get("tie_to", "Host"))
             fl = float(t.get("flowline_km", 0.0))
-            umb = float(t.get("umbilical_km", 0.0))
+            p1 = tpl_px[i]
             if tie.startswith("T") and tie[1:].isdigit():
                 j = int(tie[1:]) - 1
-                if 0 <= j < n_t and j != ti:
-                    jx, jy = template_centres[j]
-                    parts.append(_route(tx, ty, jx, jy, "#246", 3.5))
-                    parts.append(_route(tx, ty+9, jx, jy+9, "#b07ac0",
-                                        2, "6,3"))
-                    parts.append(
-                        f'<text x="{(tx+jx)/2:.0f}" '
-                        f'y="{(ty+jy)/2-6:.0f}" font-size="8" fill="#246" '
-                        f'text-anchor="middle">{fl:.0f} km</text>')
-                    continue
-            # ties to the host
-            parts.append(_route(tx, ty, riser_base_x, host_y, "#246", 3.5))
-            parts.append(_route(tx, ty+9, riser_base_x, host_y+11,
-                                "#b07ac0", 2, "6,3"))
-            parts.append(
-                f'<text x="{(tx+riser_base_x)/2:.0f}" '
-                f'y="{(ty+host_y)/2-6:.0f}" font-size="8" fill="#246" '
-                f'text-anchor="middle">{fl:.0f} km</text>')
-        gather_x, gather_y = riser_base_x, host_y
+                if 0 <= j < n_templates and j != i:
+                    p2 = tpl_px[j]
+                else:
+                    p2 = host_px
+            else:
+                p2 = host_px
+            parts.append(_leg(p1, p2, "#235a86", 3.5,
+                              label=f"{fl:.0f} km" if fl else None))
+            parts.append(_leg((p1[0], p1[1]+7), (p2[0], p2[1]+7),
+                              "#b07ac0", 2, dash="6,3"))
     else:
-        # simple mode — manifold hub or chained templates, then to host
-        man_x, man_y = field_cx + 108, field_cy
-        if n_manifolds > 0:
-            parts.append(
-                f'<rect x="{man_x-14}" y="{man_y-14}" width="28" '
-                f'height="28" fill="#3b7a57" stroke="#1f3f2d" '
-                f'stroke-width="2" transform="rotate(45 {man_x} '
-                f'{man_y})"/>')
-            parts.append(f'<text x="{man_x}" y="{man_y+28}" font-size="9" '
-                         f'fill="#1f3f2d" text-anchor="middle">'
-                         f'Manifold ×{n_manifolds}</text>')
-            for (tx, ty) in template_centres:
-                parts.append(_route(tx, ty, man_x, man_y, "#888", 2.5))
-            gather_x, gather_y = man_x, man_y
-        else:
-            gather_x, gather_y = template_centres[-1]
-            if n_t > 1:
-                for i in range(len(template_centres) - 1):
-                    (x1, y1) = template_centres[i]
-                    (x2, y2) = template_centres[i + 1]
-                    parts.append(_route(x1, y1, x2, y2, "#888", 2.5,
-                                        "4,3"))
-        # main tie-back: gathering point -> host
-        parts.append(_route(gather_x, gather_y, riser_base_x, host_y,
-                            "#246", 4))
-        parts.append(f'<text x="{(gather_x+riser_base_x)/2:.0f}" '
-                     f'y="{(gather_y+host_y)/2-8:.0f}" font-size="10" '
-                     f'fill="#246" text-anchor="middle">'
-                     f'Flowline {flowline_km:.0f} km</text>')
-        parts.append(_route(gather_x, gather_y+10, riser_base_x,
-                            host_y+12, "#b07ac0", 2, "6,3"))
-        parts.append(f'<text x="{(gather_x+riser_base_x)/2:.0f}" '
-                     f'y="{(gather_y+host_y)/2+20:.0f}" font-size="9" '
-                     f'fill="#8a4f9a" text-anchor="middle">'
-                     f'Umbilical {umbilical_km:.0f} km</text>')
+        # simple mode: chain templates then a single tie-back to the host
+        for i in range(n_templates):
+            parts.append(_leg(tpl_px[i], host_px, "#235a86", 3.5))
+            parts.append(_leg((tpl_px[i][0], tpl_px[i][1]+7),
+                              (host_px[0], host_px[1]+7),
+                              "#b07ac0", 2, dash="6,3"))
+        # label the main tie-back distance
+        if n_templates > 0:
+            mx = (tpl_px[0][0] + host_px[0]) / 2
+            my = (tpl_px[0][1] + host_px[1]) / 2
+            parts.append(f'<text x="{mx:.1f}" y="{my-8:.1f}" '
+                         f'font-size="9.5" fill="#235a86" '
+                         f'text-anchor="middle">Flowline '
+                         f'{flowline_km:.0f} km</text>')
 
-    # tie-in porch at the host
-    parts.append(f'<circle cx="{riser_base_x:.0f}" cy="{host_y:.0f}" '
-                 f'r="6" fill="#246" stroke="#0d2030" stroke-width="1.5"/>')
-
-    # ---- Boosting station ----
-    if n_boosting > 0:
-        bx = (gather_x + riser_base_x) / 2
-        by = (gather_y + host_y) / 2
-        parts.append(f'<rect x="{bx-9:.0f}" y="{by-9:.0f}" width="18" '
-                     f'height="18" rx="3" fill="#fa3" stroke="#7a4a00" '
-                     f'stroke-width="2"/>')
-        parts.append(f'<text x="{bx:.0f}" y="{by+22:.0f}" font-size="9" '
-                     f'fill="#a60" text-anchor="middle">'
+    # ---- Boosting station on the longest leg -------------------------
+    if n_boosting > 0 and n_templates > 0:
+        # midpoint of the template-0 -> host leg
+        bx = (tpl_px[0][0] + host_px[0]) / 2
+        by = (tpl_px[0][1] + host_px[1]) / 2
+        parts.append(f'<rect x="{bx-9:.1f}" y="{by-9:.1f}" width="18" '
+                     f'height="18" rx="3" fill="#f0a83a" '
+                     f'stroke="#7a4a00" stroke-width="2"/>')
+        parts.append(f'<text x="{bx:.1f}" y="{by+22:.1f}" font-size="9" '
+                     f'fill="#a66400" text-anchor="middle">'
                      f'Boosting ×{n_boosting}</text>')
 
-    # ---- Export pipeline leaving the host ----
-    if export_km > 0:
-        parts.append(
-            f'<line x1="{host_x+34}" y1="{host_y}" x2="{W-12}" '
-            f'y2="{host_y}" stroke="#555" stroke-width="3" '
-            f'stroke-dasharray="2,2"/>')
-        parts.append(f'<text x="{host_x+90}" y="{host_y-8}" font-size="9" '
-                     f'fill="#555">Export {export_km:.0f} km →</text>')
+    # ---- Draw the templates ------------------------------------------
+    wells_left = n_subsea
+    for i in range(n_templates):
+        n_slots = slot_capacity
+        if templates_detail and i < len(templates_detail):
+            n_slots = int(templates_detail[i].get("slots", slot_capacity))
+        this_wells = min(n_slots, wells_left)
+        # slot roles: a detail entry may flag an injector template
+        kinds = None
+        if templates_detail and i < len(templates_detail):
+            role = str(templates_detail[i].get("role", "producer"))
+            if role == "injector":
+                kinds = ["water"] * n_slots
+        _lbl = f"T{i+1}"
+        if templates_detail and i < len(templates_detail):
+            _lbl = str(templates_detail[i].get("name", f"T{i+1}"))
+        svg_t, _slot_pts = _draw_square_template(
+            tpl_px[i][0], tpl_px[i][1], _lbl, this_wells, n_slots,
+            slot_kinds=kinds)
+        parts.append(svg_t)
+        wells_left -= this_wells
 
-    # ---- Legend ----
-    ly = H - 26
-    parts.append(f'<rect x="12" y="{ly-12}" width="16" height="11" '
-                 f'rx="2" fill="#b9c4cc" stroke="#3a4750"/>')
-    parts.append(f'<text x="32" y="{ly-3}" font-size="9" fill="#444">'
-                 f'Template</text>')
-    parts.append(f'<line x1="108" y1="{ly-7}" x2="132" y2="{ly-7}" '
-                 f'stroke="#246" stroke-width="4"/>')
-    parts.append(f'<text x="138" y="{ly-3}" font-size="9" fill="#444">'
-                 f'Flowline</text>')
-    parts.append(f'<line x1="206" y1="{ly-7}" x2="230" y2="{ly-7}" '
-                 f'stroke="#b07ac0" stroke-width="2" '
-                 f'stroke-dasharray="6,3"/>')
-    parts.append(f'<text x="236" y="{ly-3}" font-size="9" fill="#444">'
-                 f'Umbilical</text>')
-    parts.append(f'<circle cx="312" cy="{ly-7}" r="4" fill="#d6dde2" '
-                 f'stroke="#3a4750"/>')
-    parts.append(f'<circle cx="312" cy="{ly-7}" r="2" fill="#11150f"/>')
-    parts.append(f'<text x="322" y="{ly-3}" font-size="9" fill="#444">'
-                 f'Well slot ({n_subsea} wells)</text>')
+    # ---- Draw the host -----------------------------------------------
+    hx, hy = host_px
+    floating = any(k in host_type for k in
+                   ("FPSO", "Semi", "Spar", "TLP", "Compliant"))
+    if floating and "FPSO" in host_type:
+        parts.append(
+            f'<ellipse cx="{hx:.1f}" cy="{hy:.1f}" rx="40" ry="17" '
+            f'fill="#8a96a0" stroke="#2a363d" stroke-width="2.5"/>')
+        parts.append(
+            f'<path d="M{hx+40:.1f},{hy:.1f} l12,0 l-12,-7 z" '
+            f'fill="#8a96a0" stroke="#2a363d" stroke-width="1"/>')
+    elif floating:
+        # semi / TLP — square pontoon outline with 4 columns
+        parts.append(
+            f'<rect x="{hx-26:.1f}" y="{hy-26:.1f}" width="52" '
+            f'height="52" rx="3" fill="none" stroke="#2a363d" '
+            f'stroke-width="2"/>')
+        for dx in (-15, 15):
+            for dy in (-15, 15):
+                parts.append(f'<circle cx="{hx+dx:.1f}" cy="{hy+dy:.1f}" '
+                             f'r="7" fill="#8a96a0" stroke="#2a363d" '
+                             f'stroke-width="2"/>')
+    else:
+        parts.append(
+            f'<rect x="{hx-26:.1f}" y="{hy-26:.1f}" width="52" '
+            f'height="52" rx="4" fill="#8a96a0" stroke="#2a363d" '
+            f'stroke-width="2.5"/>')
+        for dx in (-16, 16):
+            for dy in (-16, 16):
+                parts.append(f'<circle cx="{hx+dx:.1f}" cy="{hy+dy:.1f}" '
+                             f'r="3.5" fill="#2a363d"/>')
+    _host_label = ("Existing host" if concept_type == "Subsea tie-in"
+                   else (host_type or "Host facility"))
+    parts.append(f'<text x="{hx:.1f}" y="{hy+40:.1f}" font-size="10.5" '
+                 f'fill="#2a363d" text-anchor="middle" '
+                 f'font-weight="bold">{_host_label}</text>')
+
+    # ---- Export pipeline leaving the host ----------------------------
+    if export_km > 0:
+        ex_x = min(W - 14, hx + 80)
+        parts.append(
+            f'<line x1="{hx+30:.1f}" y1="{hy:.1f}" x2="{ex_x:.1f}" '
+            f'y2="{hy:.1f}" stroke="#555" stroke-width="3" '
+            f'stroke-dasharray="2,2"/>')
+        parts.append(f'<text x="{hx+54:.1f}" y="{hy-9:.1f}" '
+                     f'font-size="9" fill="#555">Export '
+                     f'{export_km:.0f} km →</text>')
+
+    # ---- Legend -------------------------------------------------------
+    lx, ly = W - 138, 78
+    parts.append(f'<rect x="{lx}" y="{ly}" width="128" height="118" '
+                 f'rx="4" fill="#ffffff" stroke="#c4ced4" '
+                 f'stroke-width="1" opacity="0.95"/>')
+    parts.append(f'<text x="{lx+8}" y="{ly+16}" font-size="10" '
+                 f'fill="#234" font-weight="bold">Legend</text>')
+    leg = [
+        ("rect", "#3aa856", "Oil producer slot"),
+        ("rect", "#2f6fb0", "Water injector slot"),
+        ("rect", "#e7ecef", "Spare / empty slot"),
+        ("line", "#235a86", "Production flowline"),
+        ("line", "#b07ac0", "Umbilical"),
+    ]
+    for k, (kind, color, txt) in enumerate(leg):
+        yy = ly + 30 + k * 17
+        if kind == "rect":
+            parts.append(f'<rect x="{lx+8}" y="{yy-8}" width="12" '
+                         f'height="12" rx="2" fill="{color}" '
+                         f'stroke="#2a363d" stroke-width="1"/>')
+        else:
+            parts.append(f'<line x1="{lx+8}" y1="{yy-2}" x2="{lx+20}" '
+                         f'y2="{yy-2}" stroke="{color}" '
+                         f'stroke-width="3"/>')
+        parts.append(f'<text x="{lx+26}" y="{yy+2}" font-size="8.5" '
+                     f'fill="#444">{txt}</text>')
 
     parts.append('</svg>')
     return "".join(parts)
@@ -4832,6 +5178,85 @@ VALIDATION_FIELDS = {
             "the p/Z trend. A multi-segment decline (plateau + exponential) "
             "reproduces this shape well.",
     },
+    "Gullfaks-type (NCS, water injection)": {
+        "description":
+            "A large NCS oil field on water injection from early life — a "
+            "long high plateau then a slow, water-supported decline with a "
+            "high recovery factor. Tests waterflood / injection-supported "
+            "behaviour. Profile shape representative of a major "
+            "Tampen-area producer.",
+        "fluid_system": "Oil with associated gas",
+        "first_production_year": 1986,
+        "ooip_oil_MMstb": 3200.0,
+        "ogip_gas_Bscf": 0.0,
+        "rf_expected": 0.59,
+        "plateau_oil_kstbd": 380.0,
+        "api": 36.0,
+        "drive": "Water injection (pressure-maintained)",
+        "annual_oil_MMstb": [
+            (1986, 20), (1987, 55), (1988, 95), (1989, 120), (1990, 130),
+            (1991, 135), (1992, 138), (1993, 140), (1994, 138),
+            (1995, 132), (1996, 124), (1997, 115), (1998, 105),
+            (1999, 95), (2000, 85), (2001, 76), (2002, 68), (2003, 60),
+            (2004, 53), (2005, 47), (2006, 42), (2007, 37), (2008, 33),
+            (2009, 29), (2010, 26), (2011, 23), (2012, 21), (2013, 19),
+        ],
+        "notes":
+            "Water injection holds the plateau long and lifts recovery "
+            "well above a depletion case. To reproduce it, enable water "
+            "injection / strong aquifer support — a depletion-only model "
+            "will decline far too fast after plateau.",
+    },
+    "Solution-gas-drive oil field (NCS)": {
+        "description":
+            "A mid-size oil field produced on primary depletion only — no "
+            "injection, weak aquifer. Pressure falls below bubble point "
+            "early, gas comes out of solution and the field declines "
+            "sharply. Tests the unsupported-depletion case.",
+        "fluid_system": "Oil with associated gas",
+        "first_production_year": 2005,
+        "ooip_oil_MMstb": 420.0,
+        "ogip_gas_Bscf": 0.0,
+        "rf_expected": 0.22,
+        "plateau_oil_kstbd": 70.0,
+        "api": 32.0,
+        "drive": "Solution-gas drive (primary depletion)",
+        "annual_oil_MMstb": [
+            (2005, 9), (2006, 22), (2007, 25), (2008, 24), (2009, 21),
+            (2010, 18), (2011, 14.5), (2012, 11.5), (2013, 9.2),
+            (2014, 7.3), (2015, 5.8), (2016, 4.6), (2017, 3.7),
+            (2018, 2.9), (2019, 2.3), (2020, 1.9), (2021, 1.5),
+        ],
+        "notes":
+            "Solution-gas drive gives a short plateau and a steep "
+            "hyperbolic decline — recovery factor is low (15-25%). A "
+            "depletion strategy with no aquifer reproduces it; adding "
+            "support would over-predict the tail badly.",
+    },
+    "Subsea tie-back (UKCS, fast decline)": {
+        "description":
+            "A small UKCS satellite developed as a subsea tie-back — few "
+            "high-rate wells, a short sharp plateau and a fast decline "
+            "typical of a quick-payout satellite. Tests small-field / "
+            "tie-back profiles.",
+        "fluid_system": "Oil with associated gas",
+        "first_production_year": 2012,
+        "ooip_oil_MMstb": 95.0,
+        "ogip_gas_Bscf": 0.0,
+        "rf_expected": 0.38,
+        "plateau_oil_kstbd": 32.0,
+        "api": 38.0,
+        "drive": "Mixed — partial aquifer + depletion",
+        "annual_oil_MMstb": [
+            (2012, 6), (2013, 11.5), (2014, 10.5), (2015, 8.4),
+            (2016, 6.3), (2017, 4.7), (2018, 3.5), (2019, 2.6),
+            (2020, 2.0), (2021, 1.5), (2022, 1.1), (2023, 0.9),
+        ],
+        "notes":
+            "Tie-backs are drilled up quickly and produced hard for a fast "
+            "payout, so the plateau is short and the decline steep. A "
+            "hyperbolic decline with a high initial rate reproduces this.",
+    },
 }
 
 
@@ -5065,6 +5490,77 @@ METHODOLOGY_DOCS = [
             "change of the gas itself.",
             "If the reservoir never crosses the dew point, the CGR stays "
             "constant and the result is identical to a fixed-yield model.",
+        ],
+    },
+    {
+        "section": "Production engine",
+        "title": "Fractional-flow water cut",
+        "summary":
+            "An optional physics-based water-cut mode for oil fields. "
+            "Instead of a prescribed water-cut ramp, the water cut is "
+            "derived from Corey relative-permeability curves and the "
+            "cumulative recovery. As oil is displaced the average water "
+            "saturation rises; the fractional flow of water climbs its "
+            "characteristic S-curve; the produced water cut follows.",
+        "equations": [
+            r"k_{rw} = k_{rw}^{max}\,S_{wn}^{\,n_w}, \quad "
+            r"k_{ro} = k_{ro}^{max}\,(1-S_{wn})^{\,n_o}",
+            r"S_{wn} = \frac{S_w - S_{wc}}{1 - S_{wc} - S_{or}}",
+            r"f_w = \frac{k_{rw}/\mu_w}{k_{rw}/\mu_w + k_{ro}/\mu_o}",
+            r"q_w = q_o\,\frac{f_w}{1 - f_w}",
+        ],
+        "where": [
+            (r"k_{rw},\,k_{ro}", "water / oil relative permeability"),
+            (r"S_{wn}", "normalised water saturation"),
+            (r"S_{wc},\,S_{or}", "connate water / residual oil saturation"),
+            (r"n_w,\,n_o", "Corey exponents"),
+            (r"\mu_w,\,\mu_o", "water / oil viscosity"),
+            (r"f_w", "water fractional flow"),
+            (r"q_w,\,q_o", "water / oil rate"),
+        ],
+        "notes": [
+            "The average water saturation rises from S_wc to 1 - S_or as "
+            "the moveable oil (capped by the sweep efficiency) is produced.",
+            "This is a tank-averaged screening model, not a 1-D "
+            "Buckley-Leverett front, but the water cut now follows from "
+            "the rock/fluid properties rather than a user ramp.",
+            "When disabled, the per-well water-cut ramp is used instead.",
+        ],
+    },
+    {
+        "section": "Well & concept design",
+        "title": "Shut-in well-head pressure",
+        "summary":
+            "The shut-in well-head pressure (SIWHP) is the surface pressure "
+            "when a well is closed in — the reservoir pressure transmitted "
+            "up the static fluid column, minus that column's hydrostatic "
+            "head. It sets the design pressure rating for the flowline, "
+            "riser and host, and decides whether a HIPPS is required.",
+        "equations": [
+            r"\text{Gas: } P_{wh} = P_{res}\,e^{-s}, \quad "
+            r"s = \frac{0.01875\,\gamma_g\,H}{\bar{Z}\,\bar{T}}",
+            r"\text{Liquid: } P_{wh} = P_{res} - 0.433\,\gamma_{col}\,H",
+            r"\gamma_{col} = \gamma_o(1-f_w) + \gamma_w f_w",
+        ],
+        "where": [
+            (r"P_{wh}", "shut-in well-head pressure"),
+            (r"P_{res}", "static reservoir pressure at datum"),
+            (r"H", "column height — datum depth minus the well-head "
+                   "elevation (mudline for a subsea tree)"),
+            (r"\gamma_g", "gas specific gravity (air = 1)"),
+            (r"\bar{Z},\,\bar{T}", "average gas Z-factor and temperature "
+                                   "over the column"),
+            (r"\gamma_{col}", "average specific gravity of the liquid "
+                              "column"),
+            (r"f_w", "water cut in the wellbore column"),
+        ],
+        "notes": [
+            "The gas case uses the average-temperature / average-Z method "
+            "(a compact Cullender-&-Smith style iteration).",
+            "A subsea tree sits at the mudline, so a deeper water depth "
+            "shortens the static column and raises the SIWHP.",
+            "If the flowline / host rating is below the SIWHP, a HIPPS is "
+            "required to protect the downstream equipment.",
         ],
     },
     {
