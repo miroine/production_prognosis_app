@@ -466,6 +466,12 @@ class EconInputs:
     co2_factor_gas_combust: float = 53.0  # kg CO2 per Mscf burnt (fuel/flare)
     co2_factor_flare_inefficiency: float = 0.02  # methane slip (CH4 has 28× GWP100)
     co2_factor_oil_routine: float = 0.5   # kg CO2-eq per bbl oil produced (vented + ops)
+    # Scope 3 — end-use combustion of sold hydrocarbons. Default factors
+    # are the standard IPCC / EPA values for stationary combustion.
+    co2_scope3_enabled: bool = False
+    co2_scope3_factor_oil: float = 430.0  # kg CO2 per bbl crude burnt (downstream)
+    co2_scope3_factor_gas: float = 53.0   # kg CO2 per Mscf gas burnt (downstream)
+    co2_scope3_price: float = 0.0    # $ / tonne CO2-eq applied to Scope 3 (0 = ignore)
     # ---- Fiscal regime ----
     fiscal_regime: str = "Tax/Royalty"   # or "PSC" or "NCS"
     # PSC parameters (only used when fiscal_regime == "PSC")
@@ -2082,6 +2088,33 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     co2_total_t = co2_combust_t + co2_slip_t + co2_routine_t  # tonnes / month
     co2_cost = co2_total_t * econ.co2_price                   # $ / month
 
+    # ---- Scope 3 emissions (end-use combustion of sold hydrocarbons) ----
+    # Scope 1 (above) is operational: fuel gas, flare, vents.
+    # Scope 3 is the downstream combustion when the customer burns the
+    # crude or gas. It dwarfs Scope 1 — typical ratio is 50-100×.
+    # Computed regardless of toggle so it can be reported, but only added
+    # to the cashflow (as a fee) if `co2_scope3_enabled` and a price is set.
+    if "oil_rate" in df.columns:
+        oil_sold_monthly_bbl = df["oil_rate"] * days
+    else:
+        oil_sold_monthly_bbl = pd.Series(0.0, index=df.index)
+    if "gas_export_rate" in df.columns:
+        gas_sold_monthly_Mscf = df["gas_export_rate"] * days
+    elif "gas_rate" in df.columns:
+        gas_sold_monthly_Mscf = df["gas_rate"] * days
+    else:
+        gas_sold_monthly_Mscf = pd.Series(0.0, index=df.index)
+    co2_scope3_oil_t = (oil_sold_monthly_bbl
+                        * econ.co2_scope3_factor_oil / 1000.0)
+    co2_scope3_gas_t = (gas_sold_monthly_Mscf
+                        * econ.co2_scope3_factor_gas / 1000.0)
+    co2_scope3_total_t = co2_scope3_oil_t + co2_scope3_gas_t
+    co2_scope3_cost = pd.Series(0.0, index=df.index)
+    if getattr(econ, "co2_scope3_enabled", False):
+        co2_scope3_cost = (co2_scope3_total_t
+                           * float(getattr(econ, "co2_scope3_price",
+                                            econ.co2_price)))
+
     # ---- Power consumption (screening estimate, MWh/month) ----
     # Topsides power demand scales with what the facility has to move and
     # process: liquids handling (pumps), gas compression, water injection.
@@ -2123,7 +2156,8 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         royalty_psc = revenue.values * econ.royalty_rate
         net_rev_psc = revenue.values - royalty_psc - tariff.values
         recoverable_costs = (opex.values + capex + aban_cost
-                              + co2_cost.values)
+                              + co2_cost.values
+                              + co2_scope3_cost.values)
         # Carry forward unrecovered costs through a cost pool
         cost_pool = 0.0
         cost_recovered_arr = np.zeros(len(df))
@@ -2173,8 +2207,11 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["capex_facility"] = capex_fac
         df_e["abandonment"] = aban_cost
         df_e["co2_emissions_tonnes"] = co2_total_t
+        df_e["co2_scope1_tonnes"] = co2_total_t
+        df_e["co2_scope3_tonnes"] = co2_scope3_total_t
         df_e["power_mwh"] = power_mwh
         df_e["co2_cost"] = co2_cost
+        df_e["co2_scope3_cost"] = co2_scope3_cost
         df_e["tax"] = tax_arr
         df_e["psc_cost_recovered"] = cost_recovered_arr
         df_e["psc_profit_oil"] = profit_oil
@@ -2184,6 +2221,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["cashflow"] = cf
         df_e["cum_cashflow"] = cf.cumsum()
         df_e["cum_co2_tonnes"] = co2_total_t.cumsum()
+        df_e["cum_co2_scope3_tonnes"] = co2_scope3_total_t.cumsum()
     else:
         # Standard Tax/Royalty OR NCS (Norwegian Continental Shelf)
         ncs = (regime == "NCS")
@@ -2246,7 +2284,8 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
             # --- Operating profit (before depreciation & financing) ---
             # CAPEX is NOT expensed here — it enters via depreciation.
             op_profit = (net_revenue.values - opex.values
-                         - aban_cost - co2_cost)
+                         - aban_cost - co2_cost.values
+                         - co2_scope3_cost.values)
 
             # --- CIT base: operating profit minus depreciation, with loss
             #     carry-forward ---
@@ -2279,14 +2318,16 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
             tax = cit + spt
             # Cashflow: real cash CAPEX leaves in the month spent; tax is the
             # depreciation-based number computed above.
-            pretax = net_revenue - opex - capex - aban_cost - co2_cost
+            pretax = (net_revenue - opex - capex - aban_cost
+                      - co2_cost - co2_scope3_cost)
             cf = pretax.values - tax
         else:
             # Standard Tax/Royalty. Tax is charged on taxable profit, but
             # losses (CAPEX-heavy early years) are carried forward and
             # shelter later profits — without this the tax is overstated
             # and a sound project can show a spuriously negative NPV.
-            pretax = net_revenue - opex - capex - aban_cost - co2_cost
+            pretax = (net_revenue - opex - capex - aban_cost
+                      - co2_cost - co2_scope3_cost)
             pretax_v = pretax.values
             _n = len(df)
             tax = np.zeros(_n)
@@ -2315,8 +2356,11 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["capex_facility"] = capex_fac
         df_e["abandonment"] = aban_cost
         df_e["co2_emissions_tonnes"] = co2_total_t
+        df_e["co2_scope1_tonnes"] = co2_total_t
+        df_e["co2_scope3_tonnes"] = co2_scope3_total_t
         df_e["power_mwh"] = power_mwh
         df_e["co2_cost"] = co2_cost
+        df_e["co2_scope3_cost"] = co2_scope3_cost
         df_e["tax"] = tax
         if ncs:
             df_e["ncs_cit"] = cit
@@ -2325,6 +2369,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["cashflow"] = cf
         df_e["cum_cashflow"] = cf.cumsum()
         df_e["cum_co2_tonnes"] = co2_total_t.cumsum()
+        df_e["cum_co2_scope3_tonnes"] = co2_scope3_total_t.cumsum()
     # ---- Money basis (nominal vs real) ----
     # In "nominal" mode, every monthly cashflow column is escalated by the
     # inflation rate compounded monthly. In "real" mode this is a no-op.
@@ -2476,7 +2521,9 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                          - df_e["tariff"].values
                          - df_e["opex"].values
                          - df_e["abandonment"].values
-                         - df_e.get("co2_cost", pd.Series(np.zeros(n))).values)
+                         - df_e.get("co2_cost", pd.Series(np.zeros(n))).values
+                         - df_e.get("co2_scope3_cost",
+                                     pd.Series(np.zeros(n))).values)
 
             # CIT with loss carry-forward.
             cit = np.zeros(n)
@@ -2523,7 +2570,9 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                            - df_e["capex_well"].values
                            - df_e["capex_facility"].values
                            - df_e["abandonment"].values
-                           - df_e.get("co2_cost", pd.Series(np.zeros(n))).values)
+                           - df_e.get("co2_cost", pd.Series(np.zeros(n))).values
+                           - df_e.get("co2_scope3_cost",
+                                       pd.Series(np.zeros(n))).values)
             cf_full = pretax_cash - tax_full
             df_e["cashflow"] = cf_full
             df_e["cum_cashflow"] = np.cumsum(cf_full)
@@ -4891,59 +4940,158 @@ def well_section(units, fluid, start_date):
                 "profile inputs — no field constraints, capacity caps or "
                 "material-balance effects applied yet. Use it to sanity-"
                 "check the per-well inputs before running the field model.")
+            _prev_view = st.radio(
+                "View", ["Primary phase", "All phases", "Ratios "
+                 "(GOR / water cut / CGR)"],
+                horizontal=True, key="prev_view")
             _is_oil_prev = FLUID_SYSTEMS[fluid]["primary"] == "oil"
             # build a monthly calendar covering all producers
             _hor_years = int(st.session_state.get("horizon", 25))
             _prev_dates = pd.date_range(
                 start_date, periods=_hor_years * 12, freq="MS")
             prev_rows = []
-            fig_prev = go.Figure()
+            # Three separate figures depending on the view
+            fig_main = go.Figure()
+            fig_gas = go.Figure() if _prev_view == "All phases" else None
+            fig_water = go.Figure() if _prev_view == "All phases" else None
+            fig_gor = go.Figure() if _prev_view.startswith("Ratios") else None
+            fig_wc = go.Figure() if _prev_view.startswith("Ratios") else None
             for w in producers_preview:
                 wm = well_monthly(w, _prev_dates, _is_oil_prev)
                 prim = wm["primary"]
+                sec = wm["secondary"]
+                wat = wm["water"]
                 days = DAYS_PER_MONTH
-                cum_prim = float(np.sum(prim) * days)
-                cum_sec = float(np.sum(wm["secondary"]) * days)
-                # peak and plateau
+                # Cumulative volumes.  prim is in stb/d for oil and Mscf/d
+                # for gas; both go to MMstb / Bscf by dividing the monthly
+                # total (rate × days) by 1e6.  The previous code divided
+                # the gas cumulative by 1e9, which understated it 1000×.
+                cum_prim = float(np.sum(prim) * days) / 1e6
+                cum_sec = float(np.sum(sec) * days) / 1e6
+                # for water always in stb/d → MMstb
+                cum_water = float(np.sum(wat) * days) / 1e6
                 peak = float(np.max(prim)) if len(prim) else 0.0
                 on_months = int(np.sum(prim > 0.01))
-                # primary-stream cumulative in field display units
+                # display unit conversion
                 if _is_oil_prev:
-                    cum_disp = from_field(cum_prim / 1e6, "oil_vol", units)
-                    cum_unit = ulabel("oil_vol", units)
-                    peak_disp = from_field(peak, "oil_rate", units)
-                    peak_unit = ulabel("oil_rate", units)
+                    prim_vu, sec_vu = "oil_vol", "gas_vol"
+                    prim_ru, sec_ru = "oil_rate", "gas_rate"
                 else:
-                    cum_disp = from_field(cum_prim / 1e9, "gas_vol", units)
-                    cum_unit = ulabel("gas_vol", units)
-                    peak_disp = from_field(peak, "gas_rate", units)
-                    peak_unit = ulabel("gas_rate", units)
+                    prim_vu, sec_vu = "gas_vol", "oil_vol"
+                    prim_ru, sec_ru = "gas_rate", "oil_rate"
+                cum_disp = from_field(cum_prim, prim_vu, units)
+                cum_sec_disp = from_field(cum_sec, sec_vu, units)
+                cum_wat_disp = from_field(cum_water, "water_vol", units)
+                peak_disp = from_field(peak, prim_ru, units)
+                _wt_map = st.session_state.get(
+                    "well_template_map", {}) or {}
                 prev_rows.append({
                     "Well": w.name,
                     "Rig": w.rig,
+                    "Template": _wt_map.get(w.name, "—"),
                     "Online": str(w.online_date),
-                    f"Peak ({peak_unit})": round(peak_disp, 1),
-                    f"Cum primary ({cum_unit})": round(cum_disp, 2),
+                    f"Peak ({ulabel(prim_ru, units)})": round(peak_disp, 1),
+                    f"Cum primary ({ulabel(prim_vu, units)})":
+                        round(cum_disp, 2),
+                    f"Cum secondary ({ulabel(sec_vu, units)})":
+                        round(cum_sec_disp, 2),
+                    f"Cum water ({ulabel('water_vol', units)})":
+                        round(cum_wat_disp, 2),
                     "Producing months": on_months,
                 })
-                fig_prev.add_trace(go.Scatter(
-                    x=_prev_dates,
-                    y=from_field(prim, "oil_rate" if _is_oil_prev
-                                 else "gas_rate", units),
-                    mode="lines", name=w.name))
-            fig_prev.update_layout(
-                title="Standalone producer profiles",
-                xaxis_title="Date",
-                yaxis_title=(f"Oil rate ({ulabel('oil_rate', units)})"
-                             if _is_oil_prev
-                             else f"Gas rate ({ulabel('gas_rate', units)})"),
-                height=340, legend=dict(orientation="h", y=-0.25))
-            st.plotly_chart(fh.apply_plot_template(fig_prev),
-                            use_container_width=True)
+                # PROFILE CURVES
+                if _prev_view == "Primary phase":
+                    fig_main.add_trace(go.Scatter(
+                        x=_prev_dates,
+                        y=from_field(prim, prim_ru, units),
+                        mode="lines", name=w.name))
+                elif _prev_view == "All phases":
+                    fig_main.add_trace(go.Scatter(
+                        x=_prev_dates, y=from_field(prim, prim_ru, units),
+                        mode="lines", name=w.name,
+                        legendgroup=w.name))
+                    fig_gas.add_trace(go.Scatter(
+                        x=_prev_dates, y=from_field(sec, sec_ru, units),
+                        mode="lines", name=w.name,
+                        legendgroup=w.name, showlegend=False))
+                    fig_water.add_trace(go.Scatter(
+                        x=_prev_dates,
+                        y=from_field(wat, "water_rate", units),
+                        mode="lines", name=w.name,
+                        legendgroup=w.name, showlegend=False))
+                else:
+                    # RATIOS — derived from rates
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        if _is_oil_prev:
+                            # GOR in scf/stb  =  Mscf/d × 1000 / stb/d
+                            gor = np.where(prim > 0,
+                                           sec * 1000.0 / prim, 0.0)
+                            fig_gor.add_trace(go.Scatter(
+                                x=_prev_dates, y=gor, mode="lines",
+                                name=w.name))
+                        else:
+                            # CGR in stb/MMscf = stb/d  /  (Mscf/d / 1000)
+                            cgr = np.where(prim > 0,
+                                           sec / (prim / 1000.0), 0.0)
+                            fig_gor.add_trace(go.Scatter(
+                                x=_prev_dates, y=cgr, mode="lines",
+                                name=w.name))
+                        wc = np.where((prim + wat) > 0,
+                                      wat / (prim + wat), 0.0) \
+                            if _is_oil_prev else np.zeros_like(prim)
+                        fig_wc.add_trace(go.Scatter(
+                            x=_prev_dates, y=wc, mode="lines",
+                            name=w.name, showlegend=False))
+            # Render figures
+            if _prev_view == "Primary phase":
+                fig_main.update_layout(
+                    title="Standalone producer profiles",
+                    xaxis_title="Date",
+                    yaxis_title=f"{'Oil' if _is_oil_prev else 'Gas'} rate "
+                                f"({ulabel(prim_ru, units)})",
+                    height=340, legend=dict(orientation="h", y=-0.25))
+                st.plotly_chart(fh.apply_plot_template(fig_main),
+                                use_container_width=True)
+            elif _prev_view == "All phases":
+                fig_main.update_layout(
+                    title=f"{'Oil' if _is_oil_prev else 'Gas'} rate per well",
+                    yaxis_title=ulabel(prim_ru, units), height=240,
+                    legend=dict(orientation="h", y=-0.3))
+                fig_gas.update_layout(
+                    title=f"{'Gas' if _is_oil_prev else 'Condensate'} rate "
+                          f"per well",
+                    yaxis_title=ulabel(sec_ru, units), height=240,
+                    showlegend=False)
+                fig_water.update_layout(
+                    title="Water rate per well",
+                    yaxis_title=ulabel("water_rate", units), height=240,
+                    showlegend=False)
+                st.plotly_chart(fh.apply_plot_template(fig_main),
+                                use_container_width=True)
+                st.plotly_chart(fh.apply_plot_template(fig_gas),
+                                use_container_width=True)
+                st.plotly_chart(fh.apply_plot_template(fig_water),
+                                use_container_width=True)
+            else:
+                fig_gor.update_layout(
+                    title=("GOR (scf/stb) per well" if _is_oil_prev
+                           else "CGR (stb/MMscf) per well"),
+                    yaxis_title=("GOR (scf/stb)" if _is_oil_prev
+                                 else "CGR (stb/MMscf)"),
+                    height=260,
+                    legend=dict(orientation="h", y=-0.3))
+                st.plotly_chart(fh.apply_plot_template(fig_gor),
+                                use_container_width=True)
+                if _is_oil_prev:
+                    fig_wc.update_layout(
+                        title="Water cut per well",
+                        yaxis_title="Water cut (fraction)",
+                        yaxis_range=[0, 1], height=240, showlegend=False)
+                    st.plotly_chart(fh.apply_plot_template(fig_wc),
+                                    use_container_width=True)
             prev_df = pd.DataFrame(prev_rows)
             st.dataframe(prev_df, use_container_width=True,
                          hide_index=True)
-            # totals
             _tot_col = [c for c in prev_df.columns
                         if c.startswith("Cum primary")][0]
             st.caption(
@@ -5681,14 +5829,15 @@ def economics_section(units, start_date):
              "regardless of unit system."
     )
     gas_price_mmbtu = c2.number_input(
-        "Gas price ($/MMBtu)", value=2.5,
+        "Gas price ($/MMBtu)", value=10.0,
         key="gas_price_mmbtu", on_change=mark_stale,
-        help="Flat real gas price per MMBtu. Default $2.5/MMBtu is a "
-             "conservative long-run screening value — NCS gas is sold "
-             "mainly into the European hubs (TTF / NBP), which are volatile; "
-             "use a long-run real price for screening rather than a recent "
-             "spot peak. Internally converted to $/Mscf using 1 Mcf ≈ 1 "
-             "MMBtu (real heating values vary 0.95–1.10)."
+        help="Flat real gas price per MMBtu. Default $10/MMBtu reflects "
+             "European hub pricing (TTF / NBP) over the recent cycle — "
+             "NCS gas is sold mainly into Europe and the post-2022 hub "
+             "average has sat in the $8–$15/MMBtu range. Use a long-run "
+             "real price for screening rather than a recent spot peak. "
+             "Internally converted to $/Mscf using 1 Mcf ≈ 1 MMBtu "
+             "(real heating values vary 0.95–1.10)."
     )
     # Variable OPEX — unit basis depends on the fluid system. For an oil
     # field the natural basis is $/bbl of oil; for a gas field it is $/Mscf
@@ -6145,16 +6294,18 @@ def economics_section(units, start_date):
         # template or the host it connects to, plus the flowline/umbilical
         # leg length). This overrides the single-type simple mode.
         templates_detail = None
-        if n_templates > 1:
+        if n_templates >= 1:
             use_detail = st.checkbox(
-                "Configure each template individually (slots + tie-in)",
+                "Configure each template individually (position, slots, tie-in)",
                 value=False, key="dc_use_template_detail",
-                help="Off — every template is the same type above. On — "
-                     "set each template's slot count and how it ties in "
-                     "(to the host directly, or daisy-chained to another "
-                     "template), with the flowline / umbilical leg length "
-                     "for that connection. In-field tie-in legs are costed "
-                     "separately from the main tie-back.")
+                help="Off — every template is the same type above and "
+                     "auto-placed. On — set each template's X/Y position "
+                     "in km from the host, slot count, role and how it "
+                     "ties in (to the host directly, or daisy-chained to "
+                     "another template), with the flowline / umbilical leg "
+                     "length for that connection. Works for a single "
+                     "template too — useful for placing one drill centre "
+                     "at the correct field coordinate.")
             if use_detail:
                 tie_options = ["Host"] + [f"T{i+1}"
                                           for i in range(int(n_templates))]
@@ -6286,6 +6437,147 @@ def economics_section(units, start_date):
                         st.warning(f"T{i+1} is tied to itself — change its "
                                    f"tie-in to the host or another "
                                    f"template.")
+
+                # ---- Link wells (and their rigs) to each template ----
+                # Each producer in the production profile is assigned to
+                # exactly one template (a well sits on one drill centre).
+                # The cleanest UX is a single dataframe editor: one row per
+                # well, one column to pick the template — exclusive by
+                # construction, and easy to scan against the production
+                # profile and the rig list.
+                _pdf = st.session_state.get("producers_df")
+                if _pdf is not None and len(_pdf) > 0:
+                    st.markdown("**Link wells to templates and rigs**")
+                    st.caption(
+                        "One row per producer from the production profile. "
+                        "Pick the template hosting each well; the rig "
+                        "drilling it is read straight from the producers "
+                        "table (it can't be edited here — change it there). "
+                        "A well can only sit on one template — selecting "
+                        "the template moves the well exclusively.")
+                    _well_names = [str(n) for n in _pdf["name"].tolist()
+                                   if str(n).strip()]
+                    _rig_of = {}
+                    if "rig" in _pdf.columns:
+                        for _, _r in _pdf.iterrows():
+                            _rig_of[str(_r["name"])] = str(
+                                _r.get("rig", "—"))
+                    _tpl_labels = [f"T{i+1}"
+                                   for i in range(int(n_templates))]
+                    _tpl_options = [f"{lbl} · {templates_detail[i]['name']}"
+                                    for i, lbl in enumerate(_tpl_labels)]
+                    # Mapping from full option label back to T-id (for
+                    # parsing the editor result).
+                    def _opt_to_tid(opt):
+                        return str(opt).split(" ", 1)[0] if opt else "T1"
+
+                    _wt_key = f"dc_well_template_map_{int(n_templates)}"
+                    _assign = dict(st.session_state.get(_wt_key, {}))
+                    # purge stale wells (renamed/removed in producers_df)
+                    _assign = {k: v for k, v in _assign.items()
+                               if k in _well_names}
+                    # default-fill new wells across templates by slot
+                    if _well_names:
+                        _slot_caps = [int(templates_detail[i]["slots"])
+                                      for i in range(int(n_templates))]
+                        _slot_used = [0] * int(n_templates)
+                        # count current usage
+                        for wn, lbl in _assign.items():
+                            if lbl in _tpl_labels:
+                                _slot_used[_tpl_labels.index(lbl)] += 1
+                        for wn in _well_names:
+                            if wn in _assign:
+                                continue
+                            # find the first template with spare slots
+                            target = 0
+                            for ti in range(int(n_templates)):
+                                if _slot_used[ti] < _slot_caps[ti]:
+                                    target = ti; break
+                            _assign[wn] = _tpl_labels[target]
+                            _slot_used[target] += 1
+
+                    # Build the table
+                    def _tid_to_opt(tid):
+                        if tid in _tpl_labels:
+                            return _tpl_options[_tpl_labels.index(tid)]
+                        return _tpl_options[0]
+                    _wt_rows = [{
+                        "Well": wn,
+                        "Rig": _rig_of.get(wn, "—"),
+                        "Template": _tid_to_opt(_assign.get(wn,
+                                                             _tpl_labels[0])),
+                    } for wn in _well_names]
+                    _wt_df = pd.DataFrame(_wt_rows)
+                    _edited_wt = st.data_editor(
+                        _wt_df,
+                        key=f"dc_wt_editor_{int(n_templates)}_"
+                            f"{len(_well_names)}",
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "Well": st.column_config.TextColumn(
+                                "Well", disabled=True),
+                            "Rig": st.column_config.TextColumn(
+                                "Rig", disabled=True,
+                                help="Set in the producers table — shown "
+                                     "here for reference."),
+                            "Template": st.column_config.SelectboxColumn(
+                                "Template", options=_tpl_options,
+                                help="Pick the template hosting this well."),
+                        })
+                    # Apply button — commit edits exclusively
+                    if st.button("✅ Apply well-template links",
+                                  key=f"dc_apply_wt_{int(n_templates)}",
+                                  help="Commit the well-to-template "
+                                       "assignment. The schematic, the "
+                                       "drilling Gantt and the per-template "
+                                       "well counts refresh."):
+                        new_assign = {}
+                        for _, row in _edited_wt.iterrows():
+                            wn = str(row["Well"])
+                            new_assign[wn] = _opt_to_tid(row["Template"])
+                        st.session_state[_wt_key] = new_assign
+                        _assign = new_assign
+                        mark_stale()
+                        st.success("Well-template links applied.")
+                        st.rerun()
+
+                    # Per-template summary lines (read from the edited
+                    # frame so the user sees their pending edits even
+                    # before pressing Apply).
+                    _pending = {}
+                    for _, row in _edited_wt.iterrows():
+                        wn = str(row["Well"])
+                        _pending[wn] = _opt_to_tid(row["Template"])
+                    for ti in range(int(n_templates)):
+                        _tlabel = _tpl_labels[ti]
+                        _here = [wn for wn in _well_names
+                                 if _pending.get(wn) == _tlabel]
+                        _rigs_here = sorted({_rig_of.get(wn, "—")
+                                              for wn in _here})
+                        _rig_txt = (", ".join(r for r in _rigs_here
+                                              if r != "—")
+                                     or "—")
+                        cap = int(templates_detail[ti]["slots"])
+                        over = len(_here) > cap
+                        st.caption(
+                            f"**{_tlabel} · {templates_detail[ti]['name']}** "
+                            f"— {len(_here)} well(s) / {cap} slot(s); "
+                            f"rig(s): {_rig_txt}"
+                            + ("  ⚠️ over capacity" if over else ""))
+
+                    # Attach the mapping (+ rig) to each template detail so
+                    # downstream code (aerial labels, side view, schedule)
+                    # can read it.
+                    for ti in range(int(n_templates)):
+                        _tlabel = _tpl_labels[ti]
+                        _wells_here = [wn for wn in _well_names
+                                       if _pending.get(wn) == _tlabel]
+                        templates_detail[ti]["wells"] = _wells_here
+                        templates_detail[ti]["rigs"] = sorted(
+                            {_rig_of.get(wn, "—")
+                             for wn in _wells_here})
+                    # stash for the rest of the app (drilling Gantt etc.)
+                    st.session_state["well_template_map"] = dict(_pending)
         rs1, rs2 = st.columns(2)
         riser_type = rs1.selectbox(
             "Riser type",
@@ -6530,6 +6822,8 @@ def economics_section(units, start_date):
         dc_spec = {
             "concept_type": concept_type,
             "host_type": host_type,
+            "fluid_system": st.session_state.get(
+                "fluid", "Oil with associated gas"),
             "processing_capacity_kboed": processing_capacity,
             "water_depth_class": water_depth_class,
             "hpht_tier": hpht_tier,
@@ -7275,6 +7569,78 @@ def economics_section(units, start_date):
         st.rerun()
     fac_df = st.session_state.fac_df
 
+    # ---- CO₂ emissions & carbon fees (Scope 1 + Scope 3) ----
+    with st.expander("🌍 CO₂ emissions & carbon fees", expanded=False):
+        st.caption(
+            "**Scope 1** is operational — fuel gas combustion, flaring, "
+            "methane slip, routine vents. **Scope 3** is end-use combustion "
+            "of the sold oil and gas (downstream). Scope 3 typically "
+            "dwarfs Scope 1 by 50–100×. Each scope can carry its own "
+            "carbon price.")
+        co2_price = st.number_input(
+            "Scope 1 carbon price ($/tonne CO₂-eq)", value=80.0,
+            min_value=0.0, step=10.0, key="co2_price",
+            on_change=mark_stale,
+            help="EU ETS-style price applied to operational emissions. "
+                 "NCS operators have faced an effective combined CO₂ tax "
+                 "+ ETS quota cost in the $80–$120/t range in recent "
+                 "years. Set to 0 to ignore Scope 1 emissions in the "
+                 "economics.")
+        co2_factor_gas_combust = st.number_input(
+            "Fuel/flare gas emission factor (kg CO₂/Mscf)",
+            value=53.0, min_value=0.0, step=1.0,
+            key="co2_factor_gas_combust", on_change=mark_stale,
+            help="Kilograms of CO₂ per Mscf of gas burnt as fuel or "
+                 "flared. 53 kg/Mscf is the standard value for typical "
+                 "associated gas.")
+        co2_factor_flare_ineff = st.number_input(
+            "Flare combustion inefficiency (CH₄ slip fraction)",
+            value=0.02, min_value=0.0, max_value=0.20, step=0.005,
+            format="%.3f", key="co2_factor_flare_inefficiency",
+            on_change=mark_stale,
+            help="Fraction of flared gas that escapes as un-combusted "
+                 "methane. 2% is typical for a well-maintained flare; "
+                 "older or smokeless flares can be 5–10%. Counted at "
+                 "GWP100 = 28× CO₂.")
+        co2_factor_oil_routine = st.number_input(
+            "Routine ops emissions (kg CO₂-eq/bbl oil)",
+            value=0.5, min_value=0.0, step=0.1,
+            key="co2_factor_oil_routine", on_change=mark_stale,
+            help="Vented + ops emissions per barrel of oil produced "
+                 "(diesel, methanol, fugitives). NCS upstream average "
+                 "is ~8 kg/boe; 0.5 here covers the residual after fuel "
+                 "and flare are accounted for separately.")
+        st.markdown("**Scope 3 — end-use combustion**")
+        co2_scope3_enabled = st.checkbox(
+            "Include Scope 3 in the cashflow as a fee",
+            value=False, key="co2_scope3_enabled", on_change=mark_stale,
+            help="Off — Scope 3 is reported in the yearly emissions "
+                 "profile but not charged. On — Scope 3 tonnes are "
+                 "priced at the Scope 3 carbon price below and deducted "
+                 "from the cashflow. Use this to test sensitivity to a "
+                 "future downstream carbon levy or internal carbon "
+                 "shadow price.")
+        s3c1, s3c2, s3c3 = st.columns(3)
+        co2_scope3_price = s3c1.number_input(
+            "Scope 3 carbon price ($/tonne)", value=0.0,
+            min_value=0.0, step=10.0, key="co2_scope3_price",
+            on_change=mark_stale,
+            help="$/tonne CO₂ applied to Scope 3 emissions when the "
+                 "toggle is on. Some companies use $50–$100/t as an "
+                 "internal shadow price for screening.")
+        co2_scope3_factor_oil = s3c2.number_input(
+            "Oil Scope 3 factor (kg CO₂/bbl)", value=430.0,
+            min_value=0.0, step=10.0, key="co2_scope3_factor_oil",
+            on_change=mark_stale,
+            help="End-use combustion of crude. 430 kg/bbl is the "
+                 "standard IPCC / EPA value for stationary combustion.")
+        co2_scope3_factor_gas = s3c3.number_input(
+            "Gas Scope 3 factor (kg CO₂/Mscf)", value=53.0,
+            min_value=0.0, step=1.0, key="co2_scope3_factor_gas",
+            on_change=mark_stale,
+            help="End-use combustion of natural gas. 53 kg/Mscf same as "
+                 "the upstream combustion factor.")
+
     return EconInputs(
         oil_price=oil_price,        # already in $/bbl (engine-internal)
         gas_price=gas_price,        # already in $/Mscf (engine-internal)
@@ -7286,6 +7652,14 @@ def economics_section(units, start_date):
         tariff_gas=tariff_gas_mmbtu * MMBTU_PER_MCF,  # $/MMBtu → $/Mscf
         abandonment_cost_MM=aban_cost,
         facility_capex=CapexSchedule(df=fac_df.copy()),
+        co2_price=co2_price,
+        co2_factor_gas_combust=co2_factor_gas_combust,
+        co2_factor_flare_inefficiency=co2_factor_flare_ineff,
+        co2_factor_oil_routine=co2_factor_oil_routine,
+        co2_scope3_enabled=co2_scope3_enabled,
+        co2_scope3_factor_oil=co2_scope3_factor_oil,
+        co2_scope3_factor_gas=co2_scope3_factor_gas,
+        co2_scope3_price=co2_scope3_price,
         fiscal_regime=regime_for_engine,
         psc_cost_recovery_ceiling=psc_cost_recovery_ceiling,
         psc_profit_oil_share_contractor=psc_profit_oil_share_contractor,
@@ -7503,13 +7877,44 @@ def plot_drilling_gantt(wells):
     fig = go.Figure()
     rigs = sorted({w.rig for w in wells})
     color_map = {r: RIG_COLORS[i % len(RIG_COLORS)] for i, r in enumerate(rigs)}
-    for w in wells:
+    # Read the well -> template mapping built by the concept builder.
+    # When available, the Gantt label includes the template (e.g.
+    # "P1 [T1]"), and the rows are grouped by template so each drill
+    # centre's wells sit together. When no mapping exists, the legacy
+    # behaviour (rig grouping) is preserved.
+    wt_map = st.session_state.get("well_template_map", {}) or {}
+    has_map = bool(wt_map)
+
+    def _tpl_of(name):
+        return wt_map.get(str(name), "—")
+
+    def _y_label(w):
+        if has_map:
+            t = _tpl_of(w.name)
+            return f"{w.name}  [{t}]" if t and t != "—" else w.name
+        return w.name
+
+    # Sort wells: by template (if mapped) then by spud, so each
+    # template's wells form a contiguous band.
+    if has_map:
+        wells_sorted = sorted(
+            wells,
+            key=lambda w: (_tpl_of(w.name), pd.Timestamp(w.spud_date),
+                            w.name))
+    else:
+        wells_sorted = list(wells)
+
+    for w in wells_sorted:
+        tpl = _tpl_of(w.name)
+        tpl_txt = (f"<br>Template: {tpl}"
+                   if has_map and tpl and tpl != "—" else "")
+        ylab = _y_label(w)
         fig.add_trace(go.Bar(
-            x=[w.drill_days * 86400000], y=[w.name],
+            x=[w.drill_days * 86400000], y=[ylab],
             base=[pd.Timestamp(w.spud_date)],
             orientation="h", marker_color=color_map[w.rig],
             opacity=0.85, showlegend=False,
-            hovertemplate=(f"<b>{w.name}</b> — {w.rig}<br>"
+            hovertemplate=(f"<b>{w.name}</b> — {w.rig}{tpl_txt}<br>"
                            f"Spud: {w.spud_date}<br>"
                            f"Drill: {w.drill_days} d<br>"
                            f"Compl: {w.completion_days} d<br>"
@@ -7517,19 +7922,49 @@ def plot_drilling_gantt(wells):
         ))
         compl_start = pd.Timestamp(w.spud_date) + pd.Timedelta(days=w.drill_days)
         fig.add_trace(go.Bar(
-            x=[w.completion_days * 86400000], y=[w.name],
+            x=[w.completion_days * 86400000], y=[ylab],
             base=[compl_start],
             orientation="h", marker_color=color_map[w.rig],
             opacity=0.45, showlegend=False,
-            hovertemplate=(f"{w.name} completion<br>"
+            hovertemplate=(f"{w.name} completion{tpl_txt}<br>"
                            f"From: {compl_start.date()}<br>"
                            f"Online: {w.online_date}<extra></extra>"),
         ))
     for r in rigs:
         fig.add_trace(go.Bar(x=[None], y=[None], marker_color=color_map[r],
                              name=r, showlegend=True))
+    # Add faint horizontal bands behind each template's wells when mapped
+    if has_map:
+        # build groups in plot order
+        groups = []
+        last_tpl = None
+        for w in wells_sorted:
+            tpl = _tpl_of(w.name)
+            if tpl != last_tpl:
+                groups.append([tpl, _y_label(w), _y_label(w)])
+                last_tpl = tpl
+            else:
+                groups[-1][2] = _y_label(w)
+        shapes = []
+        band_colors = ["rgba(120,170,210,0.10)",
+                        "rgba(200,160,90,0.10)"]
+        for gi, (tpl, y0, y1) in enumerate(groups):
+            if not tpl or tpl == "—":
+                continue
+            shapes.append(dict(
+                type="rect", xref="paper", yref="y",
+                x0=0, x1=1, y0=y0, y1=y1,
+                line=dict(width=0),
+                fillcolor=band_colors[gi % len(band_colors)],
+                layer="below"))
+        if shapes:
+            fig.update_layout(shapes=shapes)
+    title = ("Drilling schedule — grouped by template "
+             "(drill = solid, completion = faded)"
+             if has_map else
+             "Drilling schedule (drill = solid, completion = faded)")
     fig.update_layout(
-        title="Drilling schedule (drill = solid, completion = faded)",
+        title=title,
         height=max(350, 28 * len(wells)),
         barmode="overlay",
         xaxis=dict(type="date", title="Date"),
@@ -7700,8 +8135,64 @@ def plot_npv_waterfall(df_e, discount_rate: float):
     return fh.apply_plot_template(fig)
 
 
+def plot_co2_yearly(df_e):
+    """Yearly CO₂ emissions stacked by scope (Scope 1 ops + Scope 3 end-use).
+
+    Scope 3 dwarfs Scope 1 by 50-100×, so the chart uses a *split-axis* view:
+    Scope 1 on its own panel, Scope 3 on a second panel side-by-side, so
+    Scope 1 detail isn't crushed to invisibility under the Scope 3 stack.
+    A line of Scope 3 / Scope 1 ratio is overlaid where useful.
+    """
+    if "co2_scope1_tonnes" not in df_e.columns:
+        return None
+    df_c = df_e.copy()
+    df_c["year"] = pd.to_datetime(df_c["date"], errors="coerce").dt.year
+    df_c = df_c[df_c["year"].notna() & (df_c["year"] >= 1990)]
+    df_c["year"] = df_c["year"].astype(int)
+    annual = df_c.groupby("year").agg({
+        "co2_scope1_tonnes": "sum",
+        "co2_scope3_tonnes": "sum",
+        "co2_cost": "sum",
+        "co2_scope3_cost": "sum",
+    }).reset_index()
+    # convert tonnes -> kilotonnes for chart legibility
+    annual["s1_kt"] = annual["co2_scope1_tonnes"] / 1000.0
+    annual["s3_kt"] = annual["co2_scope3_tonnes"] / 1000.0
+    yrs = annual["year"].astype(str)
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Scope 1 — operational (kt CO₂-eq/yr)",
+                        "Scope 3 — end-use combustion (kt CO₂-eq/yr)"),
+        horizontal_spacing=0.12)
+    fig.add_trace(go.Bar(x=yrs, y=annual["s1_kt"],
+                         name="Scope 1",
+                         marker_color="#d98a2b"), row=1, col=1)
+    fig.add_trace(go.Bar(x=yrs, y=annual["s3_kt"],
+                         name="Scope 3",
+                         marker_color="#6b3a17"), row=1, col=2)
+    fig.update_xaxes(title_text="Calendar year", row=1, col=1,
+                      type="category")
+    fig.update_xaxes(title_text="Calendar year", row=1, col=2,
+                      type="category")
+    fig.update_yaxes(title_text="kt CO₂-eq / year", row=1, col=1)
+    fig.update_yaxes(title_text="kt CO₂-eq / year", row=1, col=2)
+    fig.update_layout(height=380, showlegend=False,
+                      title="Yearly CO₂ emissions by scope")
+    return fh.apply_plot_template(fig)
+
+
 def plot_economics(df_e):
-    annual = df_e.groupby(df_e["year"]).agg({
+    # Drop rows with bogus dates (NaT or epoch placeholders) before
+    # grouping. A single year=0 row stretched the bar chart's x-axis from
+    # 0 to 2040, hiding all the data at the right edge.
+    df_clean = df_e.copy()
+    df_clean["year"] = pd.to_datetime(df_clean["date"],
+                                        errors="coerce").dt.year
+    df_clean = df_clean[df_clean["year"].notna()
+                         & (df_clean["year"] >= 1990)]
+    df_clean["year"] = df_clean["year"].astype(int)
+    annual = df_clean.groupby("year").agg({
         "revenue": "sum", "royalty": "sum", "tariff": "sum",
         "opex": "sum", "capex_well": "sum", "capex_facility": "sum",
         "tax": "sum", "abandonment": "sum", "cashflow": "sum"
@@ -7745,14 +8236,17 @@ def plot_economics(df_e):
         ("abandonment", "Abandonment", "#7f7f7f", -1),
     ]
     for col, name, color, sign in bars:
-        fig.add_trace(go.Bar(x=annual["year"], y=sign * annual[col]/1e6,
+        fig.add_trace(go.Bar(x=annual["year"].astype(str),
+                             y=sign * annual[col]/1e6,
                              name=name, marker_color=color), row=1, col=1)
-    # mark first oil on the buildup chart
-    if first_oil_year is not None:
-        fh.safe_vline(fig, first_oil_year, label="First oil",
+    # mark first oil on the buildup chart (using string years so the
+    # vline lands on the matching categorical tick)
+    if first_oil_year is not None and first_oil_year in annual["year"].values:
+        fh.safe_vline(fig, str(first_oil_year), label="First oil",
                       color="#2ca02c", dash="dot", row=1, col=1)
-    if cessation_year is not None:
-        fh.safe_vline(fig, cessation_year, label="Cessation",
+    if (cessation_year is not None
+            and cessation_year in annual["year"].values):
+        fh.safe_vline(fig, str(cessation_year), label="Cessation",
                       color="#7f7f7f", dash="dot", row=1, col=1,
                       label_position="bottom")
     fig.add_trace(go.Scatter(x=df_e["date"], y=df_e["cum_cashflow"]/1e6,
@@ -7762,7 +8256,16 @@ def plot_economics(df_e):
                              name="NPV", line=dict(color="#ff7f0e", width=2, dash="dash")),
                   row=1, col=2)
     fig.add_hline(y=0, line=dict(color="grey", dash="dot"), row=1, col=2)
-    fig.update_xaxes(title_text="Calendar year", row=1, col=1)
+    # Force the annual bar chart to use the actual years as a categorical
+    # axis so every bar gets a proper tick label. Without this, Plotly's
+    # numeric autoscale snaps to round numbers like 500/1000/1500/2000 and
+    # the bars (which sit at years ~2025-2040) get squeezed to the left
+    # edge with no visible data.
+    fig.update_xaxes(title_text="Calendar year", row=1, col=1,
+                      type="category",
+                      categoryorder="array",
+                      categoryarray=[str(y) for y in
+                                      sorted(annual["year"].unique())])
     fig.update_xaxes(title_text="Date", row=1, col=2)
     fig.update_layout(barmode="relative", height=450,
                       legend=dict(orientation="h", y=-0.2))
@@ -8502,6 +9005,44 @@ def main():
             "the undiscounted cashflow, then the discounting bridge to NPV. "
             "Green = value added, red = value removed, blue = subtotals."
         )
+
+        # CO₂ Scope 1 + Scope 3 yearly profile
+        _co2_fig = plot_co2_yearly(df_e)
+        if _co2_fig is not None:
+            st.markdown("#### 🌍 Yearly CO₂ emissions — Scope 1 + Scope 3")
+            st.plotly_chart(_co2_fig, use_container_width=True)
+            _s1 = float(df_e.get("co2_scope1_tonnes",
+                                  pd.Series([0.0])).sum())
+            _s3 = float(df_e.get("co2_scope3_tonnes",
+                                  pd.Series([0.0])).sum())
+            _s1_cost = float(df_e.get("co2_cost",
+                                       pd.Series([0.0])).sum())
+            _s3_cost = float(df_e.get("co2_scope3_cost",
+                                       pd.Series([0.0])).sum())
+            cc1, cc2, cc3, cc4 = st.columns(4)
+            cc1.metric("Lifetime Scope 1",
+                       f"{_s1/1e6:,.2f} Mt CO₂-eq",
+                       help="Operational emissions over the full project "
+                            "life — fuel gas, flare, methane slip, "
+                            "routine vents.")
+            cc2.metric("Lifetime Scope 3",
+                       f"{_s3/1e6:,.2f} Mt CO₂-eq",
+                       help="End-use combustion of all the oil and gas "
+                            "sold. Charged to the cashflow only if the "
+                            "Scope 3 toggle is on.")
+            cc3.metric("Scope 1 fee", f"${_s1_cost/1e6:,.0f}MM",
+                       help="Total Scope 1 carbon cost folded into the "
+                            "cashflow.")
+            cc4.metric("Scope 3 fee", f"${_s3_cost/1e6:,.0f}MM",
+                       help="Total Scope 3 carbon cost folded into the "
+                            "cashflow (zero unless the toggle is on).")
+            _ratio = (_s3 / _s1) if _s1 > 0 else 0.0
+            st.caption(
+                f"Scope 3 / Scope 1 ratio: **{_ratio:.0f}×**. The vast "
+                f"majority of an upstream project's lifecycle emissions "
+                f"come from downstream combustion. Scope 1 is what the "
+                f"operator can directly act on (flare reduction, "
+                f"electrification, CCS); Scope 3 is policy-driven.")
 
         # Minimum economical volume + robustness case
         with st.expander("📉 Minimum economical volume & robustness case",
@@ -10656,8 +11197,11 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         st.markdown("#### 📊 Probabilistic reserves (SPE-PRMS convention)")
         is_oil_mc = FLUID_SYSTEMS[fluid]["primary"] == "oil"
         res_col = "cum_oil" if is_oil_mc else "cum_gas"
-        res_unit = "MMstb" if is_oil_mc else "Bscf"
-        res_vols = summary[res_col].values
+        _phase_unit = "oil_vol" if is_oil_mc else "gas_vol"
+        res_unit = ulabel(_phase_unit, units)
+        # Convert MMstb/Bscf → user's display units (MMstb/Bscf or
+        # MSm³/GSm³) so the reserves report honours the unit toggle.
+        res_vols = from_field(summary[res_col].values, _phase_unit, units)
         rc = classify_reserves(res_vols)
         if rc["n"] > 0:
             rk1, rk2, rk3, rk4 = st.columns(4)
@@ -10855,8 +11399,11 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         if show_reserves:
             _is_oil_mc = FLUID_SYSTEMS[fluid]["primary"] == "oil"
             _rcol = "cum_oil" if _is_oil_mc else "cum_gas"
-            _runit = "MMstb" if _is_oil_mc else "Bscf"
-            _rvols = summary[_rcol].values
+            _phase_unit = "oil_vol" if _is_oil_mc else "gas_vol"
+            _runit = ulabel(_phase_unit, units)
+            # Convert the field-unit values (MMstb / Bscf) into the user's
+            # chosen display units (MMstb/Bscf or MSm³/GSm³ for SI).
+            _rvols = from_field(summary[_rcol].values, _phase_unit, units)
             _rc = classify_reserves(_rvols)
             if _rc["n"] > 0:
                 fig_res = go.Figure()
@@ -10903,7 +11450,7 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         fig_c = go.Figure()
         fig_c.add_trace(go.Bar(
             y=names, x=vals, orientation="h",
-            marker_color=[C["spring"] if v > 0 else C["gas"] for v in vals],
+            marker_color=[C["oil"] if v > 0 else C["gas"] for v in vals],
             hovertemplate="%{y}: %{x:+.2f}<extra></extra>",
         ))
         fig_c.add_vline(x=0, line=dict(color=C["pressure"], width=1))

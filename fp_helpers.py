@@ -3835,37 +3835,94 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
         # other: "clustered" (side by side near the field) or "spread"
         # (separated along the tie-back). Default clustered.
         template_layout = str(g("template_layout", "clustered"))
-        # distribute the subsea wells across templates
-        wells_left = n_subsea
-        # base x positions for templates
-        if template_layout == "spread" and n_t > 1:
-            t_xs = [70 + i * (380 / max(1, n_t - 1)) for i in range(n_t)]
+        # gas-field detection so producer slots are coloured by phase
+        _fl_s = str(g("fluid_system", "Oil with associated gas")).lower()
+        _is_gas_s = any(s in _fl_s for s in
+                        ("dry gas", "gas with condensate", "wet gas",
+                         "gas condensate"))
+        # If templates_detail is present, honour each template's x_km
+        # coordinate (and its own slot count / name / role) so the side
+        # view matches the aerial — ordering by x position, with the
+        # template closest to the host on the right, furthest on the left.
+        td_list = g("templates_detail", None)
+        det_mode = (td_list is not None
+                    and len(td_list) == n_t and n_t >= 1)
+        if det_mode:
+            # x_km is signed (negative = west of host). The side view runs
+            # field (left) → host (right), so the most negative x sits at
+            # the left edge and the least negative at the right.
+            sorted_idx = sorted(range(n_t),
+                                key=lambda j: float(td_list[j]
+                                                    .get("x_km", -14.0)))
+            xs_km = [float(td_list[j].get("x_km", -14.0))
+                     for j in sorted_idx]
+            xmin, xmax = min(xs_km), max(xs_km)
+            xspan = max(xmax - xmin, 1.0)
+            # template centres in pixel space, between x=70 and x=450
+            left_px, right_px = 70, 450
+            if n_t == 1:
+                t_xs = [(left_px + right_px) // 2]
+            else:
+                t_xs = [left_px + (xk - xmin) / xspan * (right_px - left_px)
+                        for xk in xs_km]
+            td_use = [td_list[j] for j in sorted_idx]
         else:
-            t_xs = [70 + i * 120 for i in range(n_t)]
+            # base x positions for templates (legacy simple mode)
+            if template_layout == "spread" and n_t > 1:
+                t_xs = [70 + i * (380 / max(1, n_t - 1)) for i in range(n_t)]
+            else:
+                t_xs = [70 + i * 120 for i in range(n_t)]
+            td_use = [{"slots": slot_capacity,
+                       "name": f"T{i+1}",
+                       "role": "producer"} for i in range(n_t)]
+        # distribute the subsea wells across templates (only in non-detail
+        # mode; in detail mode each template carries its own well count)
+        wells_left = n_subsea
         first_t_x = t_xs[0]
         last_t_x = t_xs[-1]
         for ti, t_x in enumerate(t_xs):
+            td_i = td_use[ti]
+            t_slots = int(td_i.get("slots", slot_capacity))
+            t_role = str(td_i.get("role", "producer")).lower()
+            t_name = str(td_i.get("name", f"T{ti+1}"))
             # template frame — width scales with slot count
-            t_w = 30 + slot_capacity * 11
+            t_w = 30 + t_slots * 11
             t_w = min(t_w, 130)
             t_y = seabed - 18
             parts.append(
                 f'<rect x="{t_x}" y="{t_y}" width="{t_w}" height="20" '
                 f'rx="3" fill="#c4566a" stroke="#5a2030" stroke-width="2"/>')
             # well slots as small circles along the template
-            this_wells = min(slot_capacity,
-                             max(0, wells_left if ti == n_t - 1
-                                 else min(slot_capacity, wells_left)))
-            for s in range(slot_capacity):
-                sx = t_x + 10 + s * ((t_w - 16) / max(1, slot_capacity - 1)
-                                     if slot_capacity > 1 else 0)
+            if det_mode:
+                # template's own well count (from the well-template map);
+                # fall back to filling up to its slot capacity
+                _wells_on = td_i.get("wells")
+                this_wells = (min(t_slots, len(_wells_on))
+                              if _wells_on is not None
+                              else min(t_slots, wells_left))
+            else:
+                this_wells = min(t_slots,
+                                 max(0, wells_left if ti == n_t - 1
+                                     else min(t_slots, wells_left)))
+            for s in range(t_slots):
+                sx = t_x + 10 + s * ((t_w - 16) / max(1, t_slots - 1)
+                                     if t_slots > 1 else 0)
                 slot_filled = s < this_wells
+                # phase-aware slot fill
+                if slot_filled:
+                    if t_role == "injector":
+                        fill = "#2f6fb0"   # blue
+                    elif _is_gas_s:
+                        fill = "#d98a2b"   # orange (gas)
+                    else:
+                        fill = "#3aa856"   # green (oil)
+                else:
+                    fill = "#e8e8e8"
                 parts.append(
                     f'<circle cx="{sx:.0f}" cy="{t_y + 10}" r="4" '
-                    f'fill="{"#2a2a2a" if slot_filled else "#e8e8e8"}" '
+                    f'fill="{fill}" '
                     f'stroke="#333" stroke-width="1"/>')
                 if slot_filled:
-                    # well stub down into the seabed
                     parts.append(
                         f'<line x1="{sx:.0f}" y1="{seabed}" x2="{sx:.0f}" '
                         f'y2="{seabed + 26}" stroke="#333" '
@@ -3874,13 +3931,13 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
             parts.append(
                 f'<text x="{t_x + t_w/2:.0f}" y="{seabed + 40}" '
                 f'font-size="9" fill="#5a2030" text-anchor="middle">'
-                f'T{ti+1}: {template_type.split(" ")[0]}</text>')
+                f'{t_name}: {t_slots}-slot</text>')
         # caption under the template cluster
         parts.append(
             f'<text x="{first_t_x:.0f}" y="{seabed + 54}" font-size="10" '
             f'fill="#333">{n_t} × template, {n_subsea} wells</text>')
-        # inter-template tie line when spread
-        if n_t > 1 and template_layout == "spread":
+        # inter-template tie line — always shown when more than one
+        if n_t > 1:
             parts.append(
                 f'<line x1="{first_t_x + 40:.0f}" y1="{seabed - 4}" '
                 f'x2="{last_t_x:.0f}" y2="{seabed - 4}" stroke="#888" '
@@ -4103,6 +4160,12 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
     template_layout = str(g("template_layout", "clustered"))
     host_type = str(g("host_type", ""))
     templates_detail = g("templates_detail", None)
+    # Detect a gas field from the fluid system so the producer slots and
+    # legend swatch are coloured by phase (orange for gas, green for oil).
+    _fl = str(g("fluid_system", "Oil with associated gas")).lower()
+    _is_gas_field = any(s in _fl for s in ("dry gas",
+                                            "gas with condensate",
+                                            "wet gas", "gas condensate"))
 
     W, H = 760, 470
     parts = []
@@ -4239,17 +4302,36 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
 
     # ---- Routing helper ----------------------------------------------
     def _leg(p1, p2, color, width, dash=None, label=None,
-             label_dy=-6, label_color=None):
+             label_dy=-6, label_color=None, curve_offset=0.10):
+        """Draw a gently curved tie-in leg as a quadratic Bezier so the
+        plot looks less mechanical than ruler-straight lines. The control
+        point sits at the midpoint, offset perpendicular to the line by
+        `curve_offset` × leg length."""
         out = []
         d = (f' stroke-dasharray="{dash}"' if dash else '')
-        out.append(f'<line x1="{p1[0]:.1f}" y1="{p1[1]:.1f}" '
-                   f'x2="{p2[0]:.1f}" y2="{p2[1]:.1f}" stroke="{color}" '
-                   f'stroke-width="{width}"{d}/>')
+        dx, dy = (p2[0] - p1[0]), (p2[1] - p1[1])
+        L = math.hypot(dx, dy) or 1.0
+        # perpendicular unit vector (rotate 90° CCW)
+        nx, ny = -dy / L, dx / L
+        # midpoint of the chord
+        mx, my = (p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0
+        # control point
+        cx = mx + nx * L * curve_offset
+        cy = my + ny * L * curve_offset
+        out.append(
+            f'<path d="M{p1[0]:.1f},{p1[1]:.1f} '
+            f'Q{cx:.1f},{cy:.1f} {p2[0]:.1f},{p2[1]:.1f}" '
+            f'stroke="{color}" stroke-width="{width}"{d} '
+            f'fill="none"/>')
         if label:
-            mx, my = (p1[0]+p2[0])/2, (p1[1]+p2[1])/2
-            out.append(f'<text x="{mx:.1f}" y="{my+label_dy:.1f}" '
-                       f'font-size="9" fill="{label_color or color}" '
-                       f'text-anchor="middle">{label}</text>')
+            # label sits near the bowed midpoint (halfway between chord
+            # midpoint and control point) so it tracks the curve
+            lx_p = mx + nx * L * curve_offset * 0.5
+            ly_p = my + ny * L * curve_offset * 0.5
+            out.append(
+                f'<text x="{lx_p:.1f}" y="{ly_p + label_dy:.1f}" '
+                f'font-size="9" fill="{label_color or color}" '
+                f'text-anchor="middle">{label}</text>')
         return "".join(out)
 
     # ---- Draw the tie-in legs (under the structures) -----------------
@@ -4306,12 +4388,29 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
         if templates_detail and i < len(templates_detail):
             n_slots = int(templates_detail[i].get("slots", slot_capacity))
         this_wells = min(n_slots, wells_left)
-        # slot roles: a detail entry may flag an injector template
+        # If the template has an explicit well assignment, the filled-slot
+        # count is the number of wells linked to it (not the running
+        # remainder).
+        _assigned_wells = None
+        _assigned_rigs = None
+        if templates_detail and i < len(templates_detail):
+            _aw = templates_detail[i].get("wells")
+            if _aw is not None:
+                _assigned_wells = list(_aw)
+                this_wells = min(n_slots, len(_assigned_wells))
+            _assigned_rigs = templates_detail[i].get("rigs")
+        # slot roles: by default a producer template's slots are coloured
+        # green (oil) — but on a gas field the producers are gas wells, so
+        # paint them orange. Injectors stay blue regardless.
         kinds = None
         if templates_detail and i < len(templates_detail):
             role = str(templates_detail[i].get("role", "producer"))
             if role == "injector":
                 kinds = ["water"] * n_slots
+            elif _is_gas_field:
+                kinds = ["gas"] * n_slots
+        elif _is_gas_field:
+            kinds = ["gas"] * n_slots
         _lbl = f"T{i+1}"
         if templates_detail and i < len(templates_detail):
             _lbl = str(templates_detail[i].get("name", f"T{i+1}"))
@@ -4319,6 +4418,19 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
             tpl_px[i][0], tpl_px[i][1], _lbl, this_wells, n_slots,
             slot_kinds=kinds)
         parts.append(svg_t)
+        # sub-label: well count + serving rig(s)
+        if _assigned_wells is not None:
+            _sub = f"{len(_assigned_wells)} well"
+            _sub += "" if len(_assigned_wells) == 1 else "s"
+            if _assigned_rigs:
+                _rig_txt = "/".join(str(r) for r in _assigned_rigs
+                                    if r and r != "—")
+                if _rig_txt:
+                    _sub += f" · {_rig_txt}"
+            parts.append(
+                f'<text x="{tpl_px[i][0]:.1f}" '
+                f'y="{tpl_px[i][1] + 40:.1f}" font-size="8.5" '
+                f'fill="#56646d" text-anchor="middle">{_sub}</text>')
         wells_left -= this_wells
 
     # ---- Draw the host -----------------------------------------------
@@ -4369,15 +4481,21 @@ def _concept_aerial_svg(spec: dict, concept_type: str) -> str:
                      f'font-size="9" fill="#555">Export '
                      f'{export_km:.0f} km →</text>')
 
-    # ---- Legend -------------------------------------------------------
-    lx, ly = W - 138, 78
-    parts.append(f'<rect x="{lx}" y="{ly}" width="128" height="118" '
+    # ---- Legend (lower-left) -----------------------------------------
+    lx, ly = 14, H - 178
+    parts.append(f'<rect x="{lx}" y="{ly}" width="148" height="118" '
                  f'rx="4" fill="#ffffff" stroke="#c4ced4" '
                  f'stroke-width="1" opacity="0.95"/>')
     parts.append(f'<text x="{lx+8}" y="{ly+16}" font-size="10" '
                  f'fill="#234" font-weight="bold">Legend</text>')
+    # Phase-aware producer slot label: gas-orange for gas fields, oil-green
+    # for oil fields.
+    if _is_gas_field:
+        prod_swatch = ("#d98a2b", "Gas producer slot")
+    else:
+        prod_swatch = ("#3aa856", "Oil producer slot")
     leg = [
-        ("rect", "#3aa856", "Oil producer slot"),
+        ("rect", prod_swatch[0], prod_swatch[1]),
         ("rect", "#2f6fb0", "Water injector slot"),
         ("rect", "#e7ecef", "Spare / empty slot"),
         ("line", "#235a86", "Production flowline"),
