@@ -8197,19 +8197,21 @@ def plot_economics(df_e):
         "opex": "sum", "capex_well": "sum", "capex_facility": "sum",
         "tax": "sum", "abandonment": "sum", "cashflow": "sum"
     }).reset_index()
-    # The timeline starts when money first moves — the first year with any
-    # CAPEX (development investment usually precedes first oil) — and ends
-    # at cessation (the last year with any cost or revenue). Trim the annual
-    # frame to that span so the x-axis reflects the true project life.
-    annual["_cost"] = (annual["capex_well"].abs()
-                       + annual["capex_facility"].abs()
-                       + annual["abandonment"].abs()
-                       + annual["revenue"].abs())
-    active = annual[annual["_cost"] > 1.0]
-    if len(active) > 0:
-        y0, y1 = active["year"].min(), active["year"].max()
-        annual = annual[(annual["year"] >= y0)
-                        & (annual["year"] <= y1)].reset_index(drop=True)
+    # Include every calendar year in the plot range, not only years
+    # with cost activity. Previously when only one year (e.g. the
+    # facility CAPEX year) had non-zero cost we trimmed annual to a
+    # single row — the bars all stacked on that one x-tick and the rest
+    # of the project life looked empty, even though the production
+    # years had revenue. Re-index against a full year range so every
+    # year of project life shows on the x-axis, with zeros filling
+    # quiet years.
+    if len(annual) > 0:
+        full_years = list(range(int(annual["year"].min()),
+                                 int(annual["year"].max()) + 1))
+        annual = (annual.set_index("year")
+                        .reindex(full_years, fill_value=0.0)
+                        .reset_index()
+                        .rename(columns={"index": "year"}))
 
     # First-oil and cessation calendar years for reference markers
     first_oil_year = None
@@ -8235,17 +8237,19 @@ def plot_economics(df_e):
         ("tax", "Tax", "#e377c2", -1),
         ("abandonment", "Abandonment", "#7f7f7f", -1),
     ]
+    # x-categories: every project year as a string, in order
+    year_cats = [str(y) for y in annual["year"].tolist()]
     for col, name, color, sign in bars:
-        fig.add_trace(go.Bar(x=annual["year"].astype(str),
+        fig.add_trace(go.Bar(x=year_cats,
                              y=sign * annual[col]/1e6,
                              name=name, marker_color=color), row=1, col=1)
     # mark first oil on the buildup chart (using string years so the
     # vline lands on the matching categorical tick)
-    if first_oil_year is not None and first_oil_year in annual["year"].values:
+    if first_oil_year is not None and str(first_oil_year) in year_cats:
         fh.safe_vline(fig, str(first_oil_year), label="First oil",
                       color="#2ca02c", dash="dot", row=1, col=1)
     if (cessation_year is not None
-            and cessation_year in annual["year"].values):
+            and str(cessation_year) in year_cats):
         fh.safe_vline(fig, str(cessation_year), label="Cessation",
                       color="#7f7f7f", dash="dot", row=1, col=1,
                       label_position="bottom")
@@ -8256,16 +8260,18 @@ def plot_economics(df_e):
                              name="NPV", line=dict(color="#ff7f0e", width=2, dash="dash")),
                   row=1, col=2)
     fig.add_hline(y=0, line=dict(color="grey", dash="dot"), row=1, col=2)
-    # Force the annual bar chart to use the actual years as a categorical
-    # axis so every bar gets a proper tick label. Without this, Plotly's
-    # numeric autoscale snaps to round numbers like 500/1000/1500/2000 and
-    # the bars (which sit at years ~2025-2040) get squeezed to the left
-    # edge with no visible data.
+    # Force the annual bar chart to use every project year as an explicit
+    # category. Without categoryorder="array", Plotly tries to be clever
+    # and either snaps the axis to round numeric ticks (the old 500-2000
+    # bug) or only labels years that have non-zero data (this bug — bars
+    # crammed at year 2030 because the trim left a single non-zero row).
     fig.update_xaxes(title_text="Calendar year", row=1, col=1,
                       type="category",
                       categoryorder="array",
-                      categoryarray=[str(y) for y in
-                                      sorted(annual["year"].unique())])
+                      categoryarray=year_cats,
+                      tickmode="array",
+                      tickvals=year_cats,
+                      ticktext=year_cats)
     fig.update_xaxes(title_text="Date", row=1, col=2)
     fig.update_layout(barmode="relative", height=450,
                       legend=dict(orientation="h", y=-0.2))
