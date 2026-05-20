@@ -2482,6 +2482,14 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
             depr_years = float(getattr(econ, "ncs_depreciation_years", 6.0))
             uplift_years = float(getattr(econ, "ncs_uplift_years", 4.0))
             n = len(df_e)
+            # Settle terminal items at the cessation month rather than the
+            # end of the forecast horizon. Without this, depreciation
+            # spillovers, uplift spillovers, CIT/SPT loss-carry-forward
+            # refunds all land at the LAST row of df_e (year 2046, say),
+            # producing a stray Tax/Facility-CAPEX-look-alike bar long
+            # after the field has ceased producing.
+            terminal_idx = int(df_e.attrs.get("cessation_idx", n - 1))
+            terminal_idx = max(0, min(n - 1, terminal_idx))
 
             capex_full = (df_e["capex_well"].values.astype(float)
                           + df_e["capex_facility"].values.astype(float))
@@ -2493,14 +2501,15 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 if amt <= 0:
                     continue
                 per_month = amt / depr_months
-                # Tail beyond the forecast is allowed to accelerate into the
-                # final month so total depreciation always equals total CAPEX
-                # (NCS losses are not lost — they unwind at cessation).
-                end = min(n, i + depr_months)
+                # Tail beyond cessation is allowed to accelerate into the
+                # cessation month so total depreciation always equals total
+                # CAPEX (NCS losses are not lost — they unwind at
+                # cessation).
+                end = min(terminal_idx + 1, i + depr_months)
                 depreciation[i:end] += per_month
-                spilled = per_month * (depr_months - (end - i))
+                spilled = per_month * (depr_months - max(0, end - i))
                 if spilled > 0:
-                    depreciation[n - 1] += spilled
+                    depreciation[terminal_idx] += spilled
             # Uplift: straight-line over uplift_years, SPT base only.
             uplift_months = max(1, int(round(uplift_years * 12)))
             uplift_sched = np.zeros(n)
@@ -2509,11 +2518,11 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 if amt <= 0:
                     continue
                 per_month = amt / uplift_months
-                end = min(n, i + uplift_months)
+                end = min(terminal_idx + 1, i + uplift_months)
                 uplift_sched[i:end] += per_month
-                spilled = per_month * (uplift_months - (end - i))
+                spilled = per_month * (uplift_months - max(0, end - i))
                 if spilled > 0:
-                    uplift_sched[n - 1] += spilled
+                    uplift_sched[terminal_idx] += spilled
 
             # Operating profit (CAPEX enters via depreciation, not expensed).
             op_profit = (df_e["revenue"].values
@@ -2535,12 +2544,13 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                     cit_cf = 0.0
                 else:
                     cit_cf = -base
-            # Terminal loss settlement: NCS does not let tax losses expire —
-            # remaining carry-forward at cessation is refunded (the State
-            # carries the downside symmetrically). Credit the residual loss
-            # at its tax value in the final month.
+            # Terminal loss settlement at CESSATION (not horizon end). NCS
+            # does not let tax losses expire — remaining carry-forward at
+            # cessation is refunded (the State carries the downside
+            # symmetrically). Credit the residual loss at its tax value in
+            # the cessation month, not at year n-1.
             if cit_cf > 0:
-                cit[n - 1] -= cit_cf * cit_rate
+                cit[terminal_idx] -= cit_cf * cit_rate
             # SPT with its own loss carry-forward (uplift in the base).
             spt = np.zeros(n)
             spt_cf = 0.0
@@ -2553,7 +2563,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 else:
                     spt_cf = -base
             if spt_cf > 0:
-                spt[n - 1] -= spt_cf * spt_rate
+                spt[terminal_idx] -= spt_cf * spt_rate
             tax_full = cit + spt
 
             df_e["ncs_cit"] = cit
@@ -8197,21 +8207,6 @@ def plot_economics(df_e):
         "opex": "sum", "capex_well": "sum", "capex_facility": "sum",
         "tax": "sum", "abandonment": "sum", "cashflow": "sum"
     }).reset_index()
-    # Include every calendar year in the plot range, not only years
-    # with cost activity. Previously when only one year (e.g. the
-    # facility CAPEX year) had non-zero cost we trimmed annual to a
-    # single row — the bars all stacked on that one x-tick and the rest
-    # of the project life looked empty, even though the production
-    # years had revenue. Re-index against a full year range so every
-    # year of project life shows on the x-axis, with zeros filling
-    # quiet years.
-    if len(annual) > 0:
-        full_years = list(range(int(annual["year"].min()),
-                                 int(annual["year"].max()) + 1))
-        annual = (annual.set_index("year")
-                        .reindex(full_years, fill_value=0.0)
-                        .reset_index()
-                        .rename(columns={"index": "year"}))
 
     # First-oil and cessation calendar years for reference markers
     first_oil_year = None
@@ -8223,6 +8218,30 @@ def plot_economics(df_e):
     cidx = df_e.attrs.get("cessation_idx")
     if cidx is not None and cidx < len(df_e):
         cessation_year = int(pd.to_datetime(df_e["date"].iloc[cidx]).year)
+
+    # Include every calendar year in the plot range, not only years
+    # with cost activity. The annual frame might only have one or two
+    # non-zero years (e.g. a CAPEX year and not much else if the run
+    # hasn't reached full economics). Pad the span to cover at least
+    # the first calendar year present in df_clean through the cessation
+    # year, so the x-axis reflects the true project life even when most
+    # years would be zeros.
+    if len(annual) > 0:
+        y_lo = int(annual["year"].min())
+        y_hi = int(annual["year"].max())
+        if len(df_clean) > 0:
+            y_lo = min(y_lo, int(df_clean["year"].min()))
+            y_hi = max(y_hi, int(df_clean["year"].max()))
+        if cessation_year is not None:
+            y_hi = max(y_hi, int(cessation_year))
+        if first_oil_year is not None:
+            y_lo = min(y_lo, int(first_oil_year))
+            y_hi = max(y_hi, int(first_oil_year))
+        full_years = list(range(y_lo, y_hi + 1))
+        annual = (annual.set_index("year")
+                        .reindex(full_years, fill_value=0.0)
+                        .reset_index()
+                        .rename(columns={"index": "year"}))
 
     fig = make_subplots(rows=1, cols=2,
                         subplot_titles=("Annual cashflow buildup ($MM)",
@@ -8244,7 +8263,11 @@ def plot_economics(df_e):
                              y=sign * annual[col]/1e6,
                              name=name, marker_color=color), row=1, col=1)
     # mark first oil on the buildup chart (using string years so the
-    # vline lands on the matching categorical tick)
+    # vline lands on the matching categorical tick). Crucially, only
+    # plot the vline when the year is actually in year_cats — otherwise
+    # Plotly silently appends the unknown category and stretches the
+    # axis past the data (the symptom you saw: bars crammed to the left,
+    # 'Cessation' label drifting to the far right).
     if first_oil_year is not None and str(first_oil_year) in year_cats:
         fh.safe_vline(fig, str(first_oil_year), label="First oil",
                       color="#2ca02c", dash="dot", row=1, col=1)
@@ -8263,8 +8286,9 @@ def plot_economics(df_e):
     # Force the annual bar chart to use every project year as an explicit
     # category. Without categoryorder="array", Plotly tries to be clever
     # and either snaps the axis to round numeric ticks (the old 500-2000
-    # bug) or only labels years that have non-zero data (this bug — bars
-    # crammed at year 2030 because the trim left a single non-zero row).
+    # bug) or only labels years that have non-zero data (the second bug —
+    # bars crammed at year 2030 because the rest of the years had no
+    # data even after reindex).
     fig.update_xaxes(title_text="Calendar year", row=1, col=1,
                       type="category",
                       categoryorder="array",
@@ -8527,6 +8551,184 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # ---- Guided walkthrough ----
+    # A self-contained onboarding panel that takes the user from a blank
+    # app to a complete field-development case, in the same order as the
+    # sidebar inputs. Defaults expanded the first time, collapsed once the
+    # user has run a case (tracked via session state).
+    _wt_default_open = not bool(st.session_state.get("_has_run_once",
+                                                       False))
+    with st.expander("📘 **New here? Quick walkthrough — 8 steps to a "
+                     "complete case**", expanded=_wt_default_open):
+        st.caption(
+            "FieldVista takes a screening-level field development from a "
+            "blank sheet to NPV / IRR / reserves in under ten minutes once "
+            "you know where the inputs live. The sidebar holds **what the "
+            "field is**; the main pages show **what the model says about "
+            "it**. Work top-to-bottom in the sidebar — every section "
+            "depends only on the ones above it.")
+
+        st.markdown("### 1 · Units, fluid system and strategy")
+        st.markdown(
+            "- **Units** (top of the sidebar) — field (MMstb, Bscf, psi) "
+            "or SI (MSm³, GSm³, bar). Every input and every chart follow "
+            "the choice.\n"
+            "- **Fluid system** — oil with associated gas, dry gas, gas "
+            "with condensate, black oil. Sets which phase is primary and "
+            "which engineering checks apply.\n"
+            "- **Strategy** — _Depletion_ (no injection) or _Injection_ "
+            "(water/gas injectors maintain pressure). Strategy decides "
+            "whether the injector table is editable and whether voidage "
+            "balance is enforced.\n"
+            "- **Start date** and **forecast horizon** in years.")
+
+        st.markdown("### 2 · Reservoir volumes, PVT, aquifer / gas cap")
+        st.markdown(
+            "- **Reservoir volumes** — OOIP (MMstb) or OGIP (Bscf) and "
+            "**target recovery factor**. The volumetric cap stops the "
+            "decline curve from over-producing the resource.\n"
+            "- **PVT inputs** — initial reservoir pressure, temperature, "
+            "API, gas gravity, GOR (oil) or CGR (gas). Drives the Bo/Rs/Z "
+            "tables used by the material-balance tank.\n"
+            "- **Aquifer support** — toggle on for a Pot, Fetkovich or "
+            "Carter-Tracy model. Without aquifer support a depletion run "
+            "drops pressure quickly below bubble point.\n"
+            "- **Gas cap** — for oil reservoirs sitting under a free-gas "
+            "cap. Affects MBE & ultimate recovery.\n"
+            "- **🔧 Well-head shut-in pressure** — main-area panel just "
+            "above the reservoir section. Computes SIWHP from reservoir "
+            "pressure, datum depth, water depth and water cut, and tells "
+            "you the pressure-rating class (and whether a HIPPS is "
+            "required).")
+
+        st.markdown("### 3 · Capacity schedule")
+        st.markdown(
+            "- Time-varying surface capacity for oil, gas, water and "
+            "liquid throughput. The decline curve is choked by the active "
+            "row's limits.\n"
+            "- Adds rows for ramp-ups (debottlenecking, second train, "
+            "tariff renegotiation) — each row's start date applies from "
+            "that month onward.\n"
+            "- A production-efficiency factor scales the capacity for "
+            "downtime.")
+
+        st.markdown("### 4 · Producers, injectors and rigs")
+        st.markdown(
+            "- **Producers table** — name, rig, spud date, drill / "
+            "completion days, qi, decline model (Exponential, Hyperbolic, "
+            "Harmonic, Multi-segment, or User-defined CSV / Eclipse RSM "
+            "profile), Di, b, water-cut ramp, scaling, uptime.\n"
+            "- **Injectors table** — same shape, with an injection rate.\n"
+            "- Each rig is its own queue: spud date + drill + completion "
+            "days advances the rig cursor for the next well on it.\n"
+            "- **🔍 Preview producer profiles** appears under the "
+            "producers table — every well's standalone profile and "
+            "cumulative volumes, with view modes for primary phase / all "
+            "phases / ratios (GOR, water cut, CGR). Sanity-check qi and "
+            "decline here before running.")
+
+        st.markdown("### 5 · Economics — prices, costs, fiscal regime, CO₂")
+        st.markdown(
+            "- **Oil price** $/bbl and **gas price** $/MMBtu (default "
+            "$10/MMBtu — European hub TTF/NBP cycle average).\n"
+            "- **OPEX** variable $/bbl and fixed $MM/year.\n"
+            "- **CAPEX** per well (or use the rig-rate mode) and a "
+            "phased **facility CAPEX** schedule (date + $MM per phase).\n"
+            "- **Royalty**, **tariffs**, **abandonment cost**, "
+            "**discount rate**, **money basis** (real vs nominal).\n"
+            "- **Fiscal regime** — Tax/Royalty, PSC, or **NCS** (CIT "
+            "22% + SPT 71.8% + 17.69% uplift over 4 yrs + 6-yr "
+            "straight-line depreciation; terminal losses settled at "
+            "cessation). Tax/Royalty carries losses forward so CAPEX-"
+            "heavy early years shelter later profits.\n"
+            "- **Economic cutoff mode** — _horizon_ (run to end) or "
+            "_economic_ (stop at the earlier of ultimate recovery vs "
+            "cumulative-NPV turnover). Cessation is booked a few months "
+            "after.\n"
+            "- **🌍 CO₂ emissions & carbon fees** — Scope 1 (fuel/flare/"
+            "vents) priced at the Scope 1 carbon price (default $80/t); "
+            "Scope 3 (end-use combustion) reported always, charged to "
+            "the cashflow only if its toggle is on.")
+
+        st.markdown("### 6 · Development concept (optional)")
+        st.markdown(
+            "- The 🏗️ **Development concept** section in the main area "
+            "builds a CAPEX estimate from the physical concept — host "
+            "type (FPSO / Semi / Spar / Onshore / Subsea tie-in), water "
+            "depth class, number and type of templates, wells, "
+            "flowlines, umbilicals, risers, HIPPS, multiphase meters, "
+            "boosting stations, gas lift, heating.\n"
+            "- Tick **Configure each template individually** to set per-"
+            "template name, type (single / double / 4-slot / 6-slot), "
+            "role (producer / injector), **X/Y position in km** from the "
+            "host, and tie-in (host or daisy-chained). Press **✅ Apply "
+            "template layout**.\n"
+            "- A second table lets you **link each producer well to a "
+            "template** — the well's drilling rig is shown alongside. "
+            "Press **✅ Apply well-template links**.\n"
+            "- Three views — **Side view** (cross-section), **Aerial "
+            "view** (plan-view, to scale, 2×2-style square templates "
+            "with phase-coloured slots and curved tie-in flowlines), "
+            "**3D view** (interactive Plotly).")
+
+        st.markdown("### 7 · Run the case")
+        st.markdown(
+            "- Hit the **▶ Run** button at the top of the main area. "
+            "The button stays inactive until inputs are valid; the "
+            "engine runs the monthly production model, the material-"
+            "balance tank, the economics calculation, and assembles all "
+            "the charts.\n"
+            "- A successful run unlocks the result tabs and the export "
+            "buttons (Excel, JSON, PDF).")
+
+        st.markdown("### 8 · Read the results")
+        st.markdown(
+            "- **Production** — phase rates, gas disposition, water "
+            "rates.\n"
+            "- **Cumulatives & RF** — cumulative produced volumes, "
+            "recovery factor with the target line.\n"
+            "- **Per-well** — each well's contribution to the field "
+            "totals, GOR/CGR/water-cut trends.\n"
+            "- **Drilling sequence** — Gantt grouped by template "
+            "(when wells are linked) with rig colours.\n"
+            "- **Material balance** — tank pressure trajectory, aquifer "
+            "influx, voidage ratio, p/Z plot for gas systems.\n"
+            "- **Economics** — annual cashflow buildup (CAPEX bars "
+            "below zero before first oil, revenue above zero through "
+            "the producing years, abandonment at the end), cumulative "
+            "CF and NPV, NPV waterfall, yearly Scope 1 + Scope 3 CO₂ "
+            "profile.\n"
+            "- **Sensitivity** — tornado of NPV vs ±range on each "
+            "driver.\n"
+            "- **Monte Carlo** — distribution of NPV, peak rate, final "
+            "RF; 1P / 2P / 3P probabilistic reserves with full unit "
+            "support (MMstb/Bscf or MSm³/GSm³).\n"
+            "- **Data** — every monthly column for download.\n"
+            "- **Methodology** — the equations behind every model, with "
+            "live unit self-test and validation against five reference "
+            "NCS/UKCS fields.")
+
+        st.markdown("---")
+        st.markdown("### Save your case")
+        st.markdown(
+            "- The **case manager** at the top of the page (📁 Cases) "
+            "lets you save the full input set as a named JSON case, "
+            "duplicate one, diff two, or load a saved case. Cases live "
+            "in `~/.field_prognosis_cases/` and can be exported / "
+            "imported between machines.\n"
+            "- **Multiple cases** can be opened side by side via the "
+            "📊 **Scenario comparison** tool (sidebar).\n"
+            "- **Portfolio mode** rolls up several saved cases with a "
+            "shared facility / export constraint and per-field start "
+            "delays.")
+
+        st.caption(
+            "⚠️ FieldVista is a **screening tool**. Treat numbers as "
+            "guidance, not as commitments. Always cross-check against a "
+            "full reservoir simulation, a discipline-grade economics "
+            "model, and your project's design basis before any "
+            "investment decision.")
+
     # ---- Top-bar: case management + help ----
     top_l, top_m, top_r = st.columns([3, 3, 2])
     with top_l:
@@ -8534,40 +8736,48 @@ def main():
     with top_m:
         export_section_placeholder = st.container()
     with top_r:
-        with st.popover("❓ Help & docs"):
-            st.markdown(
-                "### Workflow\n"
-                "1. Pick **units**, **fluid system** and **strategy** in the sidebar.\n"
-                "2. Set reservoir volumes, **target RF**, **PVT**, **aquifer** & **gas cap**.\n"
-                "3. Tune **operational efficiency** and **gas disposition** (export / inject / fuel / flare).\n"
-                "4. Define **rigs**, **producers**, and **injectors** with drill/completion days. "
-                "Each well has its own **uptime** and **scaling factor**.\n"
-                "5. *(Optional)* enable **multi-reservoir** mode and define reservoirs + well allocations.\n"
-                "6. Configure time-varying **capacities** and **economics** "
-                "(prices, OPEX, CAPEX, royalty, tax, tariffs, abandonment).\n"
-                "7. Click **▶ Run prognosis** — red = stale, green = fresh. "
-                "Editing any table or input flips it red.\n"
-                "8. Review tabs: production, cumulatives & RF, per-well, drilling Gantt, "
-                "material balance (with per-reservoir breakdown if active), economics, exports.\n"
-                "9. **Save** the case; **load**, **duplicate** or start a **new** case via the case manager.\n"
-                "10. Export as **Excel** (multi-sheet), **JSON-API**, or **PDF report**.\n\n"
-                "### Key features\n"
-                "- 🎯 **Auto-scale to RF**: bisection on a global producer multiplier so final RF "
-                "matches the target.\n"
-                "- 💰 **Breakeven**: oil-and-gas price multiplier where NPV = 0.\n"
-                "- 🪨 **Multi-reservoir**: per-reservoir PVT, strategy, MBE, and allocations.\n"
-                "- ♻️ **Gas disposition** drives revenue (net), CO₂ (fuel/flare), and gas injection.\n"
-                "- 🌳 **CO₂ rough estimate** from combusted/flared gas + routine ops emissions.\n"
-                "- 📊 Plot template applies a unified theme to every chart.\n\n"
-                "### Methodology\n"
-                "- **PVT**: Standing Bo/Rs, Beggs–Robinson μo, Brill–Beggs Z, Lee–Gonzalez μg.\n"
-                "- **MBE**: Schilthuis form with rock+water expansion, optional Pot or Fetkovich "
-                "aquifer, and gas cap term `m·Eg`. Pressure solved by bisection per timestep.\n"
-                "- **Capacity**: proportional choke when any surface limit binds.\n"
-                "- **Economics**: monthly DCF; tax on positive pretax CF only; royalty on gross revenue.\n\n"
-                "⚠️ Early-phase screening only. Not for investment decisions, reserves booking, "
-                "or production-grade studies."
-            )
+        wt_btn_col, help_btn_col = st.columns([1, 1])
+        with wt_btn_col:
+            if st.button("📘 Walkthrough", key="show_walkthrough_btn",
+                          help="Reopen the new-user walkthrough at the top "
+                               "of the page."):
+                st.session_state["_has_run_once"] = False
+                st.rerun()
+        with help_btn_col:
+            with st.popover("❓ Help"):
+                st.markdown(
+                    "### Workflow\n"
+                    "1. Pick **units**, **fluid system** and **strategy** in the sidebar.\n"
+                    "2. Set reservoir volumes, **target RF**, **PVT**, **aquifer** & **gas cap**.\n"
+                    "3. Tune **operational efficiency** and **gas disposition** (export / inject / fuel / flare).\n"
+                    "4. Define **rigs**, **producers**, and **injectors** with drill/completion days. "
+                    "Each well has its own **uptime** and **scaling factor**.\n"
+                    "5. *(Optional)* enable **multi-reservoir** mode and define reservoirs + well allocations.\n"
+                    "6. Configure time-varying **capacities** and **economics** "
+                    "(prices, OPEX, CAPEX, royalty, tax, tariffs, abandonment).\n"
+                    "7. Click **▶ Run prognosis** — red = stale, green = fresh. "
+                    "Editing any table or input flips it red.\n"
+                    "8. Review tabs: production, cumulatives & RF, per-well, drilling Gantt, "
+                    "material balance (with per-reservoir breakdown if active), economics, exports.\n"
+                    "9. **Save** the case; **load**, **duplicate** or start a **new** case via the case manager.\n"
+                    "10. Export as **Excel** (multi-sheet), **JSON-API**, or **PDF report**.\n\n"
+                    "### Key features\n"
+                    "- 🎯 **Auto-scale to RF**: bisection on a global producer multiplier so final RF "
+                    "matches the target.\n"
+                    "- 💰 **Breakeven**: oil-and-gas price multiplier where NPV = 0.\n"
+                    "- 🪨 **Multi-reservoir**: per-reservoir PVT, strategy, MBE, and allocations.\n"
+                    "- ♻️ **Gas disposition** drives revenue (net), CO₂ (fuel/flare), and gas injection.\n"
+                    "- 🌳 **CO₂ rough estimate** from combusted/flared gas + routine ops emissions.\n"
+                    "- 📊 Plot template applies a unified theme to every chart.\n\n"
+                    "### Methodology\n"
+                    "- **PVT**: Standing Bo/Rs, Beggs–Robinson μo, Brill–Beggs Z, Lee–Gonzalez μg.\n"
+                    "- **MBE**: Schilthuis form with rock+water expansion, optional Pot or Fetkovich "
+                    "aquifer, and gas cap term `m·Eg`. Pressure solved by bisection per timestep.\n"
+                    "- **Capacity**: proportional choke when any surface limit binds.\n"
+                    "- **Economics**: monthly DCF; tax on positive pretax CF only; royalty on gross revenue.\n\n"
+                    "⚠️ Early-phase screening only. Not for investment decisions, reserves booking, "
+                    "or production-grade studies."
+                )
 
     st.divider()
 
@@ -8773,6 +8983,9 @@ def main():
         }
         st.session_state["stale"] = False
         st.session_state["last_table_hash"] = _hash_table_state()
+        # Auto-collapse the walkthrough on subsequent visits once the user
+        # has produced a successful run.
+        st.session_state["_has_run_once"] = True
         st.rerun()
 
     if st.session_state["results"] is None:
