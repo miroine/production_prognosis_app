@@ -3095,6 +3095,38 @@ def on_units_change():
             df["qi_primary"] = df["qi_primary"].apply(lambda v: convert(v, kp))
         if "qi_secondary" in df.columns:
             df["qi_secondary"] = df["qi_secondary"].apply(lambda v: convert(v, ks))
+        # IPR columns hold display-unit values (their headers flip to bar/m
+        # in metric mode). Convert when the unit system changes so the
+        # displayed numbers still match the new label.
+        if "wellhead_pressure_psi" in df.columns:
+            df["wellhead_pressure_psi"] = df["wellhead_pressure_psi"].apply(
+                lambda v: convert(v, "pressure"))
+        if "tubing_depth_ft" in df.columns:
+            df["tubing_depth_ft"] = df["tubing_depth_ft"].apply(
+                lambda v: convert(v, "depth"))
+        # PI override is a compound unit (rate per pressure). Convert
+        # explicitly per row, using the well's primary phase (kp).
+        if "well_pi_override" in df.columns:
+            def _convert_pi(v):
+                try:
+                    pi_old = float(v)
+                    if pi_old == 0.0:
+                        return 0.0
+                    rate_old_to_field = (1.0 if old_units == "field"
+                                          else M2F[kp])
+                    press_old_to_field = (1.0 if old_units == "field"
+                                           else M2F["pressure"])
+                    pi_field = (pi_old * rate_old_to_field
+                                / press_old_to_field)
+                    rate_field_to_new = (1.0 if new_units == "field"
+                                          else 1.0 / M2F[kp])
+                    press_field_to_new = (1.0 if new_units == "field"
+                                           else 1.0 / M2F["pressure"])
+                    return (pi_field * rate_field_to_new
+                            / press_field_to_new)
+                except (ValueError, TypeError):
+                    return v
+            df["well_pi_override"] = df["well_pi_override"].apply(_convert_pi)
         st.session_state["producers_df"] = df
 
     if "injectors_df" in st.session_state:
@@ -3140,6 +3172,101 @@ def on_units_change():
             if col in df.columns:
                 df[col] = df[col].apply(lambda v: convert(v, kind))
         st.session_state["reservoirs_df"] = df
+
+    # ---- Scalar widget values stored in session_state ----
+    # Each scalar number_input that uses a unit-aware default also stashes
+    # its current value in session_state under its `key`. When the user
+    # switches units, those scalars stay in the OLD unit system but the
+    # widget label flips to the new unit — so a user sees "241" labelled
+    # "psi" (which is really 241 bar from the metric session). Convert each
+    # scalar key explicitly here so the displayed number matches the new
+    # label. Streamlit forbids writing widget-backed keys *after* the
+    # widget exists for that run, but `on_units_change` fires BEFORE the
+    # widgets re-render, so the write here is applied to the rebuilt
+    # widgets on this same rerun.
+    _scalar_kinds = {
+        # PVT / reservoir pressures and temperatures
+        "p_init":          "pressure",
+        "p_bub":           "pressure",
+        "t_res":           "temp",
+        # Aquifer + gas cap pressures and volume
+        "aq_pini":         "pressure",
+        "aq_vol":          "water_vol",
+        "gc_pi":           "pressure",
+        # PI: rate per pressure unit. PI doesn't have a simple `kind` in
+        # the unit framework (it's a compound unit). Skip — `well_pi_default`
+        # is treated as dimensionless and the user re-enters it.
+        # In-place volumes
+        "ooip":            "oil_vol",
+        "ogip":            "gas_vol",
+        # GOR/CGR (engine in scf/stb or stb/MMscf — both handled by `gor`
+        # in the unit framework).
+        "rs_init":         "gor",
+        # Default min BHP for non-IPR wells
+        "min_bhp_default": "pressure",
+        # Field abandonment rates (oil is straight `oil_rate`; gas uses
+        # the same MMscf/d↔kSm³/d convention as the capacity column, so
+        # it's handled separately below).
+        "aban_oil":        "oil_rate",
+        # Shut-in well-head pressure tool
+        "siwhp_p_res":     "pressure",
+        "siwhp_datum":     "depth",
+        "siwhp_wd":        "depth",
+        "siwhp_twh":       "temp",
+        # Portfolio shared constraints
+        "portfolio_constraint_oil": "oil_rate",
+        "portfolio_constraint_gas": "gas_rate",
+    }
+    for _key, _kind in _scalar_kinds.items():
+        if _key in st.session_state:
+            try:
+                _v = st.session_state[_key]
+                _field = to_field(float(_v), _kind, old_units)
+                st.session_state[_key] = from_field(_field, _kind, new_units)
+            except (ValueError, TypeError):
+                pass
+
+    # `aban_gas` uses MMscf/d in field and kSm³/d in metric (same
+    # convention as the capacity column's `gas` column). `M2F["gas_rate"]`
+    # is the per-Mscf↔per-kSm³ factor (35.3147). So:
+    #   field MMscf/d → field Mscf/d (×1000) → metric kSm³/d (÷ M2F).
+    if "aban_gas" in st.session_state:
+        try:
+            _v = float(st.session_state["aban_gas"])
+            if old_units == "field" and new_units == "metric":
+                st.session_state["aban_gas"] = (
+                    _v * 1000.0 / M2F["gas_rate"])
+            elif old_units == "metric" and new_units == "field":
+                st.session_state["aban_gas"] = (
+                    _v * M2F["gas_rate"] / 1000.0)
+        except (ValueError, TypeError):
+            pass
+
+    # PI (well_pi_default) — compound unit (rate per pressure). Convert
+    # explicitly: PI_metric = PI_field × (rate factor) / (pressure factor).
+    if "well_pi_default" in st.session_state:
+        try:
+            _pi_old = float(st.session_state["well_pi_default"])
+            _is_oil = (FLUID_SYSTEMS.get(
+                st.session_state.get("fluid",
+                                      "Oil with associated gas"),
+                {"primary": "oil"})["primary"] == "oil")
+            _rk = "oil_rate" if _is_oil else "gas_rate"
+            # PI in old units → field PI → PI in new units
+            # field PI = old PI × (rate from old → field) / (pressure from old → field)
+            _rate_old_to_field = (1.0 if old_units == "field"
+                                   else M2F[_rk])
+            _press_old_to_field = (1.0 if old_units == "field"
+                                    else M2F["pressure"])
+            _pi_field = _pi_old * _rate_old_to_field / _press_old_to_field
+            _rate_field_to_new = (1.0 if new_units == "field"
+                                   else 1.0 / M2F[_rk])
+            _press_field_to_new = (1.0 if new_units == "field"
+                                    else 1.0 / M2F["pressure"])
+            st.session_state["well_pi_default"] = (
+                _pi_field * _rate_field_to_new / _press_field_to_new)
+        except (ValueError, TypeError):
+            pass
 
     st.session_state["_table_units"] = new_units
     mark_stale()
@@ -3261,9 +3388,13 @@ def sidebar_inputs():
             implied_cond_disp = from_field(implied_cond_mmstb,
                                             "oil_vol", units)
             entered_cond_mmstb = to_field(ooip, "oil_vol", units)
+            # CGR engine units are stb/MMscf; SI equivalent is Sm³/kSm³
+            # (× 0.22213).
+            _cgr_d = _cgr if units == "field" else _cgr * 0.22213
+            _cgr_u = "stb/MMscf" if units == "field" else "Sm³/kSm³"
             st.sidebar.caption(
                 f"Implied condensate in place from OGIP × CGR "
-                f"({_cgr:.0f} stb/MMscf): "
+                f"({_cgr_d:.1f} {_cgr_u}): "
                 f"**{implied_cond_disp:,.1f} {ulabel('oil_vol', units)}**.")
             if entered_cond_mmstb > 0:
                 ratio = implied_cond_mmstb / entered_cond_mmstb
@@ -3345,9 +3476,12 @@ def sidebar_inputs():
                             else cgr_field)
                 st.metric(f"Initial CGR (computed, {cgr_unit})",
                           f"{cgr_disp:,.2f}")
+                _cond_show = from_field(_cond_mmstb, "oil_vol", units)
+                _gas_show = from_field(_gas_bscf, "gas_vol", units)
                 st.caption(
                     f"= condensate-in-place ÷ OGIP "
-                    f"= {_cond_mmstb:,.1f} MMstb ÷ {_gas_bscf:,.0f} Bscf. "
+                    f"= {_cond_show:,.1f} {ulabel('oil_vol', units)} ÷ "
+                    f"{_gas_show:,.0f} {ulabel('gas_vol', units)}. "
                     f"Untick to enter the CGR manually.")
                 rs_init_disp = cgr_disp
                 rs_kind = "cgr"
@@ -3642,14 +3776,18 @@ def sidebar_inputs():
             "table. Multi-reservoir mode picks PI from each reservoir's row "
             "instead."
         )
+        # Pick natural example numbers per unit system.
+        _ex_dd = 1000 if units == "field" else 70   # psi or bar
+        _ex_pl = "psi" if units == "field" else "bar"
+        _ex_rate_unit = ulabel("oil_rate" if is_oil_for_pi
+                                else "gas_rate", units)
         st.caption(
             f"**How PI works:** the productivity index links flow rate to "
             f"drawdown by  q = PI × (P_res − P_wf), where P_wf is the "
             f"flowing bottom-hole pressure. So PI in **{pi_units_label}** is "
             f"the rate produced per unit of pressure drawdown. Example: a PI "
-            f"of 2 {pi_units_label} with 1000 "
-            f"{'psi' if units=='field' else 'bar'} of drawdown delivers "
-            f"2000 {'bbl/d' if is_oil_for_pi else ('Mscf/d' if units=='field' else 'kSm³/d')}. "
+            f"of 2 {pi_units_label} with {_ex_dd} {_ex_pl} of drawdown "
+            f"delivers {2 * _ex_dd:,} {_ex_rate_unit}. "
             f"It is normally obtained from a well test (build-up / drawdown) "
             f"or estimated from k·h, fluid viscosity and skin."
         )
@@ -3872,10 +4010,11 @@ def well_type_curve_picker(units: str, fluid: str, rig_names: list):
                 if fit["score"] < 0.7 and fit["reason"]:
                     st.warning(f"Reservoir fit: {fit['reason']}")
                 elif fit["pi_implied_qi"] > 0:
+                    _qi_k = "oil_rate" if tmpl.get("fluid") == "oil" else "gas_rate"
+                    _qi_d = from_field(fit["pi_implied_qi"], _qi_k, units)
                     st.caption(
-                        f"💡 Reservoir PI × ΔP implies ~{fit['pi_implied_qi']:,.0f} "
-                        f"{'stb/d' if tmpl.get('fluid')=='oil' else 'Mscf/d'} per well "
-                        "for this archetype."
+                        f"💡 Reservoir PI × ΔP implies ~{_qi_d:,.0f} "
+                        f"{ulabel(_qi_k, units)} per well for this archetype."
                     )
 
         with c_right:
@@ -4303,10 +4442,16 @@ def well_section(units, fluid, start_date):
         _t = to_field(float(st.session_state.get("t_res", 180.0)),
                       "temp", units)
         _hpht = fh.classify_hpht(_p, _t)
+        # `_p`, `_t` are in field units (psi/°F) because classify_hpht
+        # expects field units. Convert for display.
+        _p_d = from_field(_p, "pressure", units)
+        _t_d = from_field(_t, "temp", units)
+        _pl = ulabel("pressure", units)
+        _tl = ulabel("temp", units)
         if _hpht["is_hpht"]:
             st.warning(f"**{_hpht['tag']} wells** — these wells operate in "
-                       f"{_hpht['tier']} conditions ({_p:,.0f} psi, "
-                       f"{_t:,.0f} °F). HPHT wells need specialised "
+                       f"{_hpht['tier']} conditions ({_p_d:,.0f} {_pl}, "
+                       f"{_t_d:,.0f} {_tl}). HPHT wells need specialised "
                        f"completions and higher-grade metallurgy; expect "
                        f"longer drilling/completion times and higher well "
                        f"cost. The development concept builder applies a "
@@ -4314,7 +4459,7 @@ def well_section(units, fluid, start_date):
                        f"tier.")
         else:
             st.caption(f"{_hpht['tag']} — standard pressure/temperature "
-                       f"conditions ({_p:,.0f} psi, {_t:,.0f} °F).")
+                       f"conditions ({_p_d:,.0f} {_pl}, {_t_d:,.0f} {_tl}).")
     except Exception:
         pass
 
@@ -4414,6 +4559,10 @@ def well_section(units, fluid, start_date):
 
     st.markdown("**Producers**")
     if "producers_df" not in st.session_state:
+        # IPR defaults — store in display units to match the column-header
+        # labels (P_wh in psi or bar; depth in ft or m).
+        _whp_default = from_field(200.0, "pressure", units)
+        _td_default = from_field(8000.0, "depth", units)
         rows = []
         for i in range(8):
             rows.append({
@@ -4427,8 +4576,8 @@ def well_section(units, fluid, start_date):
                 "derive_qi_from_pi": False, "well_pi_override": 0.0,
                 "fluid": "auto",
                 "ipr_mode": False,
-                "wellhead_pressure_psi": 200.0,
-                "tubing_depth_ft": 8000.0,
+                "wellhead_pressure_psi": _whp_default,
+                "tubing_depth_ft": _td_default,
                 "fluid_gradient_psi_per_ft": 0.35,
                 "friction_psi_per_kbpd": 5.0,
             })
@@ -4902,13 +5051,36 @@ def well_section(units, fluid, start_date):
                 user_profile=user_profiles.get(str(name).strip()),
                 segments=well_segments.get(str(name).strip()),
                 derive_qi_from_pi=bool(row.get("derive_qi_from_pi", False)),
-                well_pi_override=_f(row.get("well_pi_override"), 0.0),
+                # PI override is in DISPLAY units (rate/pressure). Convert
+                # to engine units (field rate / psi) — see column-header
+                # help text. Zero means "use the reservoir's PI".
+                well_pi_override=(
+                    (lambda _pi_disp: (
+                        0.0 if _pi_disp == 0.0
+                        else _pi_disp
+                             * (1.0 if units == "field" else M2F[
+                                 "oil_rate" if is_oil else "gas_rate"])
+                             / (1.0 if units == "field" else M2F["pressure"])
+                    ))(_f(row.get("well_pi_override"), 0.0))
+                ),
                 fluid=str(row.get("fluid", "auto") or "auto"),
                 ipr_mode=bool(row.get("ipr_mode", False)),
-                wellhead_pressure_psi=_f(row.get("wellhead_pressure_psi"), 200.0),
-                tubing_depth_ft=_f(row.get("tubing_depth_ft"), 8000.0),
-                fluid_gradient_psi_per_ft=_f(row.get("fluid_gradient_psi_per_ft"), 0.35),
-                friction_psi_per_kbpd=_f(row.get("friction_psi_per_kbpd"), 5.0),
+                # IPR columns hold DISPLAY-unit values (the column header
+                # flips between psi/bar and ft/m). Convert to field units
+                # before passing to the engine. Fluid gradient stays in
+                # psi/ft and friction in psi/kbpd — both are explicitly
+                # marked as field-convention engineering inputs in their
+                # column headers and help text.
+                wellhead_pressure_psi=to_field(
+                    _f(row.get("wellhead_pressure_psi"), 200.0),
+                    "pressure", units),
+                tubing_depth_ft=to_field(
+                    _f(row.get("tubing_depth_ft"), 8000.0),
+                    "depth", units),
+                fluid_gradient_psi_per_ft=_f(
+                    row.get("fluid_gradient_psi_per_ft"), 0.35),
+                friction_psi_per_kbpd=_f(
+                    row.get("friction_psi_per_kbpd"), 5.0),
             )
         else:
             inj_rate_val = _f(row.get("inj_rate"), 0.0)
@@ -8306,7 +8478,7 @@ def plot_economics(df_e):
 # Main
 # =============================================================================
 def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
-                     wells: list, fluid: str) -> None:
+                     wells: list, fluid: str, units: str = "field") -> None:
     """Surface soft warnings for likely-wrong input combinations.
 
     Doesn't block execution — just renders an info/warning banner with
@@ -8318,11 +8490,14 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
     is_oil = FLUID_SYSTEMS[fluid]["primary"] == "oil"
     issues = []   # list[(severity, message)] where severity ∈ {"warn", "info"}
 
-    # PVT consistency
+    # PVT consistency — show in user's chosen pressure unit
+    _pl = ulabel("pressure", units)
+    _p_init_d = from_field(asm.pvt.p_init_psi, "pressure", units)
+    _p_bub_d = from_field(asm.pvt.p_bub_psi, "pressure", units)
     if asm.pvt.p_init_psi <= asm.pvt.p_bub_psi and is_oil:
         issues.append(("warn",
-            f"Initial pressure ({asm.pvt.p_init_psi:,.0f} psi) is at or below bubble point "
-            f"({asm.pvt.p_bub_psi:,.0f} psi). The reservoir starts saturated; "
+            f"Initial pressure ({_p_init_d:,.0f} {_pl}) is at or below bubble point "
+            f"({_p_bub_d:,.0f} {_pl}). The reservoir starts saturated; "
             "expect immediate gas evolution and free-gas behavior."))
     if asm.pvt.api < 10 or asm.pvt.api > 60:
         issues.append(("warn",
@@ -8353,22 +8528,30 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
             issues.append(("warn",
                 f"Well **{w.name}**: uptime {w.uptime:.2f} should be between 0 and 1."))
 
-    # Capacity sanity vs total nameplate
+    # Capacity sanity vs total nameplate — both in user rate units
     if producers and asm.cap_schedule is not None and len(asm.cap_schedule.df) > 0:
         nameplate = sum(w.qi_primary for w in producers)
         first = asm.cap_schedule.df.iloc[0]
         if is_oil:
             cap_p = float(first["oil"])
             if cap_p > 0 and cap_p < nameplate * 0.10:
+                _ru = ulabel("oil_rate", units)
                 issues.append(("info",
-                    f"Initial oil capacity ({cap_p:,.0f} bbl/d) is < 10% of nameplate "
-                    f"production ({nameplate:,.0f} bbl/d). Wells will be heavily choked."))
+                    f"Initial oil capacity "
+                    f"({from_field(cap_p, 'oil_rate', units):,.0f} {_ru}) "
+                    f"is < 10% of nameplate production "
+                    f"({from_field(nameplate, 'oil_rate', units):,.0f} {_ru}). "
+                    f"Wells will be heavily choked."))
         else:
             cap_p = float(first["gas"]) * 1000.0
             if cap_p > 0 and cap_p < nameplate * 0.10:
+                _ru = ulabel("gas_rate", units)
                 issues.append(("info",
-                    f"Initial gas capacity ({cap_p:,.0f} Mscf/d) is < 10% of nameplate "
-                    f"production ({nameplate:,.0f} Mscf/d). Wells will be heavily choked."))
+                    f"Initial gas capacity "
+                    f"({from_field(cap_p, 'gas_rate', units):,.0f} {_ru}) "
+                    f"is < 10% of nameplate production "
+                    f"({from_field(nameplate, 'gas_rate', units):,.0f} {_ru}). "
+                    f"Wells will be heavily choked."))
 
     # Gas disposition fractions should sum to 1
     gas_sum = (asm.gas_export_fraction + asm.gas_injection_fraction
@@ -8388,11 +8571,12 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
             f"Strategy is 'Depletion' but {len(injectors)} injectors are defined. "
             "They will inject according to the surface and VRR caps."))
 
-    # Aquifer / pressure consistency
+    # Aquifer / pressure consistency — user pressure units
     if asm.aquifer.active and asm.aquifer.initial_pressure_psi < asm.pvt.p_init_psi * 0.7:
+        _aq_d = from_field(asm.aquifer.initial_pressure_psi, "pressure", units)
         issues.append(("warn",
-            f"Aquifer initial pressure ({asm.aquifer.initial_pressure_psi:,.0f} psi) "
-            f"is much lower than reservoir Pi ({asm.pvt.p_init_psi:,.0f} psi). "
+            f"Aquifer initial pressure ({_aq_d:,.0f} {_pl}) "
+            f"is much lower than reservoir Pi ({_p_init_d:,.0f} {_pl}). "
             "The aquifer will provide little support."))
 
     # PI bridge sanity: when wells use PI mode, check that PI × ΔP gives a
@@ -8411,14 +8595,18 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
             ref_bhp = r0.min_bhp_psi
             ref_pi_init = r0.pvt.p_init_psi
         derived_qi = ref_pi * max(ref_pi_init - ref_bhp, 0.0)
+        _ref_pi_init_d = from_field(ref_pi_init, "pressure", units)
+        _ref_bhp_d = from_field(ref_bhp, "pressure", units)
+        _dd_d = from_field(max(ref_pi_init - ref_bhp, 0.0), "pressure", units)
         if derived_qi <= 0:
             issues.append(("warn",
                 f"{len(pi_wells)} well(s) have PI mode ON but the reservoir's "
-                f"PI × (P − BHP_min) = {ref_pi:.2f} × ({ref_pi_init:,.0f} − {ref_bhp:,.0f}) ≤ 0. "
+                f"PI × (P − BHP_min) = {ref_pi:.2f} × "
+                f"({_ref_pi_init_d:,.0f} − {_ref_bhp_d:,.0f}) {_pl} ≤ 0. "
                 "Wells will produce nothing. Check PI / BHP / Pi values."))
-        elif ref_pi_init - ref_bhp < 100:
+        elif (ref_pi_init - ref_bhp) < 100:    # 100 psi (~7 bar)
             issues.append(("info",
-                f"Drawdown (P_init − BHP_min) = {ref_pi_init - ref_bhp:,.0f} psi is "
+                f"Drawdown (P_init − BHP_min) = {_dd_d:,.0f} {_pl} is "
                 "very small. Wells will be deliverability-limited; consider lowering BHP_min."))
         # Cross-check against any free-input qi values that DON'T have PI mode on:
         free_wells = [w for w in producers if not getattr(w, "derive_qi_from_pi", False)
@@ -8427,28 +8615,35 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
             free_avg = sum(w.qi_primary for w in free_wells) / len(free_wells)
             ratio = free_avg / derived_qi if derived_qi > 0 else 0
             if ratio > 3.0 or ratio < 0.33:
+                _qi_kind = "oil_rate" if is_oil else "gas_rate"
+                _ru = ulabel(_qi_kind, units)
+                _free_d = from_field(free_avg, _qi_kind, units)
+                _der_d = from_field(derived_qi, _qi_kind, units)
                 issues.append(("info",
-                    f"Free-input qi (avg {free_avg:,.0f}) differs by {ratio:.1f}× from "
-                    f"the PI-derived qi ({derived_qi:,.0f}). Consider whether your "
+                    f"Free-input qi (avg {_free_d:,.0f} {_ru}) differs by "
+                    f"{ratio:.1f}× from the PI-derived qi "
+                    f"({_der_d:,.0f} {_ru}). Consider whether your "
                     "reservoir PI / BHP values reflect the same well type."))
 
-    # IPR mode sanity
+    # IPR mode sanity — pressure in user units
     ipr_wells_v = [w for w in producers if getattr(w, "ipr_mode", False)]
     if ipr_wells_v:
         for w in ipr_wells_v:
             hydrostatic = w.fluid_gradient_psi_per_ft * w.tubing_depth_ft
             min_bhp_implied = w.wellhead_pressure_psi + hydrostatic
+            _bhp_d = from_field(min_bhp_implied, "pressure", units)
             if min_bhp_implied >= asm.pvt.p_init_psi:
                 issues.append(("warn",
                     f"Well **{w.name}**: outflow back-pressure (P_wh + ρ×depth = "
-                    f"{min_bhp_implied:,.0f} psi) exceeds reservoir Pi "
-                    f"({asm.pvt.p_init_psi:,.0f} psi). Well will not flow. "
+                    f"{_bhp_d:,.0f} {_pl}) exceeds reservoir Pi "
+                    f"({_p_init_d:,.0f} {_pl}). Well will not flow. "
                     "Reduce wellhead pressure, depth, or fluid gradient."))
             elif min_bhp_implied >= asm.pvt.p_init_psi * 0.85:
                 issues.append(("info",
-                    f"Well **{w.name}**: outflow back-pressure ({min_bhp_implied:,.0f} psi) "
-                    f"is close to reservoir Pi — limited drawdown available. "
-                    "Well will go off plateau quickly as reservoir depletes."))
+                    f"Well **{w.name}**: outflow back-pressure "
+                    f"({_bhp_d:,.0f} {_pl}) is close to reservoir Pi — "
+                    f"limited drawdown available. Well will go off plateau "
+                    "quickly as reservoir depletes."))
 
     # Economics
     if econ.discount_rate <= 0 or econ.discount_rate > 0.30:
@@ -8859,25 +9054,35 @@ def main():
                 k2.metric(f"Hydrostatic head ({ulabel('pressure', units)})",
                           f"{head_disp:,.0f}")
                 k3.metric("Column type", res["column_kind"].title())
+                # Gradient unit follows the user's pressure unit (psi/ft
+                # in field; bar/m in SI).
+                _grad_u = "psi/ft" if units == "field" else "bar/m"
+                _grad_d = (res["gradient_psi_ft"] if units == "field"
+                           else res["gradient_psi_ft"] * 0.0689476 * 3.28084)
                 st.caption(
                     f"Method: {res['method']}. "
-                    f"Static gradient ≈ {res['gradient_psi_ft']:.3f} "
-                    f"psi/ft."
+                    f"Static gradient ≈ {_grad_d:.3f} {_grad_u}."
                     + (f" Mean gas Z ≈ {res['z_avg']:.3f}."
                        if "z_avg" in res else
                        f" Column specific gravity ≈ "
                        f"{res.get('sg_column', 0):.3f}."))
-                # design-rating guidance
+                # Standard pressure-rating classes (2500/5000/10000/15000
+                # psi) are industry flange nomenclature quoted in psi
+                # globally; keep them in psi but show the SIWHP-vs-rating
+                # comparison in the user's selected pressure unit.
                 siwhp = res["shutin_whp_psi"]
                 std_ratings = [2500, 5000, 10000, 15000]
                 rating = next((r for r in std_ratings if r >= siwhp * 1.1),
                               20000)
+                _siwhp_u = from_field(siwhp, "pressure", units)
+                _pl = ulabel("pressure", units)
                 st.info(
                     f"**Concept implication:** the flowline / riser / host "
                     f"should be rated for at least the shut-in WHP plus a "
-                    f"margin — a standard **{rating:,} psi** class fits "
-                    f"here. If the chosen host or flowline is rated below "
-                    f"{siwhp:,.0f} psi, a **HIPPS** (High Integrity "
+                    f"margin — a standard **{rating:,} psi** class "
+                    f"(industry flange-rating nomenclature) fits here. If "
+                    f"the chosen host or flowline is rated below "
+                    f"{_siwhp_u:,.0f} {_pl}, a **HIPPS** (High Integrity "
                     f"Pressure Protection System) is required to protect "
                     f"the downstream equipment.")
             except Exception as e:
@@ -8927,7 +9132,7 @@ def main():
     st.divider()
 
     # Soft input validation — warns about likely mistakes without blocking the run
-    validate_inputs(asm, econ, wells, fluid)
+    validate_inputs(asm, econ, wells, fluid, units)
 
     if "results" not in st.session_state:
         st.session_state["results"] = None
@@ -9108,11 +9313,17 @@ def main():
         cum_ngl_MMbbl = (df_e.get("ngl_rate", pd.Series(0.0, index=df_e.index))
                           * DAYS_PER_MONTH).sum() / 1e6
         st.caption(
-            f"💎 **NGL stream:** peak {peak_ngl_bpd:,.0f} bbl/d  •  "
-            f"cumulative {cum_ngl_MMbbl:,.1f} MMbbl  •  "
+            f"💎 **NGL stream:** peak "
+            f"{from_field(peak_ngl_bpd, 'oil_rate', units):,.0f} "
+            f"{ulabel('oil_rate', units)}  •  "
+            f"cumulative {from_field(cum_ngl_MMbbl, 'oil_vol', units):,.2f} "
+            f"{ulabel('oil_vol', units)}  •  "
             f"revenue ${total_ngl_rev:,.0f}MM "
             f"({ngl_share:.1f}% of total)  •  "
-            f"yield {ngl_yield_active:.0f} bbl/MMscf at ${econ_r.ngl_price_bbl:.0f}/bbl."
+            f"yield "
+            f"{ngl_yield_active * (0.22213 if units != 'field' else 1.0):.1f} "
+            f"{'bbl/MMscf' if units == 'field' else 'Sm³/kSm³'} at "
+            f"${econ_r.ngl_price_bbl:.0f}/bbl."
         )
 
     tabs = st.tabs([
@@ -9509,7 +9720,9 @@ def main():
                             pass
                     # Truncate sheet name to Excel's 31-char limit
                     sn = str(sheet_name)[:31]
-                    safe.to_excel(writer, sn, index=False)
+                    # pandas 2.x requires sheet_name= as a keyword argument
+                    # (in 1.x the second positional was the sheet name).
+                    safe.to_excel(writer, sheet_name=sn, index=False)
                 except Exception as exc:
                     # Don't kill the whole export over one bad sheet
                     st.warning(f"Could not write sheet '{sheet_name}': {exc}")
@@ -9749,9 +9962,12 @@ def main():
         _vis_oil = vfld["fluid_system"] in ("Oil with associated gas",
                                             "Black oil (no gas)")
         vc1, vc2, vc3 = st.columns(3)
+        _vol_k = "oil_vol" if _vis_oil else "gas_vol"
+        _vol_field = (vfld["ooip_oil_MMstb"] if _vis_oil
+                      else vfld["ogip_gas_Bscf"])
+        _vol_d = from_field(_vol_field, _vol_k, units)
         vc1.metric("In-place volume",
-                   f"{vfld['ooip_oil_MMstb']:,.0f} MMstb" if _vis_oil
-                   else f"{vfld['ogip_gas_Bscf']:,.0f} Bscf")
+                   f"{_vol_d:,.0f} {ulabel(_vol_k, units)}")
         vc2.metric("Expected recovery factor",
                    f"{vfld['rf_expected']:.0%}")
         vc3.metric("Drive mechanism", vfld["drive"])
