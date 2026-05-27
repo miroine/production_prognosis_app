@@ -1412,31 +1412,56 @@ def run_simulation(wells, asm: FieldAssumptions):
     # ---- Global pressure-floor enforcement ----
     # When the reservoir pressure for the well's host reservoir falls below
     # that reservoir's minimum BHP, the well has nothing left to flow
-    # against — drawdown ≤ 0. Zero out the post-choke rate (oil, gas,
-    # water) and the cumulative bookkeeping for those months. This
-    # applies to ALL wells regardless of IPR mode, so a depletion run
-    # honours the user-set min_bhp (or per-reservoir min_bhp_psi) even
-    # without explicit IPR. Without this floor the MBE was happy to
-    # continue solving deep into vacuum-level reservoir pressure.
+    # against — drawdown ≤ 0. Once a well has been shut in for sustained
+    # pressure deficit, it stays shut: the per-well chart used to show a
+    # mid-life gap followed by full-rate "resumption" because the floor
+    # mask only flagged individual months and let production restart when
+    # pressure transiently recovered (e.g. aquifer influx after no
+    # withdrawal). Real wells don't restart at peak rate after a shut-in;
+    # we make the shut-in PERSISTENT — once a well first goes below the
+    # floor for a few consecutive months, every later month is also
+    # zeroed.
     floor_triggered = False
+    # `persistence` — once we see this many consecutive months below the
+    # floor, the well is treated as permanently shut. 3 months filters
+    # out brief transient dips while catching real depletion.
+    floor_persistence = 3
     for j, w in enumerate(producers):
         rsv = well_to_res.get(w.name, default_res)
         if rsv is None:
             continue
-        min_bhp = float(getattr(rsv, "min_bhp_psi", asm.default_well_pi
-                                 if False else 1500.0) or 1500.0)
+        min_bhp = float(getattr(rsv, "min_bhp_psi", 1500.0) or 1500.0)
         press_for_well = per_res_pressure[rsv.id]
         below = press_for_well < min_bhp
-        if below.any():
-            floor_triggered = True
-            p_post[below, j] = 0.0
-            s_post[below, j] = 0.0
-            w_post[below, j] = 0.0
-            # also clear the un-choked matrices so cumulatives downstream
-            # don't double-count the floor-triggered months.
-            p_mat[below, j] = 0.0
-            s_mat[below, j] = 0.0
-            w_mat[below, j] = 0.0
+        if not below.any():
+            continue
+        # Find the first month with `floor_persistence` consecutive months
+        # below the floor. From that month onwards, the well is shut.
+        shut_idx = None
+        run = 0
+        for i in range(len(below)):
+            if below[i]:
+                run += 1
+                if run >= floor_persistence:
+                    shut_idx = i - floor_persistence + 1
+                    break
+            else:
+                run = 0
+        if shut_idx is None:
+            continue
+        floor_triggered = True
+        # Zero EVERY matrix from shut_idx onward — the choked rates that
+        # feed reservoir aggregates AND the per-well matrices the
+        # per-well chart reads from.
+        p_post[shut_idx:, j] = 0.0
+        s_post[shut_idx:, j] = 0.0
+        w_post[shut_idx:, j] = 0.0
+        p_mat[shut_idx:, j] = 0.0
+        s_mat[shut_idx:, j] = 0.0
+        w_mat[shut_idx:, j] = 0.0
+        w_mat_choked[shut_idx:, j] = 0.0
+        oil_mat[shut_idx:, j] = 0.0
+        gas_mat[shut_idx:, j] = 0.0
     # Re-derive per-reservoir aggregates if any well was floored, so
     # downstream cumulatives + RF reflect the truncation.
     if floor_triggered:
