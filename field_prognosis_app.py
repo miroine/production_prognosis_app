@@ -1281,6 +1281,13 @@ def run_simulation(wells, asm: FieldAssumptions):
         voidage = field_l if is_oil else field_p / 1000.0
         field_inj = voidage * asm.voidage_ratio * asm.inj_efficiency
 
+    # Track field-total cutoff month so the per-well matrices used by the
+    # per-well plot can be truncated identically (the per-well chart reads
+    # from oil_mat / gas_mat / w_mat_choked and previously kept producing
+    # past cessation — most visibly the water curve which lacks the
+    # rate-floor check).
+    field_cutoff_idx = None
+
     if asm.aban_basis == "Field total":
         # Vectorized field-total abandonment: trigger once below the rate
         # threshold OR above the water-cut threshold, after month 12.
@@ -1290,17 +1297,33 @@ def run_simulation(wells, asm: FieldAssumptions):
             below = field_p / 1000.0 < asm.aban_rate_gas
         # Field-wide water cut (oil systems): field_w is water rate,
         # field_p is oil rate. WC threshold applies only when there is
-        # any oil production (avoid 0/0 = NaN at the very start).
+        # any oil production (avoid 0/0 = NaN at the very start). The
+        # explicit np.errstate silences a benign divide-by-zero warning
+        # that would otherwise fire on pre-FOP zero-rate months.
         if is_oil:
             denom = field_p + field_w
-            field_wc = np.where(denom > 0, field_w / denom, 0.0)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                field_wc = np.where(denom > 0, field_w / denom, 0.0)
             wc_above = field_wc > asm.aban_wc
             below = below | wc_above
         below[:12] = False                                   # first year never triggers
         if below.any():
             first = int(np.argmax(below))
+            field_cutoff_idx = first
             field_p[first:] = field_s[first:] = 0.0
             field_w[first:] = field_l[first:] = field_inj[first:] = 0.0
+            # Also truncate the per-well matrices that feed the per-well
+            # phase chart. Without this, the water curve in particular
+            # kept flowing past cessation because field-total mode only
+            # zeroed the field aggregate, not the per-well water_mat.
+            # (p_post / s_post / w_post / inj_post are built later from
+            # these and the choke vector, so they inherit the truncation.)
+            p_mat[first:, :] = 0.0
+            s_mat[first:, :] = 0.0
+            w_mat[first:, :] = 0.0
+            w_mat_choked[first:, :] = 0.0
+            oil_mat[first:, :] = 0.0
+            gas_mat[first:, :] = 0.0
 
     days = DAYS_PER_MONTH
     # Unit conversions: 1 MMstb = 1e6 stb;  1 Bscf = 1e6 Mscf
