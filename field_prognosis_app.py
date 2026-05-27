@@ -1282,11 +1282,20 @@ def run_simulation(wells, asm: FieldAssumptions):
         field_inj = voidage * asm.voidage_ratio * asm.inj_efficiency
 
     if asm.aban_basis == "Field total":
-        # Vectorized field-total abandonment: trigger once below threshold past month 12
+        # Vectorized field-total abandonment: trigger once below the rate
+        # threshold OR above the water-cut threshold, after month 12.
         if is_oil:
             below = field_p < asm.aban_rate_oil
         else:
             below = field_p / 1000.0 < asm.aban_rate_gas
+        # Field-wide water cut (oil systems): field_w is water rate,
+        # field_p is oil rate. WC threshold applies only when there is
+        # any oil production (avoid 0/0 = NaN at the very start).
+        if is_oil:
+            denom = field_p + field_w
+            field_wc = np.where(denom > 0, field_w / denom, 0.0)
+            wc_above = field_wc > asm.aban_wc
+            below = below | wc_above
         below[:12] = False                                   # first year never triggers
         if below.any():
             first = int(np.argmax(below))
@@ -1376,6 +1385,41 @@ def run_simulation(wells, asm: FieldAssumptions):
     pressure = np.zeros(n_months)
     for k, r in enumerate(reservoirs):
         pressure += per_res_pressure[r.id] * weights[k]
+
+    # ---- Global pressure-floor enforcement ----
+    # When the reservoir pressure for the well's host reservoir falls below
+    # that reservoir's minimum BHP, the well has nothing left to flow
+    # against — drawdown ≤ 0. Zero out the post-choke rate (oil, gas,
+    # water) and the cumulative bookkeeping for those months. This
+    # applies to ALL wells regardless of IPR mode, so a depletion run
+    # honours the user-set min_bhp (or per-reservoir min_bhp_psi) even
+    # without explicit IPR. Without this floor the MBE was happy to
+    # continue solving deep into vacuum-level reservoir pressure.
+    floor_triggered = False
+    for j, w in enumerate(producers):
+        rsv = well_to_res.get(w.name, default_res)
+        if rsv is None:
+            continue
+        min_bhp = float(getattr(rsv, "min_bhp_psi", asm.default_well_pi
+                                 if False else 1500.0) or 1500.0)
+        press_for_well = per_res_pressure[rsv.id]
+        below = press_for_well < min_bhp
+        if below.any():
+            floor_triggered = True
+            p_post[below, j] = 0.0
+            s_post[below, j] = 0.0
+            w_post[below, j] = 0.0
+            # also clear the un-choked matrices so cumulatives downstream
+            # don't double-count the floor-triggered months.
+            p_mat[below, j] = 0.0
+            s_mat[below, j] = 0.0
+            w_mat[below, j] = 0.0
+    # Re-derive per-reservoir aggregates if any well was floored, so
+    # downstream cumulatives + RF reflect the truncation.
+    if floor_triggered:
+        res_p = p_post @ alloc_p
+        res_s = s_post @ alloc_p
+        res_w = w_post @ alloc_p
 
     # ---- IPR / BHP-deliverability post-pass ----
     # For wells with ipr_mode=True, recompute the rate at each timestep from
@@ -3095,15 +3139,11 @@ def on_units_change():
             df["qi_primary"] = df["qi_primary"].apply(lambda v: convert(v, kp))
         if "qi_secondary" in df.columns:
             df["qi_secondary"] = df["qi_secondary"].apply(lambda v: convert(v, ks))
-        # IPR columns hold display-unit values (their headers flip to bar/m
-        # in metric mode). Convert when the unit system changes so the
-        # displayed numbers still match the new label.
-        if "wellhead_pressure_psi" in df.columns:
-            df["wellhead_pressure_psi"] = df["wellhead_pressure_psi"].apply(
-                lambda v: convert(v, "pressure"))
-        if "tubing_depth_ft" in df.columns:
-            df["tubing_depth_ft"] = df["tubing_depth_ft"].apply(
-                lambda v: convert(v, "depth"))
+        # IPR columns (wellhead_pressure_psi, tubing_depth_ft) are stored
+        # in ENGINE units (psi, ft) regardless of the unit selection. The
+        # display layer in the producers-table renderer converts on the fly
+        # via `pdf_display`, and the Apply button converts back via
+        # `commit`. No conversion needed here.
         # PI override is a compound unit (rate per pressure). Convert
         # explicitly per row, using the well's primary phase (kp).
         if "well_pi_override" in df.columns:
@@ -4578,7 +4618,7 @@ def well_section(units, fluid, start_date):
                 "ipr_mode": False,
                 "wellhead_pressure_psi": _whp_default,
                 "tubing_depth_ft": _td_default,
-                "fluid_gradient_psi_per_ft": 0.35,
+                "fluid_gradient_psi_per_ft": 0.35,   # engine units (psi/ft)
                 "friction_psi_per_kbpd": 5.0,
             })
         st.session_state.producers_df = pd.DataFrame(rows)
@@ -4618,6 +4658,11 @@ def well_section(units, fluid, start_date):
         if "tubing_depth_ft" in pdf_display.columns:
             pdf_display["tubing_depth_ft"] = pdf_display["tubing_depth_ft"].apply(
                 lambda v: from_field(float(v or 0.0), "depth", units))
+        # ρ stored as psi/ft → bar/m (× 0.22621) for display.
+        if "fluid_gradient_psi_per_ft" in pdf_display.columns:
+            pdf_display["fluid_gradient_psi_per_ft"] = (
+                pdf_display["fluid_gradient_psi_per_ft"].apply(
+                    lambda v: float(v or 0.0) * 0.22621))
 
     producers_df_buf = st.data_editor(
         pdf_display, num_rows="dynamic", use_container_width=True,
@@ -4698,13 +4743,23 @@ def well_section(units, fluid, start_date):
                 format="%.0f",
                 help="Mid-perf depth — sets the hydrostatic head for outflow."),
             "fluid_gradient_psi_per_ft": st.column_config.NumberColumn(
-                "ρ [psi/ft]",
-                min_value=0.0, max_value=1.0, step=0.01, format="%.2f",
-                help=("Mixture hydrostatic gradient in **psi/ft** (engineering "
-                      "convention, kept regardless of unit system). "
-                      "Oil ~0.30-0.40, water ~0.43, gas ~0.05-0.15. "
-                      "For high-WC wells use 0.40-0.43. "
-                      "1 psi/ft ≈ 22.62 kPa/m.")),
+                f"ρ [{'psi/ft' if units == 'field' else 'bar/m'}]",
+                min_value=0.0,
+                max_value=1.0 if units == "field" else 0.25,
+                step=0.01 if units == "field" else 0.005,
+                format="%.3f" if units == "metric" else "%.2f",
+                help=(
+                    "Mixture hydrostatic gradient. Typical values: "
+                    + ("oil ~0.30-0.40 psi/ft, water ~0.43, gas "
+                       "~0.05-0.15. For high-WC wells use 0.40-0.43."
+                       if units == "field" else
+                       "oil ~0.068-0.090 bar/m, water ~0.097, gas "
+                       "~0.011-0.034. For high-WC wells use "
+                       "0.090-0.097.")
+                    + " A consistent suggestion based on the current "
+                      "PVT (API gravity + water-cut assumption) appears "
+                      "as a caption below the table. "
+                      "1 psi/ft ≈ 0.2262 bar/m.")),
             "friction_psi_per_kbpd": st.column_config.NumberColumn(
                 "Friction [psi/kbpd]",
                 min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
@@ -4715,6 +4770,38 @@ def well_section(units, fluid, start_date):
         },
         key="producers_editor",
     )
+
+    # ---- Suggested ρ gradient from current PVT ----
+    # Oil density at standard conditions from API gravity:
+    #   SG_oil = 141.5 / (131.5 + API)
+    # Mixture gradient at the wellbore = WC × ρ_water + (1-WC) × ρ_oil
+    # ρ_water = 0.433 psi/ft (fresh), 0.45 for brine.
+    # Convert to bar/m if metric.
+    try:
+        _api = float(st.session_state.get("api", 36.0))
+        _sg_oil = 141.5 / (131.5 + max(_api, 1.0))
+        _grad_oil_psi_ft = _sg_oil * 0.433
+        _wc_assumed = float(st.session_state.get("wc_design", 0.30))
+        _grad_mix_psi_ft = (
+            _wc_assumed * 0.443 + (1 - _wc_assumed) * _grad_oil_psi_ft)
+        if units == "field":
+            _disp_oil = _grad_oil_psi_ft
+            _disp_mix = _grad_mix_psi_ft
+            _g_u = "psi/ft"
+        else:
+            _disp_oil = _grad_oil_psi_ft * 0.22621
+            _disp_mix = _grad_mix_psi_ft * 0.22621
+            _g_u = "bar/m"
+        st.caption(
+            f"💡 **Suggested ρ from current PVT** "
+            f"(API = {_api:.1f}, SG_oil = {_sg_oil:.3f}): "
+            f"pure-oil leg ≈ **{_disp_oil:.3f} {_g_u}**; "
+            f"mixture with {_wc_assumed:.0%} water cut "
+            f"≈ **{_disp_mix:.3f} {_g_u}**. "
+            f"Set the ρ column to one of these (or your own measured value)."
+        )
+    except (ValueError, TypeError, KeyError):
+        pass
 
     btn_p1, btn_p2, _btn_p3 = st.columns([2, 1, 3])
     # The buffer is in display units; compare against a display-converted copy
@@ -4733,6 +4820,11 @@ def well_section(units, fluid, start_date):
             if "tubing_depth_ft" in commit.columns:
                 commit["tubing_depth_ft"] = commit["tubing_depth_ft"].apply(
                     lambda v: to_field(float(v or 0.0), "depth", units))
+            # ρ user-entered as bar/m → storage psi/ft. 1 psi/ft = 0.22621 bar/m.
+            if "fluid_gradient_psi_per_ft" in commit.columns:
+                commit["fluid_gradient_psi_per_ft"] = (
+                    commit["fluid_gradient_psi_per_ft"].apply(
+                        lambda v: float(v or 0.0) / 0.22621))
         # Drop rows missing required fields
         if "name" in commit.columns:
             commit = commit[commit["name"].notna() & (commit["name"].astype(str).str.strip() != "")]
@@ -5077,6 +5169,8 @@ def well_section(units, fluid, start_date):
                 tubing_depth_ft=to_field(
                     _f(row.get("tubing_depth_ft"), 8000.0),
                     "depth", units),
+                # ρ is stored in engine units (psi/ft) — display layer
+                # converts. Read raw.
                 fluid_gradient_psi_per_ft=_f(
                     row.get("fluid_gradient_psi_per_ft"), 0.35),
                 friction_psi_per_kbpd=_f(
@@ -6002,58 +6096,59 @@ def economics_section(units, start_date):
     # natural-gas heating-value factor of 1.0 Mcf/MMBtu (a close screening
     # approximation; real values vary 0.95-1.10 with composition).
     MMBTU_PER_MCF = 1.0   # screening factor; engine treats gas_price as $/Mscf
-    c1, c2, c3, c4 = st.columns(4)
-    oil_price_bbl = c1.number_input(
-        "Oil price ($/bbl)", value=75.0,
-        key="oil_price_bbl", on_change=mark_stale,
-        help="Flat real crude price per barrel. $75/bbl is a conservative "
-             "long-run screening value (Brent). Industry-standard "
-             "regardless of unit system."
-    )
-    gas_price_mmbtu = c2.number_input(
-        "Gas price ($/MMBtu)", value=10.0,
-        key="gas_price_mmbtu", on_change=mark_stale,
-        help="Flat real gas price per MMBtu. Default $10/MMBtu reflects "
-             "European hub pricing (TTF / NBP) over the recent cycle — "
-             "NCS gas is sold mainly into Europe and the post-2022 hub "
-             "average has sat in the $8–$15/MMBtu range. Use a long-run "
-             "real price for screening rather than a recent spot peak. "
-             "Internally converted to $/Mscf using 1 Mcf ≈ 1 MMBtu "
-             "(real heating values vary 0.95–1.10)."
-    )
-    # Variable OPEX — unit basis depends on the fluid system. For an oil
-    # field the natural basis is $/bbl of oil; for a gas field it is $/Mscf
-    # of gas. Charging a $/bbl number against a Mscf/d rate (the old bug)
-    # under-charges gas OPEX by roughly the boe factor.
-    _econ_fluid = st.session_state.get("fluid", "Oil with associated gas")
-    _econ_is_oil = FLUID_SYSTEMS[_econ_fluid]["primary"] == "oil"
-    # The variable-OPEX key is suffixed with the fluid phase. This is
-    # deliberate: switching from an oil to a gas fluid must give a fresh
-    # widget with the gas default ($/Mscf), not carry over the oil $/bbl
-    # value (a $5.5/bbl value silently shown as $5.5/Mscf was a real bug).
-    _opex_phase = "oil" if _econ_is_oil else "gas"
-    _opex_key = f"opex_var_{_opex_phase}"
-    if _econ_is_oil:
-        opex_var_bbl = c3.number_input(
-            "Var. OPEX ($/bbl)", value=5.5,
-            key=_opex_key, on_change=mark_stale,
-            help="Variable operating cost per barrel of primary fluid "
-                 "(oil) produced. Default $5.5/bbl reflects a mid-size NCS "
-                 "offshore development; small / late-life fields run "
-                 "higher ($10-20/bbl), very large fields lower. Industry-"
-                 "standard regardless of unit system.")
-    else:
-        opex_var_bbl = c3.number_input(
-            "Var. OPEX ($/Mscf)", value=0.9,
-            key=_opex_key, on_change=mark_stale,
-            help="Variable operating cost per Mscf of primary fluid (gas) "
-                 "produced. Default $0.9/Mscf reflects an NCS gas / gas-"
-                 "condensate development (~$5/boe). For a gas field the "
-                 "engine charges variable OPEX against the gas rate "
-                 "(Mscf/d), so this must be a $/Mscf figure — typically "
-                 "$0.5-2.0/Mscf, NOT an oil $/bbl number.")
-    opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
-                                 key="opex_fixed", on_change=mark_stale)
+    with st.expander("💵 Prices & OPEX", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        oil_price_bbl = c1.number_input(
+            "Oil price ($/bbl)", value=75.0,
+            key="oil_price_bbl", on_change=mark_stale,
+            help="Flat real crude price per barrel. $75/bbl is a conservative "
+                 "long-run screening value (Brent). Industry-standard "
+                 "regardless of unit system."
+        )
+        gas_price_mmbtu = c2.number_input(
+            "Gas price ($/MMBtu)", value=10.0,
+            key="gas_price_mmbtu", on_change=mark_stale,
+            help="Flat real gas price per MMBtu. Default $10/MMBtu reflects "
+                 "European hub pricing (TTF / NBP) over the recent cycle — "
+                 "NCS gas is sold mainly into Europe and the post-2022 hub "
+                 "average has sat in the $8–$15/MMBtu range. Use a long-run "
+                 "real price for screening rather than a recent spot peak. "
+                 "Internally converted to $/Mscf using 1 Mcf ≈ 1 MMBtu "
+                 "(real heating values vary 0.95–1.10)."
+        )
+        # Variable OPEX — unit basis depends on the fluid system. For an oil
+        # field the natural basis is $/bbl of oil; for a gas field it is $/Mscf
+        # of gas. Charging a $/bbl number against a Mscf/d rate (the old bug)
+        # under-charges gas OPEX by roughly the boe factor.
+        _econ_fluid = st.session_state.get("fluid", "Oil with associated gas")
+        _econ_is_oil = FLUID_SYSTEMS[_econ_fluid]["primary"] == "oil"
+        # The variable-OPEX key is suffixed with the fluid phase. This is
+        # deliberate: switching from an oil to a gas fluid must give a fresh
+        # widget with the gas default ($/Mscf), not carry over the oil $/bbl
+        # value (a $5.5/bbl value silently shown as $5.5/Mscf was a real bug).
+        _opex_phase = "oil" if _econ_is_oil else "gas"
+        _opex_key = f"opex_var_{_opex_phase}"
+        if _econ_is_oil:
+            opex_var_bbl = c3.number_input(
+                "Var. OPEX ($/bbl)", value=5.5,
+                key=_opex_key, on_change=mark_stale,
+                help="Variable operating cost per barrel of primary fluid "
+                     "(oil) produced. Default $5.5/bbl reflects a mid-size NCS "
+                     "offshore development; small / late-life fields run "
+                     "higher ($10-20/bbl), very large fields lower. Industry-"
+                     "standard regardless of unit system.")
+        else:
+            opex_var_bbl = c3.number_input(
+                "Var. OPEX ($/Mscf)", value=0.9,
+                key=_opex_key, on_change=mark_stale,
+                help="Variable operating cost per Mscf of primary fluid (gas) "
+                     "produced. Default $0.9/Mscf reflects an NCS gas / gas-"
+                     "condensate development (~$5/boe). For a gas field the "
+                     "engine charges variable OPEX against the gas rate "
+                     "(Mscf/d), so this must be a $/Mscf figure — typically "
+                     "$0.5-2.0/Mscf, NOT an oil $/bbl number.")
+        opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
+                                     key="opex_fixed", on_change=mark_stale)
 
     # Convert always-$/bbl and always-$/MMBtu to engine-internal $/bbl, $/Mscf
     oil_price = float(oil_price_bbl)
@@ -6109,84 +6204,100 @@ def economics_section(units, start_date):
             )
 
     # ---- Well cost (fixed vs rig-rate bottom-up) ----
-    st.markdown("**Well cost model**")
-    well_cost_mode = st.radio(
-        "Method", ["rig_rate", "fixed"],
-        format_func=lambda x: "Rig-rate (bottom-up)" if x == "rig_rate" else "Fixed $MM / well (legacy)",
-        index=0, horizontal=True,
-        key="well_cost_mode", on_change=mark_stale,
-        help="Rig-rate: cost = (drill_days × rig dayrate + completion_days × completion-spread dayrate) × (1 + intangibles%) + tangibles. "
-             "Fixed: a single $MM/well number (legacy).",
-    )
-    if well_cost_mode == "rig_rate":
-        rc1, rc2, rc3, rc4 = st.columns(4)
-        rig_day_rate_kUSD = rc1.number_input(
-            "Rig dayrate ($k/day)", value=500.0, min_value=0.0, step=10.0,
-            key="rig_dayrate", on_change=mark_stale,
-            help="Drilling-rig spread cost per day. Typical ranges: $50-150k/d (land), "
-                 "$150-350k/d (jackup), $400-700k/d (semi/drillship).")
-        completion_day_rate_kUSD = rc2.number_input(
-            "Completion dayrate ($k/day)", value=350.0, min_value=0.0, step=10.0,
-            key="cmpl_dayrate", on_change=mark_stale,
-            help="Completion spread (frac fleet, wireline, mob). Typically 60–80% of the rig dayrate.")
-        well_tangibles_MM = rc3.number_input(
-            "Tangibles ($MM/well)", value=4.0, min_value=0.0, step=0.5,
-            key="well_tangibles", on_change=mark_stale,
-            help="Casing, tubing, tree, wellhead, line pipe.")
-        well_intangibles_pct = rc4.slider(
-            "Intangibles % of spread", 0.0, 0.50, 0.10, 0.01,
-            key="well_intangibles_pct", on_change=mark_stale,
-            help="Mud, cement, services, transport, fuel — typically 8–15% of spread cost.")
-        # Show a live preview of typical well cost
-        avg_drill = 45  # default
-        avg_compl = 15
-        if "producers_df" in st.session_state and len(st.session_state.producers_df) > 0:
-            try:
-                pdf = st.session_state.producers_df
-                avg_drill = float(pdf["drill_days"].mean())
-                avg_compl = float(pdf["completion_days"].mean())
-            except Exception:
-                pass
-        spread = (avg_drill * rig_day_rate_kUSD + avg_compl * completion_day_rate_kUSD) / 1000.0
-        preview_cost = spread * (1.0 + well_intangibles_pct) + well_tangibles_MM
-        st.caption(
-            f"💡 At average drill = **{avg_drill:.0f} days**, completion = "
-            f"**{avg_compl:.0f} days** → estimated cost ≈ **${preview_cost:.1f}MM** per well "
-            f"(spread ${spread:.1f}MM × {(1+well_intangibles_pct):.2f} + tangibles "
-            f"${well_tangibles_MM:.1f}MM)."
+    with st.expander("⚒️ Well cost model (rig-rate or fixed $MM/well)",
+                     expanded=False):
+        well_cost_mode = st.radio(
+            "Method", ["rig_rate", "fixed"],
+            format_func=lambda x: "Rig-rate (bottom-up)" if x == "rig_rate" else "Fixed $MM / well (legacy)",
+            index=0, horizontal=True,
+            key="well_cost_mode", on_change=mark_stale,
+            help="Rig-rate: cost = (drill_days × rig dayrate + completion_days × completion-spread dayrate) × (1 + intangibles%) + tangibles. "
+                 "Fixed: a single $MM/well number (legacy).",
         )
-        capex_well = preview_cost   # legacy field still populated; used as MC base
-    else:
-        capex_well = st.number_input("CAPEX per well ($MM)", value=15.0,
-                                      key="capex_well", on_change=mark_stale,
-                                      help="Spent at well's spud date.")
-        rig_day_rate_kUSD = 500.0
-        completion_day_rate_kUSD = 350.0
-        well_tangibles_MM = 4.0
-        well_intangibles_pct = 0.10
+        if well_cost_mode == "rig_rate":
+            rc1, rc2, rc3, rc4 = st.columns(4)
+            rig_day_rate_kUSD = rc1.number_input(
+                "Rig dayrate ($k/day)", value=500.0, min_value=0.0, step=10.0,
+                key="rig_dayrate", on_change=mark_stale,
+                help="Drilling-rig spread cost per day. Typical ranges: $50-150k/d (land), "
+                     "$150-350k/d (jackup), $400-700k/d (semi/drillship).")
+            completion_day_rate_kUSD = rc2.number_input(
+                "Completion dayrate ($k/day)", value=350.0, min_value=0.0, step=10.0,
+                key="cmpl_dayrate", on_change=mark_stale,
+                help="Completion spread (frac fleet, wireline, mob). Typically 60–80% of the rig dayrate.")
+            well_tangibles_MM = rc3.number_input(
+                "Tangibles ($MM/well)", value=4.0, min_value=0.0, step=0.5,
+                key="well_tangibles", on_change=mark_stale,
+                help="Casing, tubing, tree, wellhead, line pipe.")
+            well_intangibles_pct = rc4.slider(
+                "Intangibles % of spread", 0.0, 0.50, 0.10, 0.01,
+                key="well_intangibles_pct", on_change=mark_stale,
+                help="Mud, cement, services, transport, fuel — typically 8–15% of spread cost.")
+            # Show a live preview of typical well cost
+            avg_drill = 45  # default
+            avg_compl = 15
+            if "producers_df" in st.session_state and len(st.session_state.producers_df) > 0:
+                try:
+                    pdf = st.session_state.producers_df
+                    avg_drill = float(pdf["drill_days"].mean())
+                    avg_compl = float(pdf["completion_days"].mean())
+                except Exception:
+                    pass
+            spread = (avg_drill * rig_day_rate_kUSD + avg_compl * completion_day_rate_kUSD) / 1000.0
+            preview_cost = spread * (1.0 + well_intangibles_pct) + well_tangibles_MM
+            st.caption(
+                f"💡 At average drill = **{avg_drill:.0f} days**, completion = "
+                f"**{avg_compl:.0f} days** → estimated cost ≈ **${preview_cost:.1f}MM** per well "
+                f"(spread ${spread:.1f}MM × {(1+well_intangibles_pct):.2f} + tangibles "
+                f"${well_tangibles_MM:.1f}MM)."
+            )
+            capex_well = preview_cost   # legacy field still populated; used as MC base
+        else:
+            # Initial default only — once the user edits, session_state["capex_well"]
+            # persists, and Streamlit will use that value instead of the literal.
+            # Streamlit does NOT re-apply `value=` on subsequent renders when the
+            # key exists, but we still need to seed it explicitly so the first
+            # render has a value when the user has never touched the widget.
+            if "capex_well" not in st.session_state:
+                st.session_state["capex_well"] = 15.0
+            capex_well = st.number_input("CAPEX per well ($MM)",
+                                          key="capex_well", on_change=mark_stale,
+                                          min_value=0.0, step=1.0,
+                                          help="Spent at the well's spud date. "
+                                               "Edited value persists across "
+                                               "reruns and mode switches.")
+            rig_day_rate_kUSD = 500.0
+            completion_day_rate_kUSD = 350.0
+            well_tangibles_MM = 4.0
+            well_intangibles_pct = 0.10
 
-    c2, c3, c4 = st.columns(3)
-    disc = c2.slider("Discount rate", 0.0, 0.30, 0.10, 0.01,
-                     key="disc", on_change=mark_stale)
-    tax = c3.slider("Tax rate", 0.0, 0.7, 0.30, 0.01,
-                    key="tax_rate", on_change=mark_stale,
-                    help="Applied on positive pre-tax CF only.")
-    royalty = c4.slider("Royalty rate", 0.0, 0.5, 0.10, 0.01,
-                        key="royalty", on_change=mark_stale,
-                        help="Deducted from gross revenue.")
+    with st.expander("📊 Discount rate, tax, royalty, tariffs, abandonment",
+                     expanded=False):
+        c2, c3, c4 = st.columns(3)
+        disc = c2.slider("Discount rate", 0.0, 0.30, 0.10, 0.01,
+                         key="disc", on_change=mark_stale)
+        tax = c3.slider("Tax rate", 0.0, 0.7, 0.30, 0.01,
+                        key="tax_rate", on_change=mark_stale,
+                        help="Applied on positive pre-tax CF only. "
+                             "**Ignored if fiscal regime is NCS** "
+                             "(CIT + SPT replace it).")
+        royalty = c4.slider("Royalty rate", 0.0, 0.5, 0.10, 0.01,
+                            key="royalty", on_change=mark_stale,
+                            help="Deducted from gross revenue. "
+                                 "**Ignored if fiscal regime is NCS**.")
 
-    c1, c2, c3 = st.columns(3)
-    tariff_oil_bbl = c1.number_input(
-        "Oil tariff ($/bbl)", value=2.0,
-        key="tariff_oil_bbl", on_change=mark_stale,
-        help="Pipeline / processing tariff per barrel of oil. Always per bbl "
-             "regardless of unit system.")
-    tariff_gas_mmbtu = c2.number_input(
-        "Gas tariff ($/MMBtu)", value=0.3,
-        key="tariff_gas_mmbtu", on_change=mark_stale,
-        help="Gas transport / processing tariff per MMBtu.")
-    aban_cost = c3.number_input("Abandonment cost ($MM)", value=80.0,
-                                key="aban_cost", on_change=mark_stale)
+        c1, c2, c3 = st.columns(3)
+        tariff_oil_bbl = c1.number_input(
+            "Oil tariff ($/bbl)", value=2.0,
+            key="tariff_oil_bbl", on_change=mark_stale,
+            help="Pipeline / processing tariff per barrel of oil. Always per bbl "
+                 "regardless of unit system.")
+        tariff_gas_mmbtu = c2.number_input(
+            "Gas tariff ($/MMBtu)", value=0.3,
+            key="tariff_gas_mmbtu", on_change=mark_stale,
+            help="Gas transport / processing tariff per MMBtu.")
+        aban_cost = c3.number_input("Abandonment cost ($MM)", value=80.0,
+                                    key="aban_cost", on_change=mark_stale)
 
     # ---- Economic limit / cessation timing ----
     st.markdown("**Cessation timing**")
@@ -7823,6 +7934,20 @@ def economics_section(units, start_date):
             help="End-use combustion of natural gas. 53 kg/Mscf same as "
                  "the upstream combustion factor.")
 
+    # When the NCS regime is active, the engine applies CIT (22%) + SPT
+    # (71.8%) + uplift — the global tax_rate and royalty_rate sliders
+    # would double-count if also passed in. Override to zero before
+    # building EconInputs, and tell the user so they're not surprised
+    # the sliders are ignored.
+    if regime_for_engine == "NCS" and (tax > 0 or royalty > 0):
+        st.info(
+            f"**NCS regime is active** — the global Tax ({tax:.0%}) and "
+            f"Royalty ({royalty:.0%}) sliders are ignored to avoid "
+            f"double-counting on top of CIT + SPT + uplift. The engine "
+            f"will use CIT={ncs_cit_rate:.0%} + SPT={ncs_spt_rate:.0%}.")
+        tax = 0.0
+        royalty = 0.0
+
     return EconInputs(
         oil_price=oil_price,        # already in $/bbl (engine-internal)
         gas_price=gas_price,        # already in $/Mscf (engine-internal)
@@ -7911,6 +8036,19 @@ def plot_production(df, fluid, units):
                      secondary_y=False, showgrid=True)
     fig.update_yaxes(title_text=f"Gas ({gas_label})",
                      secondary_y=True, showgrid=False)
+    # Cessation marker — pulled from df.attrs if the engine set one. Lets
+    # the user see WHERE the abandonment cutoff (rate / water-cut /
+    # economic limit) actually fired on the production curve.
+    cidx = df.attrs.get("cessation_idx") if hasattr(df, "attrs") else None
+    if cidx is not None and 0 <= int(cidx) < len(df):
+        try:
+            _cdate = pd.to_datetime(df["date"].iloc[int(cidx)])
+            fig.add_vline(x=_cdate, line=dict(color="#7f7f7f", dash="dot"),
+                          annotation_text="Cessation",
+                          annotation_position="top left",
+                          annotation_font=dict(size=11))
+        except Exception:
+            pass
     return fh.apply_plot_template(fig)
 
 
@@ -8146,11 +8284,19 @@ def plot_drilling_gantt(wells):
              if has_map else
              "Drilling schedule (drill = solid, completion = faded)")
     fig.update_layout(
-        title=title,
-        height=max(350, 28 * len(wells)),
+        title=dict(text=title, font=dict(size=16)),
+        # 32 px / row gives the y-axis labels enough vertical space for a
+        # 13 px font without overlap. Older 28 px crushed labels at 10 px.
+        height=max(420, 32 * len(wells)),
         barmode="overlay",
-        xaxis=dict(type="date", title="Date"),
-        legend=dict(orientation="h", y=-0.15),
+        xaxis=dict(type="date", title=dict(text="Date",
+                                            font=dict(size=14)),
+                   tickfont=dict(size=12)),
+        yaxis=dict(tickfont=dict(size=13),
+                    automargin=True),
+        legend=dict(orientation="h", y=-0.15,
+                     font=dict(size=12)),
+        font=dict(size=12),
     )
     return fh.apply_plot_template(fig)
 
@@ -8428,24 +8574,29 @@ def plot_economics(df_e):
         ("tax", "Tax", "#e377c2", -1),
         ("abandonment", "Abandonment", "#7f7f7f", -1),
     ]
-    # x-categories: every project year as a string, in order
-    year_cats = [str(y) for y in annual["year"].tolist()]
+    # x-values: INTEGER years on a numeric linear axis. Previous attempts
+    # used a categorical string axis with explicit `categoryarray` +
+    # `tickvals`, but those get silently overridden by Plotly's auto-tick
+    # logic and by `apply_plot_template`'s layout merge — leaving the
+    # bars crammed at the leftmost category and no tick labels for years
+    # in between. A numeric linear axis with explicit `range=[y_lo-0.5,
+    # y_hi+0.5]` and `dtick=1` is the bulletproof form: `range` is one of
+    # the few axis settings that survives all downstream merges, and
+    # `dtick=1` forces a tick every year.
+    year_vals = annual["year"].astype(int).tolist()
     for col, name, color, sign in bars:
-        fig.add_trace(go.Bar(x=year_cats,
+        fig.add_trace(go.Bar(x=year_vals,
                              y=sign * annual[col]/1e6,
                              name=name, marker_color=color), row=1, col=1)
-    # mark first oil on the buildup chart (using string years so the
-    # vline lands on the matching categorical tick). Crucially, only
-    # plot the vline when the year is actually in year_cats — otherwise
-    # Plotly silently appends the unknown category and stretches the
-    # axis past the data (the symptom you saw: bars crammed to the left,
-    # 'Cessation' label drifting to the far right).
-    if first_oil_year is not None and str(first_oil_year) in year_cats:
-        fh.safe_vline(fig, str(first_oil_year), label="First oil",
+    # First-oil and cessation markers — guarded so they only draw when
+    # the year is actually inside the bar-chart range.
+    if (first_oil_year is not None and year_vals
+            and year_vals[0] <= first_oil_year <= year_vals[-1]):
+        fh.safe_vline(fig, int(first_oil_year), label="First oil",
                       color="#2ca02c", dash="dot", row=1, col=1)
-    if (cessation_year is not None
-            and str(cessation_year) in year_cats):
-        fh.safe_vline(fig, str(cessation_year), label="Cessation",
+    if (cessation_year is not None and year_vals
+            and year_vals[0] <= cessation_year <= year_vals[-1]):
+        fh.safe_vline(fig, int(cessation_year), label="Cessation",
                       color="#7f7f7f", dash="dot", row=1, col=1,
                       label_position="bottom")
     fig.add_trace(go.Scatter(x=df_e["date"], y=df_e["cum_cashflow"]/1e6,
@@ -8455,19 +8606,17 @@ def plot_economics(df_e):
                              name="NPV", line=dict(color="#ff7f0e", width=2, dash="dash")),
                   row=1, col=2)
     fig.add_hline(y=0, line=dict(color="grey", dash="dot"), row=1, col=2)
-    # Force the annual bar chart to use every project year as an explicit
-    # category. Without categoryorder="array", Plotly tries to be clever
-    # and either snaps the axis to round numeric ticks (the old 500-2000
-    # bug) or only labels years that have non-zero data (the second bug —
-    # bars crammed at year 2030 because the rest of the years had no
-    # data even after reindex).
-    fig.update_xaxes(title_text="Calendar year", row=1, col=1,
-                      type="category",
-                      categoryorder="array",
-                      categoryarray=year_cats,
-                      tickmode="array",
-                      tickvals=year_cats,
-                      ticktext=year_cats)
+    # Numeric integer-year axis: `range` survives template merges, `dtick=1`
+    # forces a label per year, `tickformat="d"` prints them as integers
+    # (no decimals, no thousands separator).
+    if year_vals:
+        x_lo = year_vals[0] - 0.5
+        x_hi = year_vals[-1] + 0.5
+        fig.update_xaxes(title_text="Calendar year", row=1, col=1,
+                          type="linear",
+                          range=[x_lo, x_hi],
+                          tick0=year_vals[0], dtick=1,
+                          tickformat="d")
     fig.update_xaxes(title_text="Date", row=1, col=2)
     fig.update_layout(barmode="relative", height=450,
                       legend=dict(orientation="h", y=-0.2))
@@ -9296,12 +9445,30 @@ def main():
     else:
         # Always display breakeven in $/bbl and $/Mscf regardless of unit system —
         # these are the universally-quoted commodity reference units.
+        _cutoff_mode = getattr(econ_r, "economic_cutoff_mode", "horizon")
+        _be_help = (f"Oil price (with gas price scaled by the same factor "
+                    f"of {be['multiplier']:.2f}) at which NPV @ "
+                    f"{econ_r.discount_rate:.0%} equals zero. "
+                    f"Implied gas price: ${be['gas_price']:.2f}/Mscf.")
+        if _cutoff_mode == "economic":
+            _be_help += (
+                "  **Note:** economic cutoff is ON, so lower trial prices "
+                "trigger earlier cessation — the breakeven solver "
+                "evaluates each price with its own truncated lifetime. "
+                "That makes the breakeven LOWER than a horizon-mode run "
+                "(which forces the project through loss-making tail "
+                "years). To compare apples-to-apples, switch to horizon "
+                "mode.")
+        else:
+            _be_help += (
+                "  **Note:** economic cutoff is OFF (horizon mode) — "
+                "the project runs to the full forecast horizon at the "
+                "trial price, including any late-life loss-making "
+                "months. Breakeven price is therefore HIGHER than an "
+                "economic-cutoff run of the same case.")
         k7.metric("Breakeven oil ($/bbl)",
                   f"{be['oil_price']:,.1f}",
-                  help=(f"Oil price (with gas price scaled by the same factor "
-                        f"of {be['multiplier']:.2f}) at which NPV @ "
-                        f"{econ_r.discount_rate:.0%} equals zero. "
-                        f"Implied gas price: ${be['gas_price']:.2f}/Mscf."))
+                  help=_be_help)
 
     # NGL contribution (only show when yield > 0)
     ngl_yield_active = float(getattr(econ_r, "ngl_yield_bbl_per_mmscf", 0.0))
@@ -11221,6 +11388,69 @@ def sensitivity_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         ("Final water cut",  _scale_well_attr("wc_final", 1.0)),
         ("Discount rate",    _scale_econ("discount_rate", 1.0)),
     ]
+
+    # ---- User-customisable selection + per-driver range ----
+    # By default include every driver at the global ±pct. The user can
+    # untick drivers they want to exclude and override the lo/hi % per
+    # driver — overrides are kept across reruns via session_state.
+    _all_driver_names = [d[0] for d in drivers]
+    with st.expander("⚙️ Choose drivers and per-driver ranges",
+                     expanded=False):
+        st.caption(
+            "Pick which drivers appear in the tornado, and override "
+            "the low/high % for each one (defaults to the global "
+            f"±{pct}%). Useful when you want a sharper view on a "
+            "single high-impact driver (e.g. oil price ±50%) while "
+            "keeping others tighter.")
+        selected_drivers = st.multiselect(
+            "Drivers to include",
+            options=_all_driver_names,
+            default=st.session_state.get("sens_selected_drivers",
+                                          _all_driver_names),
+            key="sens_selected_drivers")
+        # Per-driver lo/hi % grid
+        ranges_key = "sens_driver_ranges"
+        if ranges_key not in st.session_state:
+            st.session_state[ranges_key] = {}
+        st.caption(
+            "**Per-driver overrides** — leave empty for the global "
+            f"±{pct}%. Values are percentages of the base case.")
+        _gc1, _gc2, _gc3 = st.columns([2, 1, 1])
+        _gc1.markdown("**Driver**")
+        _gc2.markdown(f"**Low %** (default −{pct})")
+        _gc3.markdown(f"**High %** (default +{pct})")
+        new_ranges = dict(st.session_state[ranges_key])
+        for dname in selected_drivers:
+            r = new_ranges.get(dname, {})
+            c1d, c2d, c3d = st.columns([2, 1, 1])
+            c1d.markdown(f"  {dname}")
+            lo = c2d.number_input(
+                f"lo_{dname}", value=float(r.get("lo", -pct)),
+                step=5.0, min_value=-95.0, max_value=0.0,
+                key=f"sens_lo_{dname}",
+                label_visibility="collapsed")
+            hi = c3d.number_input(
+                f"hi_{dname}", value=float(r.get("hi", pct)),
+                step=5.0, min_value=0.0, max_value=200.0,
+                key=f"sens_hi_{dname}",
+                label_visibility="collapsed")
+            new_ranges[dname] = {"lo": float(lo), "hi": float(hi)}
+        st.session_state[ranges_key] = new_ranges
+
+    # Filter drivers list to those selected, in original order.
+    drivers = [d for d in drivers if d[0] in selected_drivers]
+    if not drivers:
+        st.warning("Select at least one driver above to render the "
+                    "tornado.")
+        return
+    # Build a per-driver factor table for the compute step.
+    driver_factors = {}
+    for dname in [d[0] for d in drivers]:
+        r = st.session_state.get(ranges_key, {}).get(dname, {})
+        lo_pct = float(r.get("lo", -pct))
+        hi_pct = float(r.get("hi", pct))
+        driver_factors[dname] = (1.0 + lo_pct / 100.0,
+                                  1.0 + hi_pct / 100.0)
 
     def _compute_tornado_rows(drivers_, factor_lo, factor_hi, get_value,
                               base_value, asm, econ, wells, is_oil):
