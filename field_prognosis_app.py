@@ -8942,7 +8942,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "4.2"
+    _EXPECTED_FP_VERSION = "4.3"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -10896,47 +10896,70 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
     ]
     # NGL row only when the stream is active
     if getattr(econ, "ngl_yield_bbl_per_mmscf", 0.0) > 0:
-        assumptions.append(
+        asm_rows.append(
             ("NGL yield / price",
              f"{econ.ngl_yield_bbl_per_mmscf:.0f} bbl/MMscf @ "
              f"${econ.ngl_price_bbl:.0f}/bbl  (OPEX ${econ.ngl_opex_bbl:.1f}/bbl)")
         )
 
-    # Render figures
+    # ---- Render the full set of figures (results + inputs) ----
+    # Each render is independently guarded so one failure doesn't abort the
+    # whole report. The PDF aims to be a complete, self-contained dump of
+    # the analysis: production, cumulatives/RF, pressure, per-well phases,
+    # drilling schedule, economics buildup, NPV waterfall, CO₂ profile,
+    # sensitivity tornado and Monte Carlo distributions.
     figs_for_pdf = []
-    try:
-        f_prod = plot_production(df, fluid, units)
-        png = fh.figure_to_png(f_prod)
-        if png: figs_for_pdf.append(("Production profiles", png))
-    except Exception:
-        pass
-    try:
-        f_cum = plot_cumulatives(df, fluid, asm.rf_target, units)
-        png = fh.figure_to_png(f_cum)
-        if png: figs_for_pdf.append(("Cumulative production & RF", png))
-    except Exception:
-        pass
-    try:
-        f_press = plot_pressure(df, units)
-        png = fh.figure_to_png(f_press)
-        if png: figs_for_pdf.append(("Material balance — pressure & RF", png))
-    except Exception:
-        pass
-    try:
-        f_econ = plot_economics(df_e)
-        png = fh.figure_to_png(f_econ)
-        if png: figs_for_pdf.append(("Economics", png))
-    except Exception:
-        pass
-    try:
-        f_gantt = plot_drilling_gantt(wells)
-        png = fh.figure_to_png(f_gantt, height=max(400, 28 * len(wells)))
-        if png: figs_for_pdf.append(("Drilling schedule", png))
-    except Exception:
-        pass
 
-    if not figs_for_pdf:
-        # Even without plot images, still produce a PDF with KPIs+assumptions
+    def _add_fig(caption, fig, **png_kwargs):
+        try:
+            png = fh.figure_to_png(fig, **png_kwargs)
+            if png:
+                figs_for_pdf.append((caption, png))
+        except Exception:
+            pass
+
+    _add_fig("Production profiles by phase", plot_production(df, fluid, units))
+    _add_fig("Cumulative production & recovery factor",
+             plot_cumulatives(df, fluid, asm.rf_target, units))
+    _add_fig("Material balance — reservoir pressure & RF",
+             plot_pressure(df, units))
+    # Per-well phase contribution (oil/gas/water stacked by well)
+    try:
+        if per_well_df is not None and per_well_df.attrs.get("oil_mat") is not None:
+            _add_fig("Per-well contribution by phase",
+                     plot_per_well_phase(per_well_df, df, units, fluid))
+    except Exception:
+        pass
+    _add_fig("Drilling schedule", plot_drilling_gantt(wells),
+             height=max(400, 32 * len(wells)))
+    _add_fig("Annual cashflow buildup & cumulative NPV", plot_economics(df_e))
+    # NPV waterfall
+    try:
+        _add_fig("NPV value-construction waterfall",
+                 plot_npv_waterfall(df_e, econ.discount_rate))
+    except Exception:
+        pass
+    # CO₂ yearly profile
+    try:
+        _co2 = plot_co2_yearly(df_e)
+        if _co2 is not None:
+            _add_fig("Yearly CO₂ emissions (Scope 1 + Scope 3)", _co2)
+    except Exception:
+        pass
+    # Sensitivity tornado + Monte Carlo — pulled from session_state where the
+    # interactive tabs cache their last-computed figures, so the PDF mirrors
+    # exactly what the user last saw without recomputing.
+    try:
+        _torn = st.session_state.get("_last_tornado_fig")
+        if _torn is not None:
+            _add_fig("Sensitivity — NPV tornado", _torn)
+    except Exception:
+        pass
+    try:
+        _mc = st.session_state.get("_last_mc_fig")
+        if _mc is not None:
+            _add_fig("Monte Carlo — outcome distribution", _mc)
+    except Exception:
         pass
 
     # Per-reservoir summary table for the PDF
@@ -10959,6 +10982,13 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
         res_table.columns = ["ID", "Name", "Fluid", "Cum primary",
                               "Final RF", "P final (psi)", "Peak rate"]
 
+    # AI-style narrative interpretation of the results
+    try:
+        narrative = fh.generate_report_narrative(
+            case_name, summary, {}, {}, df_e)
+    except Exception:
+        narrative = None
+
     try:
         return fh.build_pdf_report(
             case_name=case_name,
@@ -10966,6 +10996,7 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
             assumptions_text=asm_rows,
             fig_bytes_list=figs_for_pdf,
             scenario_table=res_table,
+            narrative_sections=narrative,
             disclaimer=("This report is for early-phase screening only. Results MUST NOT be used "
                         "for investment decisions, reserves booking, or production-grade studies."),
         )
@@ -11722,9 +11753,11 @@ def sensitivity_section(df_base, df_e_base, wells, asm, econ, units, fluid):
         legend=dict(orientation="h", y=-0.15),
         bargap=0.35,
     )
-    st.plotly_chart(fh.apply_plot_template(fig), use_container_width=True)
-
-    # Summary table
+    _tornado_fig = fh.apply_plot_template(fig)
+    # Cache for the PDF report so "Generate PDF" can embed the last tornado
+    # the user saw without recomputing the whole sensitivity sweep.
+    st.session_state["_last_tornado_fig"] = _tornado_fig
+    st.plotly_chart(_tornado_fig, use_container_width=True)
     table = pd.DataFrame([{
         "Driver": r["Driver"],
         f"−{pct}% Δ": r["low"],
@@ -12175,7 +12208,11 @@ def monte_carlo_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             xaxis_title="NPV ($MM)", yaxis_title="Frequency",
             height=360, bargap=0.05, showlegend=False,
         )
-        st.plotly_chart(fh.apply_plot_template(fig_h), use_container_width=True)
+        _mc_npv_fig = fh.apply_plot_template(fig_h)
+        # Cache for the PDF report so "Generate PDF" embeds the last MC
+        # NPV distribution the user computed.
+        st.session_state["_last_mc_fig"] = _mc_npv_fig
+        st.plotly_chart(_mc_npv_fig, use_container_width=True)
         # Reserves histogram with 1P/2P/3P markers
         if show_reserves:
             _is_oil_mc = FLUID_SYSTEMS[fluid]["primary"] == "oil"

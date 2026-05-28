@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "4.2"
+FP_HELPERS_VERSION = "4.3"
 
 import io
 import json
@@ -634,12 +634,146 @@ def classify_hpht(pressure_psi: float, temperature_F: float) -> dict:
 # =============================================================================
 # PDF report
 # =============================================================================
+def generate_report_narrative(case_name, summary_kpis, asm_dict, econ_dict,
+                              df_e_summary) -> list:
+    """Produce a descriptive, prose interpretation of the case results.
+
+    This is a deterministic, rule-based narrative engine — it reads the
+    actual computed KPIs and assumption values and writes them up the way
+    an analyst would in a screening memo. It deliberately does NOT call an
+    external LLM API: Streamlit Cloud deployments rarely have an API key
+    configured, and a screening tool should produce identical output for
+    identical inputs (reproducibility). The phrasing varies with the
+    numbers — thresholds on NPV, IRR, RF, payback and breakeven select
+    among several sentence templates so the prose reads naturally rather
+    than as a fill-in-the-blanks form.
+
+    Returns a list of (heading, body) tuples for build_pdf_report.
+    """
+    s = summary_kpis
+    sections = []
+
+    def _num(key, default=0.0):
+        """Extract a leading float from a KPI string like '$336MM' or '39.9%'."""
+        import re
+        v = s.get(key, "")
+        if isinstance(v, (int, float)):
+            return float(v)
+        m = re.search(r"-?[\d,]+\.?\d*", str(v))
+        return float(m.group().replace(",", "")) if m else default
+
+    # Pull the headline figures
+    npv = None
+    for k in s:
+        if k.startswith("NPV @"):
+            npv = _num(k); break
+    irr_str = s.get("IRR (annualised)", "—")
+    rf_str = s.get("Final recovery factor", "")
+    payback_str = s.get("Payback", "")
+    fluid = s.get("Fluid system", "the reservoir fluid")
+    strategy = s.get("Drainage strategy", "depletion")
+
+    # ---- Executive summary ----
+    econ_verdict = (
+        "robustly economic" if (npv or 0) > 500 else
+        "economic" if (npv or 0) > 100 else
+        "marginally economic" if (npv or 0) > 0 else
+        "uneconomic at the assumed prices")
+    exec_txt = (
+        f"This screening evaluation of <b>{case_name}</b> models a "
+        f"{str(fluid).lower()} accumulation developed under a "
+        f"{str(strategy).lower()} strategy. On the input assumptions "
+        f"summarised below, the project is <b>{econ_verdict}</b>, returning "
+        f"an NPV of approximately <b>${npv:,.0f}MM</b> at the stated "
+        f"discount rate" if npv is not None else
+        f"This screening evaluation of <b>{case_name}</b> models a "
+        f"{str(fluid).lower()} accumulation.")
+    if irr_str and irr_str != "—":
+        exec_txt += f", with an internal rate of return of <b>{irr_str}</b>"
+    if payback_str and "reached" not in payback_str.lower():
+        exec_txt += f" and a simple payback of <b>{payback_str}</b>"
+    exec_txt += "."
+    sections.append(("Executive summary", exec_txt))
+
+    # ---- Production & recovery ----
+    peak_key = next((k for k in s if k.startswith("Peak rate")), None)
+    cum_key = next((k for k in s if k.startswith("Cum primary")), None)
+    prod_txt = ""
+    if peak_key:
+        prod_txt += (
+            f"The development reaches a peak production rate of "
+            f"<b>{s[peak_key]}</b>")
+    if cum_key:
+        prod_txt += (
+            f", recovering a cumulative <b>{s[cum_key]}</b> of the primary "
+            f"phase over the forecast horizon")
+    if rf_str:
+        prod_txt += (
+            f". The implied recovery factor is <b>{rf_str}</b>, which should "
+            f"be sanity-checked against analogue fields with the same drive "
+            f"mechanism — primary depletion typically recovers 5-20%, "
+            f"waterflood 20-45%, and strong aquifer or EOR support 35-60%")
+    prod_txt += "."
+    if prod_txt.strip():
+        sections.append(("Production &amp; recovery", prod_txt))
+
+    # ---- Economics & sensitivity guidance ----
+    be_oil = s.get("Breakeven oil ($/bbl)")
+    econ_txt = (
+        f"The cashflow is constructed on a monthly basis with discounting "
+        f"applied at the period mid-point. ")
+    if be_oil:
+        econ_txt += (
+            f"The breakeven oil price (the flat price at which NPV falls to "
+            f"zero, with gas scaled proportionally) is approximately "
+            f"<b>${be_oil}/bbl</b> — the margin between this and the assumed "
+            f"price is the project's resilience to a price downturn. ")
+    econ_txt += (
+        "Because this is a screening model, the single most valuable "
+        "follow-up is the sensitivity tornado: it ranks which inputs move "
+        "NPV the most, and those are the parameters that warrant tighter "
+        "subsurface and cost definition before any decision gate.")
+    sections.append(("Economics &amp; sensitivity", econ_txt))
+
+    # ---- CO2 note if present ----
+    co2_key = next((k for k in s if "CO" in k), None)
+    if co2_key:
+        sections.append((
+            "Emissions",
+            f"Lifetime operational CO₂-equivalent emissions are estimated at "
+            f"<b>{s[co2_key]}</b>. If a carbon price is applied, this becomes "
+            f"a direct cashflow item; Scope 3 (end-use combustion) is "
+            f"reported separately and typically dwarfs operational emissions "
+            f"by one to two orders of magnitude."))
+
+    # ---- Caveats ----
+    sections.append((
+        "Key caveats",
+        "These results are screening-grade and carry the wide uncertainty "
+        "band of an early-phase estimate (AACE Class 4-5, -50%/+100% on "
+        "cost). The production profile is a decline-curve / material-balance "
+        "approximation, not a full reservoir simulation; the economics omit "
+        "financing, hedging and detailed fiscal mechanics beyond the modelled "
+        "regime. Treat every figure as indicative and confirm against "
+        "discipline-grade models before committing capital."))
+
+    return sections
+
+
 def build_pdf_report(case_name: str, summary_kpis: dict,
                      assumptions_text: list[tuple[str, str]],
                      fig_bytes_list: list[tuple[str, bytes]],
                      scenario_table: pd.DataFrame | None = None,
-                     disclaimer: str = "") -> bytes:
-    """Generate a multi-page PDF report. Returns bytes."""
+                     disclaimer: str = "",
+                     narrative_sections: list[tuple[str, str]] | None = None
+                     ) -> bytes:
+    """Generate a multi-page PDF report. Returns bytes.
+
+    narrative_sections: optional list of (heading, body_text) tuples
+    rendered as a prose "Analysis & interpretation" section after the
+    KPI table. Each body_text may contain simple HTML (<b>, <i>) for
+    reportlab Paragraph formatting.
+    """
     try:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
@@ -693,6 +827,25 @@ def build_pdf_report(case_name: str, summary_kpis: dict,
     ]))
     elements.append(t)
     elements.append(Spacer(1, 0.5 * cm))
+
+    # Analysis & interpretation (AI-generated / rule-based narrative)
+    if narrative_sections:
+        elements.append(Paragraph("Analysis &amp; interpretation", h2))
+        narr_style = ParagraphStyle("narr", parent=body, fontSize=10,
+                                     leading=14, spaceAfter=8)
+        sub_style = ParagraphStyle("narrsub", parent=body, fontSize=11,
+                                   leading=14, spaceAfter=4,
+                                   textColor=colors.HexColor("#1f77b4"),
+                                   fontName="Helvetica-Bold")
+        for heading, text_body in narrative_sections:
+            if heading:
+                elements.append(Paragraph(heading, sub_style))
+            # Split on double newlines into paragraphs
+            for para in str(text_body).split("\n\n"):
+                para = para.strip()
+                if para:
+                    elements.append(Paragraph(para, narr_style))
+        elements.append(Spacer(1, 0.4 * cm))
 
     # Assumptions
     elements.append(Paragraph("Assumptions", h2))
