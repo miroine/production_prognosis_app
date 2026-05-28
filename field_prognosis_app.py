@@ -7910,6 +7910,52 @@ def economics_section(units, start_date):
         st.rerun()
     fac_df = st.session_state.fac_df
 
+    # ---- Contingency on CAPEX ----
+    # Screening-stage cost estimates are systematically optimistic — the
+    # AACE International Class 5 / Class 4 cost estimate classes (typical
+    # for a pre-FEED concept) carry an accuracy range of -50%/+100%, and
+    # NCS / UKCS benchmarking shows that final field CAPEX comes in 20-60%
+    # above the screening estimate on average. The contingency multiplier
+    # is applied to BOTH the facility CAPEX schedule AND the per-well
+    # CAPEX (whether fixed or rig-rate computed), since the same
+    # estimating bias applies to both.
+    cont_c1, cont_c2 = st.columns([1, 2])
+    contingency_pct = cont_c1.slider(
+        "CAPEX contingency (%)", 0, 100, 25, 5,
+        key="capex_contingency_pct", on_change=mark_stale,
+        help=(
+            "Multiplier applied to both facility CAPEX and well CAPEX "
+            "to cover scope growth, schedule slip, fabrication inflation "
+            "and execution risk. Applied as `(1 + pct/100)` to every "
+            "spend line.\n\n"
+            "**Benchmark recommendations** (AACE International + NCS / "
+            "UKCS post-mortems):\n"
+            "- **10-15%** — Class 2 detailed FEED / FID-ready estimate "
+            "(mature scope, locked technology, firm contracts).\n"
+            "- **20-30%** — Class 3 FEED estimate (typical NCS "
+            "subsea tie-in or brownfield with mostly known scope).\n"
+            "- **30-40%** — Class 4 concept-select estimate "
+            "(greenfield development, several technology choices "
+            "still open).\n"
+            "- **40-60%** — Class 5 screening / pre-concept estimate "
+            "(very early phase, high HPHT or deepwater technology "
+            "risk, frontier basin).\n\n"
+            "**Real-world calibration**: Johan Sverdrup phase 1 came "
+            "in ~30% under the original PDO estimate (rare); Goliat "
+            "and Yme came in 50-100% OVER; Mariner came in ~25% over. "
+            "The NCS average for FPSO / semi-sub developments since "
+            "2010 is +35% vs the PDO submission. Use 25-35% as a "
+            "screening default."))
+    if contingency_pct > 0:
+        cont_c2.caption(
+            f"💡 With {contingency_pct}% contingency, every $100MM of "
+            f"CAPEX in the schedule below (and every well CAPEX) is "
+            f"booked as **${100 * (1 + contingency_pct/100):.0f}MM** in "
+            f"the cashflow. Total facility-CAPEX uplift: "
+            f"**${fac_df['amount_MMUSD'].sum() * contingency_pct/100:,.0f}MM** "
+            f"on top of the **${fac_df['amount_MMUSD'].sum():,.0f}MM** "
+            f"base.")
+
     # ---- CO₂ emissions & carbon fees (Scope 1 + Scope 3) ----
     with st.expander("🌍 CO₂ emissions & carbon fees", expanded=False):
         st.caption(
@@ -7996,17 +8042,38 @@ def economics_section(units, start_date):
         tax = 0.0
         royalty = 0.0
 
+    # Apply contingency multiplier to facility + well CAPEX. The slider
+    # value is read from session_state in case the widget hasn't rendered
+    # yet (e.g. loading a saved case before the facility-CAPEX section
+    # has been visited this session). The multiplier touches every CAPEX
+    # input the engine sees: facility schedule, fixed $MM/well, and the
+    # rig-rate / completion / tangibles components (since the engine
+    # rebuilds capex_well from these when well_cost_mode == "rig_rate").
+    _cont_mult = 1.0 + float(
+        st.session_state.get("capex_contingency_pct", 25)) / 100.0
+    fac_df_with_cont = fac_df.copy()
+    if "amount_MMUSD" in fac_df_with_cont.columns:
+        fac_df_with_cont["amount_MMUSD"] = (
+            fac_df_with_cont["amount_MMUSD"].astype(float) * _cont_mult)
+    capex_well_with_cont = float(capex_well) * _cont_mult
+    rig_day_rate_with_cont = float(rig_day_rate_kUSD) * _cont_mult
+    cmpl_day_rate_with_cont = float(completion_day_rate_kUSD) * _cont_mult
+    well_tangibles_with_cont = float(well_tangibles_MM) * _cont_mult
+    # Abandonment is a CAPEX-like spend at the end of life and carries
+    # similar estimating bias — apply the same contingency multiplier.
+    aban_cost_with_cont = float(aban_cost) * _cont_mult
+
     return EconInputs(
         oil_price=oil_price,        # already in $/bbl (engine-internal)
         gas_price=gas_price,        # already in $/Mscf (engine-internal)
         opex_var=opex_var,           # already in $/bbl
         opex_fixed=opex_fixed * 1e6,
-        capex_per_well=capex_well,
+        capex_per_well=capex_well_with_cont,
         discount_rate=disc, tax_rate=tax, royalty_rate=royalty,
         tariff_oil=tariff_oil_bbl,    # will be set below from $/bbl input
         tariff_gas=tariff_gas_mmbtu * MMBTU_PER_MCF,  # $/MMBtu → $/Mscf
-        abandonment_cost_MM=aban_cost,
-        facility_capex=CapexSchedule(df=fac_df.copy()),
+        abandonment_cost_MM=aban_cost_with_cont,
+        facility_capex=CapexSchedule(df=fac_df_with_cont),
         co2_price=co2_price,
         co2_factor_gas_combust=co2_factor_gas_combust,
         co2_factor_flare_inefficiency=co2_factor_flare_ineff,
@@ -8027,9 +8094,9 @@ def economics_section(units, start_date):
         money_basis=money_basis_for_engine,
         inflation_rate=inflation_rate,
         well_cost_mode=well_cost_mode,
-        rig_day_rate_kUSD=rig_day_rate_kUSD,
-        completion_day_rate_kUSD=completion_day_rate_kUSD,
-        well_tangibles_MM=well_tangibles_MM,
+        rig_day_rate_kUSD=rig_day_rate_with_cont,
+        completion_day_rate_kUSD=cmpl_day_rate_with_cont,
+        well_tangibles_MM=well_tangibles_with_cont,
         well_intangibles_pct=well_intangibles_pct,
         ngl_yield_bbl_per_mmscf=ngl_yield,
         ngl_price_bbl=ngl_price,
@@ -10345,6 +10412,7 @@ def collect_inputs_payload() -> dict:
         "psc_gov_part", "psc_sig_bonus",
         "well_cost_mode", "rig_dayrate", "cmpl_dayrate",
         "well_tangibles", "well_intangibles_pct",
+        "capex_contingency_pct",
         "ngl_yield", "ngl_price", "ngl_opex", "ngl_shrink",
         "economic_cutoff_mode_label", "economic_cutoff_persistence",
         "aq_ct_U", "aq_ct_diff",
