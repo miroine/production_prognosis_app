@@ -3345,6 +3345,413 @@ def benchmark_concept_cost(grand_total_MMUSD: float,
     }
 
 
+def build_well_completion_svg(spec: dict) -> str:
+    """Cross-section schematic of a well + its completion.
+
+    Draws a vertical (or deviated) wellbore from surface/mudline to TD,
+    with casing strings, cement, tubing, packer(s), completion type
+    (open hole / cased+perforated / screens / gravel pack), artificial
+    lift, and the reservoir interval. Deliberately schematic but
+    geologically sensible. `spec` keys (all optional, sensible defaults):
+
+      well_type            : "Vertical" | "Deviated" | "Horizontal"
+      water_depth_m        : seabed depth (0 for onshore/platform dry well)
+      td_m                 : total measured depth
+      reservoir_top_m      : top of reservoir (TVD)
+      reservoir_thick_m    : reservoir interval thickness
+      n_casing             : number of casing strings (2-4)
+      completion_type      : "Open hole" | "Cased & perforated" |
+                             "Slotted liner" | "Screens / gravel pack" |
+                             "Frac-pack"
+      lower_completion     : "Open hole" | "Cemented & perf" | "Screens"
+      artificial_lift      : "None" | "Gas lift" | "ESP" | "HSP"
+      zonal_isolation      : "None" | "Single packer" | "Smart (multi-zone)"
+      is_injector          : bool
+    """
+    def g(k, d=None):
+        return spec.get(k, d)
+
+    well_type = str(g("well_type", "Deviated"))
+    wd = float(g("water_depth_m", 110.0) or 0.0)
+    td = float(g("td_m", 2600.0) or 2600.0)
+    res_top = float(g("reservoir_top_m", 2100.0) or 2100.0)
+    res_thick = float(g("reservoir_thick_m", 150.0) or 150.0)
+    n_casing = int(g("n_casing", 3) or 3)
+    completion = str(g("completion_type", "Cased & perforated"))
+    artificial = str(g("artificial_lift", "None"))
+    zonal = str(g("zonal_isolation", "Single packer"))
+    is_inj = bool(g("is_injector", False))
+
+    W, H = 460, 640
+    surf_y = 70                     # surface / wellhead y
+    td_y = H - 40                   # TD y on canvas
+    # Map a TVD depth (m) to a canvas y
+    max_depth = max(td, res_top + res_thick) * 1.05
+
+    def depth_to_y(d_m):
+        return surf_y + (d_m / max_depth) * (td_y - surf_y)
+
+    cx = W // 2                     # wellbore centre x at surface
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
+             f'height="{H}" viewBox="0 0 {W} {H}" '
+             f'font-family="sans-serif">']
+    # Background: sky, sea (if offshore), formations
+    parts.append(f'<rect x="0" y="0" width="{W}" height="{H}" '
+                 f'fill="#f4efe6"/>')
+    if wd > 0:
+        sea_y = depth_to_y(wd)
+        parts.append(f'<rect x="0" y="0" width="{W}" height="{sea_y}" '
+                     f'fill="#cfe6f4"/>')
+        parts.append(f'<line x1="0" y1="{surf_y}" x2="{W}" y2="{surf_y}" '
+                     f'stroke="#5a9bcf" stroke-width="2"/>')
+        parts.append(f'<text x="6" y="{surf_y-4}" font-size="10" '
+                     f'fill="#33648a">Sea surface</text>')
+        parts.append(f'<line x1="0" y1="{sea_y}" x2="{W}" y2="{sea_y}" '
+                     f'stroke="#7a6a45" stroke-width="2" '
+                     f'stroke-dasharray="4,2"/>')
+        parts.append(f'<text x="6" y="{sea_y-4}" font-size="10" '
+                     f'fill="#7a6a45">Mudline ({wd:.0f} m)</text>')
+        top_struct_y = sea_y
+    else:
+        parts.append(f'<text x="6" y="{surf_y-4}" font-size="10" '
+                     f'fill="#555">Wellhead / surface</text>')
+        top_struct_y = surf_y
+
+    # Formation bands (3 overburden layers + reservoir + base)
+    res_top_y = depth_to_y(res_top)
+    res_bot_y = depth_to_y(res_top + res_thick)
+    ob_colors = ["#e8ddc6", "#ddd0b2", "#d2c39e"]
+    n_ob = 3
+    for i in range(n_ob):
+        y0 = top_struct_y + (res_top_y - top_struct_y) * i / n_ob
+        y1 = top_struct_y + (res_top_y - top_struct_y) * (i+1) / n_ob
+        parts.append(f'<rect x="0" y="{y0:.0f}" width="{W}" '
+                     f'height="{y1-y0:.0f}" fill="{ob_colors[i]}"/>')
+    # Reservoir band (highlighted)
+    parts.append(f'<rect x="0" y="{res_top_y:.0f}" width="{W}" '
+                 f'height="{res_bot_y-res_top_y:.0f}" fill="#f6d98a" '
+                 f'stroke="#c99a2e" stroke-width="1"/>')
+    parts.append(f'<text x="{W-8}" y="{(res_top_y+res_bot_y)/2:.0f}" '
+                 f'font-size="11" fill="#8a6a10" text-anchor="end" '
+                 f'font-weight="bold">RESERVOIR</text>')
+    # base
+    parts.append(f'<rect x="0" y="{res_bot_y:.0f}" width="{W}" '
+                 f'height="{td_y-res_bot_y+40:.0f}" fill="#b9a87e"/>')
+
+    # ---- Wellbore trajectory ----
+    # Vertical to a kick-off, then build angle for deviated/horizontal.
+    kop_y = depth_to_y(res_top * 0.45)
+    if well_type == "Vertical":
+        traj = [(cx, top_struct_y), (cx, res_bot_y)]
+        shoe_x = cx
+    elif well_type == "Horizontal":
+        # vertical to KOP, curve, then horizontal through reservoir
+        land_y = res_top_y
+        traj = [(cx, top_struct_y), (cx, kop_y),
+                (cx + 60, (kop_y+land_y)/2), (cx + 120, land_y),
+                (W - 30, land_y)]
+        shoe_x = W - 30
+    else:  # Deviated
+        traj = [(cx, top_struct_y), (cx, kop_y),
+                (cx + 70, res_bot_y)]
+        shoe_x = cx + 70
+
+    def path_from(points):
+        d = f'M {points[0][0]:.0f} {points[0][1]:.0f} '
+        for px, py in points[1:]:
+            d += f'L {px:.0f} {py:.0f} '
+        return d
+
+    # ---- Casing strings (concentric, progressively shorter+narrower) ----
+    casing_widths = [34, 26, 18, 12][:n_casing]
+    casing_depths = []
+    for i in range(n_casing):
+        frac = (i + 1) / n_casing
+        casing_depths.append(top_struct_y +
+                             (res_top_y - top_struct_y) * frac)
+    casing_colors = ["#888", "#999", "#aaa", "#bbb"]
+    # Cement annulus shading (light grey behind outer casing)
+    for i in range(n_casing):
+        w = casing_widths[i]
+        bot = casing_depths[i]
+        if well_type == "Vertical" or i < n_casing - 1:
+            parts.append(
+                f'<rect x="{cx - w//2 - 3}" y="{top_struct_y:.0f}" '
+                f'width="{w + 6}" height="{bot - top_struct_y:.0f}" '
+                f'fill="#cfcfcf" opacity="0.5"/>')   # cement
+            parts.append(
+                f'<line x1="{cx - w//2}" y1="{top_struct_y:.0f}" '
+                f'x2="{cx - w//2}" y2="{bot:.0f}" '
+                f'stroke="{casing_colors[i]}" stroke-width="2.5"/>')
+            parts.append(
+                f'<line x1="{cx + w//2}" y1="{top_struct_y:.0f}" '
+                f'x2="{cx + w//2}" y2="{bot:.0f}" '
+                f'stroke="{casing_colors[i]}" stroke-width="2.5"/>')
+            # shoe
+            _shoe_labels = ['30"', '20"', '13 3/8"', '9 5/8"']
+            _shoe_lbl = _shoe_labels[i] if i < len(_shoe_labels) else ''
+            parts.append(
+                f'<text x="{cx + w//2 + 4}" y="{bot:.0f}" font-size="8" '
+                f'fill="#555">{_shoe_lbl} shoe</text>')
+
+    # ---- Wellbore (open hole) line ----
+    parts.append(f'<path d="{path_from(traj)}" fill="none" '
+                 f'stroke="#222" stroke-width="2"/>')
+
+    # ---- Tubing (production string) down to packer ----
+    pkr_depth_y = res_top_y - 12
+    tubing_color = "#2f6fb0" if is_inj else "#1f8a3a"
+    if well_type == "Vertical":
+        parts.append(f'<line x1="{cx-4}" y1="{top_struct_y}" x2="{cx-4}" '
+                     f'y2="{pkr_depth_y:.0f}" stroke="{tubing_color}" '
+                     f'stroke-width="2"/>')
+        parts.append(f'<line x1="{cx+4}" y1="{top_struct_y}" x2="{cx+4}" '
+                     f'y2="{pkr_depth_y:.0f}" stroke="{tubing_color}" '
+                     f'stroke-width="2"/>')
+    else:
+        # tubing follows trajectory down to ~packer
+        tub_pts = [(x, y) for (x, y) in traj if y <= pkr_depth_y]
+        tub_pts.append((traj[min(len(tub_pts), len(traj)-1)][0],
+                        pkr_depth_y))
+        parts.append(f'<path d="{path_from(tub_pts)}" fill="none" '
+                     f'stroke="{tubing_color}" stroke-width="4"/>')
+
+    # ---- Packer ----
+    if zonal != "None":
+        # packer at reservoir top
+        pkx = traj[-1][0] if well_type != "Vertical" else cx
+        # find x at packer depth
+        pkx = cx if well_type == "Vertical" else (cx + 35)
+        parts.append(f'<rect x="{pkx-14}" y="{pkr_depth_y-4:.0f}" '
+                     f'width="28" height="8" fill="#444" '
+                     f'stroke="#000"/>')
+        parts.append(f'<text x="{pkx+18}" y="{pkr_depth_y:.0f}" '
+                     f'font-size="9" fill="#444">Packer</text>')
+        if zonal.startswith("Smart"):
+            # second packer mid-reservoir for multi-zone
+            mid_y = (res_top_y + res_bot_y) / 2
+            mpx = cx if well_type == "Vertical" else (cx + 55)
+            parts.append(f'<rect x="{mpx-12}" y="{mid_y-4:.0f}" '
+                         f'width="24" height="7" fill="#444"/>')
+            parts.append(f'<text x="{mpx+16}" y="{mid_y:.0f}" '
+                         f'font-size="8" fill="#444">ICV / zone</text>')
+
+    # ---- Lower completion across the reservoir ----
+    # Draw the completion symbol depending on type.
+    comp_x = traj[-1][0]
+    comp_top, comp_bot = res_top_y, res_bot_y
+    if "Open hole" in completion:
+        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
+                     f'fill="#7a4">Open-hole completion</text>')
+    elif "perforated" in completion.lower():
+        # perforation marks
+        for d in range(int(comp_top), int(comp_bot), 12):
+            parts.append(f'<line x1="{comp_x-9}" y1="{d}" x2="{comp_x-16}" '
+                         f'y2="{d+3}" stroke="#d33" stroke-width="2"/>')
+            parts.append(f'<line x1="{comp_x+9}" y1="{d}" x2="{comp_x+16}" '
+                         f'y2="{d+3}" stroke="#d33" stroke-width="2"/>')
+        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
+                     f'fill="#d33">Cased &amp; perforated</text>')
+    elif "Slotted" in completion:
+        for d in range(int(comp_top), int(comp_bot), 8):
+            parts.append(f'<line x1="{comp_x-7}" y1="{d}" x2="{comp_x-7}" '
+                         f'y2="{d+4}" stroke="#555" stroke-width="2"/>')
+            parts.append(f'<line x1="{comp_x+7}" y1="{d}" x2="{comp_x+7}" '
+                         f'y2="{d+4}" stroke="#555" stroke-width="2"/>')
+        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
+                     f'fill="#555">Slotted liner</text>')
+    elif "gravel" in completion.lower() or "Screens" in completion:
+        # sand screen — cross-hatch + gravel dots
+        parts.append(f'<rect x="{comp_x-10}" y="{comp_top:.0f}" width="20" '
+                     f'height="{comp_bot-comp_top:.0f}" fill="none" '
+                     f'stroke="#a60" stroke-width="1.5" '
+                     f'stroke-dasharray="2,2"/>')
+        import random as _r
+        _r.seed(42)
+        for _ in range(40):
+            gx = comp_x - 14 + _r.random() * 28
+            gy = comp_top + _r.random() * (comp_bot - comp_top)
+            parts.append(f'<circle cx="{gx:.0f}" cy="{gy:.0f}" r="1.5" '
+                         f'fill="#c90"/>')
+        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
+                     f'fill="#a60">Screens + gravel pack</text>')
+    elif "Frac" in completion:
+        for d in range(int(comp_top), int(comp_bot), 16):
+            parts.append(f'<line x1="{comp_x}" y1="{d}" x2="{comp_x-30}" '
+                         f'y2="{d-4}" stroke="#d33" stroke-width="1"/>')
+            parts.append(f'<line x1="{comp_x}" y1="{d}" x2="{comp_x+30}" '
+                         f'y2="{d-4}" stroke="#d33" stroke-width="1"/>')
+        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
+                     f'fill="#d33">Frac-pack</text>')
+
+    # ---- Artificial lift ----
+    if artificial == "Gas lift":
+        # gas-lift valves on the tubing
+        for k in range(3):
+            gy = top_struct_y + (pkr_depth_y - top_struct_y) * (k+1)/4
+            gx = cx if well_type == "Vertical" else (
+                cx + 35 * ((gy-top_struct_y)/(pkr_depth_y-top_struct_y)))
+            parts.append(f'<rect x="{gx-6:.0f}" y="{gy-3:.0f}" width="12" '
+                         f'height="6" fill="#fa0" stroke="#a60"/>')
+        parts.append(f'<text x="20" y="{surf_y+20}" font-size="10" '
+                     f'fill="#a60">⚡ Gas-lift valves</text>')
+    elif artificial in ("ESP", "HSP"):
+        ey = pkr_depth_y - 60
+        ex = cx if well_type == "Vertical" else (cx + 22)
+        parts.append(f'<rect x="{ex-7:.0f}" y="{ey:.0f}" width="14" '
+                     f'height="34" fill="#b30" stroke="#600" '
+                     f'stroke-width="1.5"/>')
+        parts.append(f'<text x="{ex+12:.0f}" y="{ey+18:.0f}" '
+                     f'font-size="9" fill="#b30">{artificial} pump</text>')
+
+    # ---- Wellhead / tree ----
+    if wd > 0:
+        # subsea tree on the mudline
+        parts.append(f'<rect x="{cx-16}" y="{top_struct_y-18:.0f}" '
+                     f'width="32" height="18" fill="#357" '
+                     f'stroke="#012" stroke-width="1.5"/>')
+        parts.append(f'<text x="{cx}" y="{top_struct_y-22:.0f}" '
+                     f'font-size="9" fill="#357" '
+                     f'text-anchor="middle">Subsea tree</text>')
+    else:
+        parts.append(f'<rect x="{cx-14}" y="{surf_y-22:.0f}" width="28" '
+                     f'height="22" fill="#357" stroke="#012" '
+                     f'stroke-width="1.5"/>')
+        parts.append(f'<text x="{cx}" y="{surf_y-26:.0f}" font-size="9" '
+                     f'fill="#357" text-anchor="middle">X-tree</text>')
+
+    # Depth labels
+    parts.append(f'<text x="6" y="{res_top_y:.0f}" font-size="9" '
+                 f'fill="#8a6a10">Top res {res_top:.0f} m</text>')
+    parts.append(f'<text x="6" y="{td_y:.0f}" font-size="9" '
+                 f'fill="#555">TD {td:.0f} m</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def topside_modification_advice(surf_concept: dict) -> list:
+    """Return a list of (heading, recommendation) topside-mod suggestions
+    keyed off the selected SURF / host concept.
+
+    Reads the concept dict produced by build_development_concept (or a
+    lighter spec) and produces screening-level recommendations for what
+    needs doing on the host topsides — the kind of cross-functional
+    interface list shown on an NCS DG1 facilities long-list slide.
+    """
+    advice = []
+    host = str(surf_concept.get("host_type", "")).lower()
+    concept_type = str(surf_concept.get("concept_type", "")).lower()
+    n_subsea = int(surf_concept.get("n_subsea_wells", 0) or 0)
+    boosting = int(surf_concept.get("n_boosting_stations", 0) or 0)
+    gas_lift = bool(surf_concept.get("gas_lift", False))
+    heating = str(surf_concept.get("heating_type", "None"))
+    export_km = float(surf_concept.get("export_pipeline_km", 0) or 0)
+    flowline_km = float(surf_concept.get("flowline_km", 0) or 0)
+    fluid_is_gas = bool(surf_concept.get("is_gas", False))
+
+    # Tie-in to existing host
+    if "tie" in concept_type or "subsea tie" in concept_type:
+        advice.append((
+            "Receiving facilities",
+            "New riser/J-tube and topside riser porch to land the "
+            "incoming flowline. Confirm spare riser balcony slot and "
+            "structural capacity; if none, a clamped riser caisson is "
+            "the typical retrofit."))
+        advice.append((
+            "Inlet separation & metering",
+            "Tie the new stream into the existing inlet separator if it "
+            "has spare capacity, otherwise add a dedicated test "
+            "separator + multiphase flow meter (MPFM) for allocation. "
+            "Check separator residence time at the new combined rate."))
+        advice.append((
+            "Pressure protection",
+            "The incoming flowline may over-pressure the host inlet. "
+            "Add HIPPS (high-integrity pressure protection) or a fully "
+            "rated flowline if the shut-in pressure exceeds the host "
+            "design pressure — usually cheaper to rate the line than "
+            "re-rate the topside."))
+    # Boosting
+    if boosting > 0:
+        advice.append((
+            "Power to SURF",
+            f"{boosting} subsea boosting station(s) need power — add a "
+            "topside variable-speed drive (VSD) and step-up transformer, "
+            "plus a dynamic power umbilical. Confirm spare generation "
+            "capacity on the host; if tight, consider power-from-shore "
+            "or an added gas-turbine generator package."))
+    # Gas lift
+    if gas_lift:
+        advice.append((
+            "Gas lift",
+            "Add a gas-lift compression train (or expand the existing "
+            "one) and a gas-lift umbilical/line to the wells. Typical "
+            "topside addition is a 1-2 MW compressor skid + scrubber."))
+    # Heating
+    if heating and heating != "None":
+        advice.append((
+            "Flow assurance / heating",
+            f"{heating} selected — add the associated topside equipment: "
+            "for electrically heated lines a power feed + control; for "
+            "hot-fluid circulation a heating-medium loop and pumps. "
+            "Confirm hydrate and wax management at turndown."))
+    # Hydrate management
+    hydrate = str(surf_concept.get("hydrate_management", "None"))
+    if "MEG" in hydrate:
+        advice.append((
+            "MEG reclamation",
+            "MEG hydrate management needs a topside MEG regeneration + "
+            "reclamation package (lean/rich MEG storage, reboiler, "
+            "flash drum) plus a dosing line in the umbilical. Sizeable "
+            "topside footprint and weight — confirm deck space, "
+            "otherwise a once-through methanol scheme may be the "
+            "pragmatic tie-back choice."))
+    elif "Methanol" in hydrate:
+        advice.append((
+            "Methanol injection",
+            "Once-through methanol needs a topside storage tank + "
+            "injection pumps and a dosing line. Low CAPEX but high "
+            "consumable OPEX and resupply logistics — weigh against "
+            "MEG reclamation over field life."))
+    # Chemicals
+    advice.append((
+        "Chemical injection",
+        "Add or expand topside chemical storage + injection pumps for "
+        "the new subsea wells: scale inhibitor, corrosion inhibitor, "
+        "and (if asphaltene/wax risk) dedicated inhibitor lines in the "
+        "umbilical. Size storage for the planned subsea well count."))
+    # Water handling
+    if not fluid_is_gas:
+        advice.append((
+            "Produced-water handling",
+            "Incremental produced water from the new wells loads the "
+            "host water-treatment train (hydrocyclones + CFU). Check the "
+            "discharge spec at peak water cut; a new compact flotation "
+            "unit or extra cyclone bank is the usual debottleneck."))
+    # Gas handling / export
+    if fluid_is_gas or export_km > 0:
+        advice.append((
+            "Gas compression & export",
+            "Confirm export-compression capacity for the added gas "
+            "(produced + lift gas + flash gas). If the host is "
+            "compression-limited, a new compressor stage or a "
+            "re-wheel of the existing units is needed."))
+    # Control / automation
+    advice.append((
+        "Control & automation (SAS)",
+        f"Integrate the new subsea control system (SCS) into the host "
+        f"SAS — {n_subsea} new wells need topside SCS cabinets, an "
+        "HPU (hydraulic power unit) for the trees, and master control "
+        "station integration. Decide SAS integration vs stand-alone."))
+    # Living quarters / construction
+    advice.append((
+        "Construction & LQ",
+        "A brownfield tie-in campaign needs temporary POB (people on "
+        "board) — confirm spare LQ cabins or plan a temporary flotel. "
+        "Heavy modules may need a construction vessel with a "
+        "heavy-lift crane if the host crane is undersized."))
+    return advice
+
+
 def build_development_concept(spec: dict) -> dict:
     """Build a development concept from a spec dict.
 
@@ -3632,6 +4039,47 @@ def build_development_concept(spec: dict) -> dict:
             heat_label = heating_type
         _push(300, cost_heating, heat_label)
 
+    # ---- Hydrate management (MEG / MeOH) ----
+    # MEG with reclamation is a topside regeneration package plus a
+    # dosing line; methanol once-through is a smaller topside skid but
+    # heavy consumable OPEX (not modelled here — screening CAPEX only).
+    hydrate_mgmt = str(g("hydrate_management", "None"))
+    cost_hydrate = 0.0
+    if "MEG" in hydrate_mgmt:
+        # MEG reclamation + storage scales loosely with throughput;
+        # use a base package plus a per-km dosing-line allowance.
+        cost_hydrate = 85.0 + 0.4 * umbilical_km
+        _push(180, cost_hydrate,
+              "MEG reclamation package + dosing line")
+    elif "Methanol" in hydrate_mgmt:
+        cost_hydrate = 18.0 + 0.15 * umbilical_km
+        _push(180, cost_hydrate,
+              "Methanol injection skid + line")
+
+    # ---- Field architecture adjustment ----
+    # Architecture changes the count of jumpers / spools and whether a
+    # central manifold (PLEM) is needed. We apply a small scope delta
+    # rather than rebuilding the whole layout — enough to differentiate
+    # the concepts on cost at screening level.
+    field_arch = str(g("field_architecture", "Cluster (manifold)"))
+    cost_arch = 0.0
+    if "Satellite" in field_arch:
+        # satellites need a flowline+jumper per well — extra spools
+        cost_arch = 1.2 * max(0, n_subsea_wells - 1)
+        _push(250, cost_arch,
+              "Satellite architecture — extra individual flowline spools")
+    elif "Daisy" in field_arch:
+        # daisy chain is the leanest — small credit
+        cost_arch = -0.6 * max(0, n_subsea_wells - 1)
+        _push(250, cost_arch,
+              "Daisy-chain architecture — reduced flowline count")
+    elif "Inline tees" in field_arch or "PLEM" in field_arch:
+        cost_arch = 6.0   # PLEM structure
+        _push(250, cost_arch, "PLEM / inline-tee structure")
+    elif "Cluster" in field_arch:
+        cost_arch = 9.0   # central manifold
+        _push(250, cost_arch, "Central production manifold (cluster)")
+
     # ---- Concept-type-specific costs --------------------------------------
     cost_host_or_platform = 0.0
     cost_topsides = 0.0
@@ -3643,10 +4091,33 @@ def build_development_concept(spec: dict) -> dict:
         # Host facility modifications
         cost_host_or_platform = _HOST_TIEIN_MOD
         _push(0, cost_host_or_platform, "Host facility modifications (tie-in)")
-        # Installation — heavy for subsea
-        cost_install = 0.30 * (cost_templates + cost_flowline + cost_umbilical
-                               + cost_risers + cost_wet_trees)
-        _push(360, cost_install, "Installation + hook-up + commissioning")
+        # Installation — the base multiplier (0.30 of subsea CAPEX) is
+        # modulated by the chosen flowline-installation method and
+        # tie-in method, which carry very different vessel-spread
+        # day-rates. Reeling is the cheapest; J-lay (deep water) and
+        # diver-assisted tie-ins are the most expensive.
+        _install_method = str(g("flowline_install_method",
+                                 "Reeling (reel-lay)"))
+        _install_mult = {
+            "Reeling (reel-lay)": 1.00,
+            "S-lay": 1.10,
+            "J-lay": 1.30,
+            "Flexible lay": 1.15,
+        }.get(_install_method, 1.0)
+        _tiein_method = str(g("tiein_method",
+                               "Rigid spool + diverless connector"))
+        _tiein_mult = {
+            "Rigid spool + diverless connector": 1.00,
+            "Flexible jumper": 0.95,
+            "Vertical (VxT) connection": 1.05,
+            "Diver-assisted": 1.20,
+        }.get(_tiein_method, 1.0)
+        cost_install = (0.30 * _install_mult * _tiein_mult
+                        * (cost_templates + cost_flowline + cost_umbilical
+                           + cost_risers + cost_wet_trees))
+        _push(360, cost_install,
+              f"Installation + hook-up + commissioning "
+              f"({_install_method}, {_tiein_method})")
         # Tie-in spool / connection at the host
         if host_distance_km > 0:
             tie_spool = 8.0 + 0.15 * host_distance_km
@@ -3753,6 +4224,16 @@ def build_development_concept(spec: dict) -> dict:
         summary.append(("Risers", f"{n_risers} × {riser_type}"))
     if n_boosting:
         summary.append(("Subsea boosting", f"{n_boosting} station(s)"))
+    _fa = g("field_architecture", None)
+    if _fa:
+        summary.append(("Field architecture", _fa))
+    _hm = g("hydrate_management", None)
+    if _hm and _hm != "None":
+        summary.append(("Hydrate management", _hm))
+    if concept_type == "Subsea tie-in":
+        summary.append(("Installation method",
+                         f"{g('flowline_install_method', 'Reeling')} / "
+                         f"{g('tiein_method', 'rigid spool')}"))
     if gas_lift:
         summary.append(("Artificial lift",
                         f"Gas lift ({n_gas_lift_wells} wells)"))
@@ -4143,34 +4624,163 @@ def _concept_schematic_svg(spec: dict, concept_type: str) -> str:
         # Standalone host in the centre
         hx = 320
         host_type = str(g("host_type", ""))
+        # Draw a recognisable host facility based on its type. Each
+        # archetype has a distinct silhouette so the user can tell at a
+        # glance what concept they've selected — an FPSO ship hull, a
+        # semi-sub's twin pontoons + columns, a fixed jacket's braced
+        # legs, a TLP's tensioned tendons, a Spar's deep cylinder.
+        _ht = host_type.lower()
+        deck_y = sea - 46
+        if "fpso" in _ht:
+            # Ship-shaped hull with bow + stern + turret + topsides
+            hull_x, hull_w = hx - 10, 165
+            parts.append(
+                f'<path d="M {hull_x} {sea-6} '
+                f'L {hull_x + hull_w} {sea-6} '
+                f'L {hull_x + hull_w + 18} {sea+8} '
+                f'L {hull_x + hull_w} {sea+22} '
+                f'L {hull_x} {sea+22} '
+                f'L {hull_x - 10} {sea+8} Z" '
+                f'fill="#8a8a8a" stroke="#333" stroke-width="2"/>')
+            # Topsides modules (3 process trains)
+            for k in range(3):
+                parts.append(
+                    f'<rect x="{hull_x + 20 + k*45}" y="{sea-30}" '
+                    f'width="36" height="24" fill="#b0b0b0" '
+                    f'stroke="#333" stroke-width="1"/>')
+            # Turret + riser porch
+            parts.append(
+                f'<circle cx="{hull_x + 14}" cy="{sea+8}" r="6" '
+                f'fill="#666" stroke="#222" stroke-width="1.5"/>')
+            # Spread mooring
+            parts.append(f'<line x1="{hull_x}" y1="{sea+18}" '
+                         f'x2="{hull_x - 70}" y2="{seabed}" '
+                         f'stroke="#555" stroke-width="1.5"/>')
+            parts.append(f'<line x1="{hull_x + hull_w}" y1="{sea+18}" '
+                         f'x2="{hull_x + hull_w + 70}" y2="{seabed}" '
+                         f'stroke="#555" stroke-width="1.5"/>')
+            parts.append(f'<text x="{hull_x + hull_w/2}" y="{sea-36}" '
+                         f'font-size="11" fill="#333" '
+                         f'text-anchor="middle">FPSO</text>')
+        elif "semi" in _ht:
+            # Semi-sub: deck box on 4 columns on 2 pontoons
+            deck_x, deck_w = hx, 150
+            parts.append(f'<rect x="{deck_x}" y="{sea-40}" '
+                         f'width="{deck_w}" height="26" fill="#9a9a9a" '
+                         f'stroke="#333" stroke-width="2"/>')
+            # topside modules
+            for k in range(3):
+                parts.append(f'<rect x="{deck_x+12+k*46}" y="{sea-56}" '
+                             f'width="34" height="18" fill="#b6b6b6" '
+                             f'stroke="#333"/>')
+            # 4 columns down to pontoons (just below sea)
+            pont_y = sea + 36
+            for cx in (deck_x+16, deck_x+deck_w-26):
+                parts.append(f'<rect x="{cx}" y="{sea-14}" width="20" '
+                             f'height="{pont_y-(sea-14)}" fill="#7d7d7d" '
+                             f'stroke="#333" stroke-width="1.5"/>')
+            # pontoons
+            parts.append(f'<rect x="{deck_x+6}" y="{pont_y}" '
+                         f'width="{deck_w-12}" height="14" fill="#6c6c6c" '
+                         f'stroke="#333" stroke-width="1.5"/>')
+            # taut mooring
+            parts.append(f'<line x1="{deck_x+10}" y1="{pont_y+14}" '
+                         f'x2="{deck_x-50}" y2="{seabed}" stroke="#555" '
+                         f'stroke-width="1.5"/>')
+            parts.append(f'<line x1="{deck_x+deck_w-10}" y1="{pont_y+14}" '
+                         f'x2="{deck_x+deck_w+50}" y2="{seabed}" '
+                         f'stroke="#555" stroke-width="1.5"/>')
+            parts.append(f'<text x="{deck_x+deck_w/2}" y="{sea-62}" '
+                         f'font-size="11" fill="#333" '
+                         f'text-anchor="middle">Semi-sub</text>')
+        elif "tlp" in _ht:
+            # TLP: deck on columns with vertical tensioned tendons
+            deck_x, deck_w = hx, 130
+            parts.append(f'<rect x="{deck_x}" y="{sea-40}" '
+                         f'width="{deck_w}" height="26" fill="#9a9a9a" '
+                         f'stroke="#333" stroke-width="2"/>')
+            for k in range(2):
+                parts.append(f'<rect x="{deck_x+18+k*56}" y="{sea-56}" '
+                             f'width="44" height="18" fill="#b6b6b6" '
+                             f'stroke="#333"/>')
+            # columns into the water
+            for cx in (deck_x+18, deck_x+deck_w-34):
+                parts.append(f'<rect x="{cx}" y="{sea-14}" width="16" '
+                             f'height="48" fill="#7d7d7d" stroke="#333"/>')
+            # vertical tendons (taut, straight) to seabed foundations
+            for cx in (deck_x+26, deck_x+deck_w-26):
+                parts.append(f'<line x1="{cx}" y1="{sea+34}" x2="{cx}" '
+                             f'y2="{seabed}" stroke="#444" '
+                             f'stroke-width="2.5"/>')
+                parts.append(f'<rect x="{cx-7}" y="{seabed-3}" width="14" '
+                             f'height="6" fill="#555"/>')
+            parts.append(f'<text x="{deck_x+deck_w/2}" y="{sea-62}" '
+                         f'font-size="11" fill="#333" '
+                         f'text-anchor="middle">TLP</text>')
+        elif "spar" in _ht:
+            # Spar: deck on a single deep vertical cylinder
+            cyl_x = hx + 50
+            parts.append(f'<rect x="{cyl_x-18}" y="{sea-12}" width="36" '
+                         f'height="{seabed-sea-30}" fill="#7d7d7d" '
+                         f'stroke="#333" stroke-width="1.5"/>')
+            parts.append(f'<rect x="{cyl_x-45}" y="{sea-40}" width="90" '
+                         f'height="28" fill="#9a9a9a" stroke="#333" '
+                         f'stroke-width="2"/>')
+            parts.append(f'<rect x="{cyl_x-30}" y="{sea-54}" width="60" '
+                         f'height="16" fill="#b6b6b6" stroke="#333"/>')
+            # catenary mooring
+            parts.append(f'<path d="M {cyl_x-18} {sea+40} Q {cyl_x-80} '
+                         f'{seabed} {cyl_x-110} {seabed}" fill="none" '
+                         f'stroke="#555" stroke-width="1.5"/>')
+            parts.append(f'<path d="M {cyl_x+18} {sea+40} Q {cyl_x+80} '
+                         f'{seabed} {cyl_x+110} {seabed}" fill="none" '
+                         f'stroke="#555" stroke-width="1.5"/>')
+            parts.append(f'<text x="{cyl_x}" y="{sea-60}" font-size="11" '
+                         f'fill="#333" text-anchor="middle">Spar</text>')
+        elif any(k in _ht for k in ("subsea to shore", "tie-back",
+                                     "tie back", "onshore")):
+            # No platform — a small onshore receiving facility on the
+            # right "shore" with a long export/import line.
+            parts.append(f'<rect x="{W-110}" y="{sea-40}" width="90" '
+                         f'height="40" fill="#8a8a8a" stroke="#333" '
+                         f'stroke-width="2"/>')
+            parts.append(f'<text x="{W-65}" y="{sea-46}" font-size="10" '
+                         f'fill="#333" text-anchor="middle">Onshore '
+                         f'plant</text>')
+            parts.append(f'<text x="{W-65}" y="{sea-20}" font-size="9" '
+                         f'fill="white" text-anchor="middle">Process</text>')
+        else:
+            # Generic fixed jacket: deck on braced lattice legs
+            deck_x, deck_w = hx, 120
+            parts.append(f'<rect x="{deck_x}" y="{sea-44}" '
+                         f'width="{deck_w}" height="30" fill="#9a9a9a" '
+                         f'stroke="#333" stroke-width="2"/>')
+            for k in range(2):
+                parts.append(f'<rect x="{deck_x+16+k*52}" y="{sea-60}" '
+                             f'width="40" height="16" fill="#b6b6b6" '
+                             f'stroke="#333"/>')
+            # battered legs
+            leg_l_top, leg_r_top = deck_x+14, deck_x+deck_w-14
+            leg_l_bot, leg_r_bot = deck_x-6, deck_x+deck_w+6
+            parts.append(f'<line x1="{leg_l_top}" y1="{sea-14}" '
+                         f'x2="{leg_l_bot}" y2="{seabed}" stroke="#555" '
+                         f'stroke-width="4"/>')
+            parts.append(f'<line x1="{leg_r_top}" y1="{sea-14}" '
+                         f'x2="{leg_r_bot}" y2="{seabed}" stroke="#555" '
+                         f'stroke-width="4"/>')
+            # X-bracing
+            parts.append(f'<line x1="{leg_l_top}" y1="{(sea+seabed)/2-20}" '
+                         f'x2="{leg_r_bot}" y2="{seabed}" stroke="#777" '
+                         f'stroke-width="1.5"/>')
+            parts.append(f'<line x1="{leg_r_top}" y1="{(sea+seabed)/2-20}" '
+                         f'x2="{leg_l_bot}" y2="{seabed}" stroke="#777" '
+                         f'stroke-width="1.5"/>')
+            parts.append(f'<text x="{deck_x+deck_w/2}" y="{sea-66}" '
+                         f'font-size="11" fill="#333" '
+                         f'text-anchor="middle">'
+                         f'{host_type or "Fixed platform"}</text>')
         floating = any(k in host_type for k in
                        ("FPSO", "Semi", "Spar", "TLP", "Compliant"))
-        if floating:
-            # floating hull
-            parts.append(f'<rect x="{hx}" y="{sea-12}" width="140" height="28" '
-                         f'rx="8" fill="#7a7a7a" stroke="#333" '
-                         f'stroke-width="2"/>')
-            parts.append(f'<rect x="{hx+30}" y="{sea-42}" width="80" '
-                         f'height="30" fill="#9a9a9a" stroke="#333"/>')
-            # mooring lines
-            parts.append(f'<line x1="{hx}" y1="{sea+10}" x2="{hx-90}" '
-                         f'y2="{seabed}" stroke="#555" stroke-width="2"/>')
-            parts.append(f'<line x1="{hx+140}" y1="{sea+10}" x2="{hx+230}" '
-                         f'y2="{seabed}" stroke="#555" stroke-width="2"/>')
-            parts.append(f'<text x="{hx+70}" y="{sea-48}" font-size="11" '
-                         f'fill="#333" text-anchor="middle">'
-                         f'{host_type}</text>')
-        else:
-            # fixed platform
-            parts.append(f'<rect x="{hx+20}" y="{sea-46}" width="100" '
-                         f'height="46" fill="#7a7a7a" stroke="#333" '
-                         f'stroke-width="2"/>')
-            parts.append(f'<line x1="{hx+30}" y1="{sea}" x2="{hx+45}" '
-                         f'y2="{seabed}" stroke="#555" stroke-width="4"/>')
-            parts.append(f'<line x1="{hx+110}" y1="{sea}" x2="{hx+95}" '
-                         f'y2="{seabed}" stroke="#555" stroke-width="4"/>')
-            parts.append(f'<text x="{hx+70}" y="{sea-52}" font-size="11" '
-                         f'fill="#333" text-anchor="middle">{host_type}</text>')
         # Dry wells down through the platform
         if n_dry > 0:
             for i in range(min(n_dry, 6)):

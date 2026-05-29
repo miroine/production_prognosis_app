@@ -6919,6 +6919,39 @@ def economics_section(units, start_date):
                              for wn in _wells_here})
                     # stash for the rest of the app (drilling Gantt etc.)
                     st.session_state["well_template_map"] = dict(_pending)
+        st.markdown("**Flowlines, umbilicals & export**")
+
+        # ---- SURF field architecture (from the SURF long list) ----
+        # Top-level architecture choice that drives flowline routing,
+        # jumper count and PLEM/manifold scope. Mirrors the "SURF
+        # overall — Field architecture" column on the DG1 long list.
+        arch1, arch2 = st.columns(2)
+        field_architecture = arch1.selectbox(
+            "Field architecture (SURF)",
+            ["Cluster (manifold)", "Daisy chain", "Inline tees / PLEM",
+             "Template", "Satellite wells"],
+            index=0, key="dc_field_architecture",
+            help="Cluster — wells around a central manifold, one "
+                 "flowline pair to host (most common). Daisy chain — "
+                 "wells linked in series, fewest flowlines, but one "
+                 "failure isolates downstream. Inline tees / PLEM — "
+                 "wells tie into a trunk line via tees. Template — "
+                 "wells share a structural template + integrated "
+                 "manifold. Satellite — individually tied-back wells, "
+                 "most flowlines/jumpers, max flexibility.")
+        # ---- Hydrate management (MEG / MeOH) ----
+        hydrate_mgmt = arch2.selectbox(
+            "Hydrate management",
+            ["None", "MEG (mono-ethylene glycol) with reclamation",
+             "Methanol (MeOH) once-through", "Insulation / no-touch time only"],
+            index=0, key="dc_hydrate_mgmt",
+            help="MEG with reclamation — a topside MEG regeneration "
+                 "package + dosing line in the umbilical; standard for "
+                 "long wet-gas tie-backs (high CAPEX, low OPEX). "
+                 "Methanol once-through — simpler, no reclamation, but "
+                 "high consumable OPEX. Insulation only — relies on "
+                 "thermal no-touch time, no chemical system.")
+
         rs1, rs2 = st.columns(2)
         riser_type = rs1.selectbox(
             "Riser type",
@@ -6935,7 +6968,7 @@ def economics_section(units, start_date):
                  "over long tie-backs or from low-energy reservoirs "
                  "(~$75MM/station).")
 
-        st.markdown("**Flowlines, umbilicals & export**")
+
         fl1, fl2, fl3 = st.columns(3)
         flowline_km = fl1.number_input(
             "Flowline length (km)", min_value=0.0, value=15.0, step=1.0,
@@ -7015,6 +7048,29 @@ def economics_section(units, start_date):
             value=int(n_subsea_wells), step=1,
             key="dc_n_scm",
             help="One control module per subsea well ($2.5MM each).")
+
+        # ---- Installation method (from the SURF Installation column) ----
+        st.markdown("**Installation method**")
+        inst1, inst2 = st.columns(2)
+        flowline_install = inst1.selectbox(
+            "Flowline installation",
+            ["Reeling (reel-lay)", "S-lay", "J-lay", "Flexible lay"],
+            index=0, key="dc_flowline_install",
+            help="Reeling — fastest/cheapest for rigid pipe up to "
+                 "~16\", spooled onshore. S-lay — high-rate shallow / "
+                 "mid-water. J-lay — deep water, near-vertical "
+                 "departure. Flexible lay — for flexible pipe, "
+                 "vessel-flexible but slower. Drives the pipelay "
+                 "vessel spread day-rate.")
+        tiein_method = inst2.selectbox(
+            "Tie-in method",
+            ["Rigid spool + diverless connector", "Flexible jumper",
+             "Vertical (VxT) connection", "Diver-assisted"],
+            index=0, key="dc_tiein_method",
+            help="Rigid spool — most common, ROV-installed. Flexible "
+                 "jumper — tolerant of misalignment, quicker. Vertical "
+                 "connection — for vertical-bore trees. Diver-assisted "
+                 "— shallow water only, slower/costlier per connection.")
 
         # Topside modification + offshore manpower
         st.markdown("**Topside modification & manpower**")
@@ -7194,6 +7250,10 @@ def economics_section(units, start_date):
             "n_jumpers": n_jumpers,
             "n_control_modules": n_control_modules,
             "n_boosting_stations": n_boosting,
+            "field_architecture": field_architecture,
+            "hydrate_management": hydrate_mgmt,
+            "flowline_install_method": flowline_install,
+            "tiein_method": tiein_method,
             "gas_lift": gas_lift,
             "n_gas_lift_wells": n_gas_lift_wells,
             "heating_type": heating_type,
@@ -7278,6 +7338,41 @@ def economics_section(units, start_date):
                 else:
                     st.success("No engineering red flags — the concept is "
                                "internally consistent.")
+
+            # ---- Topside modification advisor ----
+            # Reads the selected concept and lists the cross-functional
+            # topside scope it implies — exactly the kind of facilities
+            # interface list on an NCS DG1 long-list slide.
+            with st.expander(
+                    "🏗️ Topside modification advisor — what this concept "
+                    "implies for the host", expanded=False):
+                st.caption(
+                    "Screening-level recommendations for the topside "
+                    "scope implied by the SURF / host concept you've "
+                    "selected above. Use as a checklist for the "
+                    "facilities interface register, not as a "
+                    "substitute for a topside feasibility study.")
+                try:
+                    advice = fh.topside_modification_advice({
+                        "concept_type": dc_spec.get("concept_type", ""),
+                        "host_type": dc_spec.get("host_type", ""),
+                        "n_subsea_wells": dc_spec.get("n_subsea_wells", 0),
+                        "n_boosting_stations": dc_spec.get(
+                            "n_boosting_stations", 0),
+                        "gas_lift": dc_spec.get("gas_lift", False),
+                        "heating_type": dc_spec.get("heating_type", "None"),
+                        "hydrate_management": dc_spec.get(
+                            "hydrate_management", "None"),
+                        "export_pipeline_km": dc_spec.get(
+                            "export_pipeline_km", 0),
+                        "flowline_km": dc_spec.get("flowline_km", 0),
+                        "is_gas": (FLUID_SYSTEMS.get(
+                            fluid, {"primary": "oil"})["primary"] == "gas"),
+                    })
+                    for heading, rec in advice:
+                        st.markdown(f"**{heading}** — {rec}")
+                except Exception as _e:
+                    st.info(f"Could not generate topside advice: {_e}")
 
             # ---- Editable cost table ----------------------------------
             # The engine produces benchmark costs per line; the user can
@@ -9612,6 +9707,7 @@ def main():
         "Production", "Cumulatives & RF", "Per-well",
         "Drilling sequence", "Material balance", "Economics",
         "Sensitivity", "Monte Carlo", "Data", "Methodology",
+        "🌳 Concept Selector",
     ])
 
     with tabs[0]:
@@ -10363,7 +10459,12 @@ def main():
                 f"Offshore Directorate) field production records — rounded "
                 f"screening values. {vfld['notes']}")
 
+    with tabs[10]:
+        concept_selector_section(inputs["start_date"])
+
     scenario_compare_section(units, fluid, asm, econ, wells)
+
+    well_planner_section(units, fluid)
 
     portfolio_section(units, fluid, asm)
 
@@ -11067,11 +11168,57 @@ def run_payload_case(payload: dict, default_start_date,
         except Exception:
             be_oil = None
 
+        # Total discounted CAPEX ($MM) — used as the x-axis in the
+        # Concept-comparison bubble chart. We discount each CAPEX month
+        # back to t=0 using the same monthly discount factor the engine
+        # used for NPV, so the value is directly comparable across cases.
+        capex_disc_MM = 0.0
+        try:
+            cap_well = (df_e_s["capex_well"].values.astype(float)
+                        if "capex_well" in df_e_s.columns
+                        else np.zeros(len(df_e_s)))
+            cap_fac = (df_e_s["capex_facility"].values.astype(float)
+                        if "capex_facility" in df_e_s.columns
+                        else np.zeros(len(df_e_s)))
+            cap_total = cap_well + cap_fac
+            # Monthly discount factor matching the engine
+            mr = (1.0 + econ_s.discount_rate) ** (1/12.0) - 1.0
+            disc_factors = np.array(
+                [1.0 / ((1.0 + mr) ** (i + 0.5))
+                 for i in range(len(cap_total))])
+            capex_disc_MM = float((cap_total * disc_factors).sum()) / 1e6
+        except Exception:
+            pass
+
+        # Total CO₂-equivalent emissions across the project life (Mtonnes)
+        co2_total_Mt = None
+        try:
+            if "cum_co2_tonnes" in df_e_s.columns:
+                co2_total_Mt = (float(df_e_s["cum_co2_tonnes"].iloc[-1])
+                                / 1e6)
+            elif "co2_scope1_tonnes" in df_e_s.columns:
+                s1 = (float(df_e_s["co2_scope1_tonnes"].sum())
+                      if "co2_scope1_tonnes" in df_e_s.columns else 0.0)
+                s3 = (float(df_e_s["co2_scope3_tonnes"].sum())
+                      if "co2_scope3_tonnes" in df_e_s.columns else 0.0)
+                co2_total_Mt = (s1 + s3) / 1e6
+        except Exception:
+            pass
+
+        # IRR (annualised) — uses the same helper the headline KPI uses
+        try:
+            irr = compute_irr(df_e_s["cashflow"].values)
+        except Exception:
+            irr = None
+
         res["kpis"] = {
             "npv_MM": npv_MM, "cum_oil_MMstb": cum_oil,
             "cum_gas_Bscf": cum_gas, "final_rf": final_rf,
             "peak_primary_rate": peak_rate, "payback_yrs": payback_yrs,
             "breakeven_oil": be_oil,
+            "capex_disc_MM": capex_disc_MM,
+            "co2_total_Mt": co2_total_Mt,
+            "irr": irr,
         }
         res["df"] = df_s
         res["df_e"] = df_e_s
@@ -13185,5 +13332,1705 @@ def batch_mode_section(units, fluid):
     )
 
 
+# ============================================================================
+# CONCEPT SELECTOR — "Hanging garden" / morphological matrix builder
+# ============================================================================
+# Lets the user lay out a concept long list as columns (dimensions) of
+# alternatives, sweep every combination as a batch run, and colour each
+# selected option-box by the resulting NPV (red → green). Inspired by the
+# DG1 concept-screening matrices used on the NCS.
+
+# Default dimension set — a sensible NCS-style starter the user can edit.
+# Each option's `patches` dict maps session_state keys to override values.
+# When a combination is run, the base payload's `scalar` dict is updated
+# with the patches from each chosen option before run_payload_case is called.
+_DEFAULT_CONCEPT_DIMENSIONS = [
+    {
+        "name": "Drainage strategy",
+        "description": "Recovery mechanism — sets reservoir + injector behaviour.",
+        "options": [
+            {"label": "Depletion",
+             "description": "Primary depletion, no injection. Lowest CAPEX, lower RF.",
+             "patches": {"strategy": "Depletion",
+                          "aq_active": False, "vrr": 0.0, "inj_eff": 0.0}},
+            {"label": "Water injection",
+             "description": "Waterflood with VRR=1, ~85% sweep efficiency.",
+             "patches": {"strategy": "Water injection",
+                          "vrr": 1.0, "inj_eff": 0.85}},
+            {"label": "Gas injection",
+             "description": "Pressure maintenance via lean gas re-injection.",
+             "patches": {"strategy": "Gas injection",
+                          "vrr": 1.0, "inj_eff": 0.80}},
+            {"label": "WAG",
+             "description": "Water-alternating-gas — best EOR sweep.",
+             "patches": {"strategy": "WAG",
+                          "vrr": 1.05, "inj_eff": 0.90}},
+        ],
+    },
+    {
+        "name": "Number of producers",
+        "description": "Drilling programme size.",
+        "options": [
+            {"label": "4 wells", "description": "Minimum viable.",
+             "patches": {"_n_producers_override": 4}},
+            {"label": "6 wells", "description": "Mid-range.",
+             "patches": {"_n_producers_override": 6}},
+            {"label": "8 wells", "description": "Default — balances CAPEX & ramp-up.",
+             "patches": {"_n_producers_override": 8}},
+            {"label": "10 wells", "description": "Aggressive infill.",
+             "patches": {"_n_producers_override": 10}},
+        ],
+    },
+    {
+        "name": "Drilling rig",
+        "description": "Rig class — drives dayrate and CAPEX.",
+        "options": [
+            {"label": "Jack-up", "description": "Low dayrate, shallow water only.",
+             "patches": {"well_cost_mode": "rig_rate", "rig_dayrate": 250.0}},
+            {"label": "Semi-sub",
+             "description": "Mid-range, standard NCS HARSH-environment.",
+             "patches": {"well_cost_mode": "rig_rate", "rig_dayrate": 500.0}},
+            {"label": "Drillship", "description": "Deepwater / high dayrate.",
+             "patches": {"well_cost_mode": "rig_rate", "rig_dayrate": 700.0}},
+        ],
+    },
+    {
+        "name": "Host facility",
+        "description": "Production hub — sets facility CAPEX.",
+        "options": [
+            {"label": "Tie-back to existing",
+             "description": "Cheapest — modest CAPEX on existing host.",
+             "patches": {"_facility_capex_override_MM": 200.0}},
+            {"label": "New FPSO",
+             "description": "Floating production, storage, offloading.",
+             "patches": {"_facility_capex_override_MM": 1700.0}},
+            {"label": "New jacket/platform",
+             "description": "Fixed jacket — typical for shallow shelf.",
+             "patches": {"_facility_capex_override_MM": 1200.0}},
+            {"label": "Subsea to shore",
+             "description": "Long subsea tieback to onshore plant.",
+             "patches": {"_facility_capex_override_MM": 900.0}},
+        ],
+    },
+    {
+        "name": "Oil price scenario",
+        "description": "Flat real Brent assumption.",
+        "options": [
+            {"label": "Low ($55/bbl)", "description": "Down-cycle screening.",
+             "patches": {"oil_price_bbl": 55.0}},
+            {"label": "Base ($75/bbl)", "description": "Mid-cycle reference.",
+             "patches": {"oil_price_bbl": 75.0}},
+            {"label": "High ($95/bbl)", "description": "Up-cycle upside.",
+             "patches": {"oil_price_bbl": 95.0}},
+        ],
+    },
+]
+
+
+def _apply_concept_patches(payload: dict, picks: list) -> dict:
+    """Apply a list of option-patch dicts to a base payload.
+
+    `picks` is a list of {label, patches} dicts (one per dimension).
+    Most patches map directly to session_state scalar keys. A few use
+    magic underscore-prefixed keys that drive table-level overrides
+    (well count, facility CAPEX schedule) — handled here.
+    """
+    import copy
+    p = copy.deepcopy(payload)
+    p.setdefault("scalar", {})
+    for pick in picks:
+        for k, v in pick.get("patches", {}).items():
+            if k.startswith("_n_producers_override"):
+                # Truncate / replicate the producers_df to the desired
+                # well count. Keeps the per-well design (rates, decline)
+                # from the base case but scales producer count.
+                try:
+                    n = int(v)
+                    if "tables" in p and "producers_df" in p["tables"]:
+                        pdf = pd.DataFrame(p["tables"]["producers_df"])
+                        if len(pdf) >= n:
+                            pdf = pdf.iloc[:n].reset_index(drop=True)
+                        else:
+                            # Replicate last row until reaching n
+                            n_need = n - len(pdf)
+                            extra = pd.concat(
+                                [pdf.iloc[[-1]]] * n_need, ignore_index=True)
+                            pdf = pd.concat([pdf, extra], ignore_index=True)
+                        # Renumber
+                        pdf["name"] = [f"P-{i+1:02d}"
+                                        for i in range(len(pdf))]
+                        p["tables"]["producers_df"] = pdf.to_dict("records")
+                except Exception:
+                    pass
+            elif k.startswith("_facility_capex_override_MM"):
+                # Rebuild the facility CAPEX schedule as a single lump
+                # spend on the project start date. The base schedule
+                # ordering is preserved but amounts re-scaled to total
+                # the new figure.
+                try:
+                    new_total = float(v)
+                    if "tables" in p and "fac_df" in p["tables"]:
+                        fac = pd.DataFrame(p["tables"]["fac_df"])
+                        cur_total = (
+                            fac["amount_MMUSD"].astype(float).sum()
+                            if "amount_MMUSD" in fac.columns
+                            else 0.0)
+                        if cur_total > 0:
+                            ratio = new_total / cur_total
+                            fac["amount_MMUSD"] = (
+                                fac["amount_MMUSD"].astype(float) * ratio)
+                        p["tables"]["fac_df"] = fac.to_dict("records")
+                except Exception:
+                    pass
+            else:
+                p["scalar"][k] = v
+    return p
+
+
+def _concept_color_for_npv(npv_MM: float, lo: float, hi: float) -> str:
+    """Return a hex colour on a red→amber→green ramp keyed to NPV ($MM)."""
+    if npv_MM is None:
+        return "#cccccc"
+    if hi <= lo:
+        return "#9ecae1"
+    t = max(0.0, min(1.0, (npv_MM - lo) / (hi - lo)))
+    # Anchor: 0.0 red (#d62728), 0.5 amber (#ff9900), 1.0 green (#2ca02c)
+    if t < 0.5:
+        # red → amber
+        s = t * 2
+        r = int(0xd6 + s * (0xff - 0xd6))
+        g = int(0x27 + s * (0x99 - 0x27))
+        b = int(0x28 + s * (0x00 - 0x28))
+    else:
+        # amber → green
+        s = (t - 0.5) * 2
+        r = int(0xff + s * (0x2c - 0xff))
+        g = int(0x99 + s * (0xa0 - 0x99))
+        b = int(0x00 + s * (0x2c - 0x00))
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _render_concept_garden_svg(dimensions: list, selected: dict,
+                                results_by_pick: dict | None = None) -> str:
+    """SVG of the concept long-list, coloured by NPV when results exist.
+
+    `selected[dim_idx]` = set of option indices the user has ticked for
+    inclusion in the batch. `results_by_pick` is keyed by frozenset of
+    (dim_name, option_label) and holds a dict with `npv_MM` for each
+    combination — used to colour boxes by the BEST NPV that flows
+    through that option.
+    """
+    col_w = 175
+    gap_x = 16
+    header_h = 44
+    row_h = 44
+    row_gap = 8
+    pad = 20
+    n_cols = len(dimensions)
+    max_options = max((len(d["options"]) for d in dimensions), default=1)
+    width = pad * 2 + n_cols * col_w + (n_cols - 1) * gap_x
+    height = pad * 2 + header_h + 12 + (row_h + row_gap) * max_options + 30
+
+    # Compute best NPV per option (so colour reflects best combination
+    # touching that option).
+    best_per_opt = {}      # key: (dim_idx, opt_idx) → npv_MM
+    if results_by_pick:
+        for picks_key, res in results_by_pick.items():
+            npv = res.get("npv_MM")
+            if npv is None:
+                continue
+            for dim_name, label in picks_key:
+                # Find indices
+                for di, d in enumerate(dimensions):
+                    if d["name"] != dim_name:
+                        continue
+                    for oi, o in enumerate(d["options"]):
+                        if o["label"] == label:
+                            key = (di, oi)
+                            cur = best_per_opt.get(key)
+                            if cur is None or npv > cur:
+                                best_per_opt[key] = npv
+        # NPV range across all results
+        all_npvs = [r.get("npv_MM") for r in results_by_pick.values()
+                    if r.get("npv_MM") is not None]
+        npv_lo = min(all_npvs) if all_npvs else 0.0
+        npv_hi = max(all_npvs) if all_npvs else 0.0
+    else:
+        npv_lo = npv_hi = 0.0
+
+    out = [f'<svg viewBox="0 0 {width} {height}" '
+           f'xmlns="http://www.w3.org/2000/svg" '
+           f'style="background:white;border:1px solid #ddd;'
+           f'border-radius:8px;font-family:Helvetica,Arial,sans-serif">']
+    # Title
+    out.append(f'<text x="{pad}" y="22" font-size="13" font-weight="600" '
+               f'fill="#0B3D91">Concept long list — selected options '
+               f'in colour, NPV ramp red → green</text>')
+    # Columns
+    for di, d in enumerate(dimensions):
+        x = pad + di * (col_w + gap_x)
+        # Header bar
+        out.append(f'<rect x="{x}" y="{header_h - 24}" width="{col_w}" '
+                   f'height="28" fill="#2c7fb8" rx="4"/>')
+        # Wrap title if needed
+        title = d["name"]
+        if len(title) > 22:
+            title = title[:21] + "…"
+        out.append(f'<text x="{x + col_w/2}" y="{header_h - 6}" '
+                   f'font-size="11" font-weight="700" fill="white" '
+                   f'text-anchor="middle">{title}</text>')
+        # Options
+        for oi, opt in enumerate(d["options"]):
+            y = header_h + 12 + oi * (row_h + row_gap)
+            is_selected = oi in selected.get(di, set())
+            # Colour: if results exist for this option, use NPV ramp;
+            # else neutral (selected = blue, unselected = grey).
+            best_npv = best_per_opt.get((di, oi))
+            if is_selected and best_npv is not None:
+                fill = _concept_color_for_npv(best_npv, npv_lo, npv_hi)
+                stroke = "#0B3D91"
+                stroke_w = 2
+                text_color = "#000"
+            elif is_selected:
+                fill = "#dde9f5"
+                stroke = "#0B3D91"
+                stroke_w = 2
+                text_color = "#0B3D91"
+            else:
+                fill = "#f4f4f4"
+                stroke = "#ccc"
+                stroke_w = 1
+                text_color = "#666"
+            out.append(
+                f'<rect x="{x}" y="{y}" width="{col_w}" height="{row_h}" '
+                f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_w}" '
+                f'rx="4"/>')
+            # Option label — split into two lines if it has a space and is long
+            label = opt["label"]
+            if len(label) <= 22:
+                out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 + 4}" '
+                           f'font-size="11" font-weight="600" '
+                           f'fill="{text_color}" text-anchor="middle">'
+                           f'{label}</text>')
+            else:
+                # Split at midpoint space
+                mid = len(label) // 2
+                space = label.find(" ", mid - 4)
+                if space == -1:
+                    space = mid
+                l1, l2 = label[:space].strip(), label[space:].strip()
+                out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 - 2}" '
+                           f'font-size="10" font-weight="600" '
+                           f'fill="{text_color}" text-anchor="middle">'
+                           f'{l1}</text>')
+                out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 + 12}" '
+                           f'font-size="10" font-weight="600" '
+                           f'fill="{text_color}" text-anchor="middle">'
+                           f'{l2}</text>')
+            # NPV badge if results exist
+            if is_selected and best_npv is not None:
+                out.append(
+                    f'<text x="{x + col_w - 8}" y="{y + 14}" '
+                    f'font-size="9" font-weight="700" fill="#222" '
+                    f'text-anchor="end">${best_npv:,.0f}MM</text>')
+    # Colour legend at the bottom
+    if results_by_pick and npv_hi > npv_lo:
+        legy = height - 20
+        for i in range(50):
+            t = i / 49
+            c = _concept_color_for_npv(npv_lo + t * (npv_hi - npv_lo),
+                                        npv_lo, npv_hi)
+            out.append(f'<rect x="{pad + i*4}" y="{legy}" width="4" '
+                       f'height="8" fill="{c}"/>')
+        out.append(f'<text x="{pad}" y="{legy - 3}" font-size="9" '
+                   f'fill="#666">${npv_lo:,.0f}MM (worst)</text>')
+        out.append(f'<text x="{pad + 200}" y="{legy - 3}" font-size="9" '
+                   f'fill="#666">${npv_hi:,.0f}MM (best)</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def well_planner_section(units, fluid):
+    """Interactive well + completion designer with a cross-section view."""
+    with st.expander("🛠️ Well Planner — design a well & its completion",
+                      expanded=False):
+        st.caption(
+            "Design a representative well and see its cross-section and "
+            "completion schematic. This is a design aid for the concept "
+            "phase — it sketches the wellbore architecture, casing "
+            "programme, completion type and artificial lift so you can "
+            "sense-check the well concept and communicate it. It does "
+            "not feed the production engine (that uses the per-well "
+            "table); think of it as the drawing board.")
+
+        is_metric = (units == "metric")
+        depth_unit = "m" if is_metric else "ft"
+        # depth conversion: engine schematic works in metres
+        d2m = (1.0 if is_metric else 0.3048)
+
+        c1, c2, c3 = st.columns(3)
+        well_type = c1.selectbox(
+            "Well type", ["Vertical", "Deviated", "Horizontal"],
+            index=1, key="wp_well_type",
+            help="Trajectory archetype. Horizontal maximises reservoir "
+                 "contact; deviated reaches offset targets; vertical is "
+                 "simplest and cheapest.")
+        is_injector = c2.selectbox(
+            "Well role", ["Producer", "Injector"],
+            key="wp_role") == "Injector"
+        artificial = c3.selectbox(
+            "Artificial lift",
+            ["None", "Gas lift", "ESP", "HSP"],
+            key="wp_lift",
+            help="Gas lift — robust, wide rate range, needs lift-gas. "
+                 "ESP — high rate, efficient, workover-intensive. "
+                 "HSP — hydraulic submersible, deep/hot wells.")
+
+        c4, c5, c6 = st.columns(3)
+        wd_disp = c4.number_input(
+            f"Water depth ({depth_unit}, 0 = dry/platform)",
+            value=(110.0 if is_metric else 360.0),
+            min_value=0.0, key="wp_wd")
+        td_disp = c5.number_input(
+            f"Total depth ({depth_unit} MD)",
+            value=(2600.0 if is_metric else 8530.0),
+            min_value=100.0, key="wp_td")
+        n_casing = c6.selectbox(
+            "Casing strings", [2, 3, 4], index=1, key="wp_casing",
+            help="Conductor + surface + (intermediate) + production. "
+                 "More strings for HPHT, deep, or troublesome holes.")
+
+        c7, c8, c9 = st.columns(3)
+        res_top_disp = c7.number_input(
+            f"Reservoir top ({depth_unit} TVD)",
+            value=(2100.0 if is_metric else 6890.0),
+            min_value=50.0, key="wp_restop")
+        res_thick_disp = c8.number_input(
+            f"Reservoir thickness ({depth_unit})",
+            value=(150.0 if is_metric else 490.0),
+            min_value=1.0, key="wp_resthick")
+        zonal = c9.selectbox(
+            "Zonal isolation",
+            ["None", "Single packer", "Smart (multi-zone)"],
+            index=1, key="wp_zonal",
+            help="Single packer — one production zone. Smart — "
+                 "multi-zone with inflow-control valves for selective "
+                 "production / shut-off.")
+
+        # Completion type — the menu depends on producer vs injector and
+        # the formation competence the user expects.
+        completion = st.selectbox(
+            "Lower completion type",
+            ["Open hole", "Cased & perforated", "Slotted liner",
+             "Screens / gravel pack", "Frac-pack"],
+            index=1, key="wp_completion",
+            help="Open hole — cheapest, competent rock only. "
+                 "Cased & perforated — most common, good zonal control. "
+                 "Slotted liner — sand-prone, low cost. "
+                 "Screens / gravel pack — unconsolidated sand control. "
+                 "Frac-pack — sand control + productivity in "
+                 "high-permeability sands.")
+
+        # Build the schematic spec (convert to metres for the renderer)
+        wp_spec = {
+            "well_type": well_type,
+            "water_depth_m": wd_disp * d2m,
+            "td_m": td_disp * d2m,
+            "reservoir_top_m": res_top_disp * d2m,
+            "reservoir_thick_m": res_thick_disp * d2m,
+            "n_casing": int(n_casing),
+            "completion_type": completion,
+            "artificial_lift": artificial,
+            "zonal_isolation": zonal,
+            "is_injector": is_injector,
+        }
+        try:
+            svg = fh.build_well_completion_svg(wp_spec)
+            colA, colB = st.columns([3, 2])
+            with colA:
+                st.image(_svg_to_data_uri(svg), use_container_width=True)
+                st.caption(
+                    "Schematic cross-section — not to scale. Casing "
+                    "strings (grey, telescoping), cement (light grey "
+                    "annulus), tubing (green producer / blue injector), "
+                    "packer(s), the lower completion across the "
+                    "reservoir, artificial lift and the wellhead/tree.")
+            with colB:
+                st.markdown("**Design notes**")
+                # Contextual guidance based on selections
+                notes = []
+                if completion == "Open hole" and not is_injector:
+                    notes.append(
+                        "Open hole gives the lowest skin but no zonal "
+                        "control and no sand management — only for "
+                        "competent, consolidated rock.")
+                if completion in ("Screens / gravel pack", "Frac-pack"):
+                    notes.append(
+                        "Sand-control completion selected — confirm the "
+                        "formation is unconsolidated enough to need it; "
+                        "it adds cost and restricts future intervention.")
+                if artificial == "ESP":
+                    notes.append(
+                        "ESP gives high rates but is the most workover-"
+                        "intensive lift; plan for pump replacement every "
+                        "3-5 years in the OPEX.")
+                if artificial == "Gas lift":
+                    notes.append(
+                        "Gas lift needs a lift-gas source and topside "
+                        "compression — see the Topside advisor under the "
+                        "concept builder.")
+                if well_type == "Horizontal":
+                    notes.append(
+                        "Horizontal well maximises reservoir contact and "
+                        "lowers drawdown per unit rate — good for thin "
+                        "oil rims and coning-prone reservoirs.")
+                if zonal.startswith("Smart"):
+                    notes.append(
+                        "Smart completion enables selective zonal "
+                        "production / water shut-off without "
+                        "intervention — high value in multi-layered or "
+                        "water-drive reservoirs, at higher capex.")
+                if int(n_casing) >= 4:
+                    notes.append(
+                        "Four casing strings suggest an HPHT or deep "
+                        "well — confirm the casing-design basis and "
+                        "consider a tapered production string.")
+                if not notes:
+                    notes.append(
+                        "A conventional cased-and-perforated completion "
+                        "with a single packer — the workhorse design for "
+                        "most clastic NCS reservoirs.")
+                for n in notes:
+                    st.markdown(f"- {n}")
+        except Exception as _e:
+            st.info(f"Could not render the well schematic: {_e}")
+
+
+def concept_selector_section(default_start_date):
+    """Render the Concept Selector tab.
+
+    The data model lives in st.session_state['concept_dimensions'] as a list
+    of dimension dicts. Selected options for batch run live in
+    st.session_state['concept_selected'] as {dim_idx: set(opt_idx)}.
+    Results live in st.session_state['concept_results'] keyed by the
+    frozen-set of (dim_name, opt_label) tuples for that combination.
+    """
+    st.markdown("### 🌳 Concept Selector — hanging-garden batch builder")
+    st.caption(
+        "Define the concept dimensions as columns of alternatives, tick the "
+        "options you want sweep-tested, hit **Run batch**. Every combination "
+        "is simulated against the current base case (sidebar inputs serve as "
+        "defaults); each option box is then coloured by the best NPV that "
+        "passes through it — red for the worst case, green for the best. "
+        "Inspired by the DG1 concept long-list / morphological matrix used "
+        "on the NCS.")
+
+    # ---- Initialise state ----
+    if "concept_dimensions" not in st.session_state:
+        import copy
+        st.session_state["concept_dimensions"] = copy.deepcopy(
+            _DEFAULT_CONCEPT_DIMENSIONS)
+    if "concept_selected" not in st.session_state:
+        # Default: tick every option in every dimension so the user sees
+        # a full grid immediately. They can untick to narrow the sweep.
+        st.session_state["concept_selected"] = {
+            di: set(range(len(d["options"])))
+            for di, d in enumerate(st.session_state["concept_dimensions"])
+        }
+    if "concept_results" not in st.session_state:
+        st.session_state["concept_results"] = {}
+
+    dimensions = st.session_state["concept_dimensions"]
+    selected = st.session_state["concept_selected"]
+    results = st.session_state["concept_results"]
+
+    # ---- Top toolbar ----
+    tb1, tb2, tb3, tb4 = st.columns([2, 2, 2, 3])
+    if tb1.button("➕ Add dimension", key="concept_add_dim",
+                   use_container_width=True):
+        dimensions.append({
+            "name": f"New dimension {len(dimensions)+1}",
+            "description": "",
+            "options": [
+                {"label": "Option A", "description": "", "patches": {}},
+                {"label": "Option B", "description": "", "patches": {}},
+            ],
+        })
+        selected[len(dimensions) - 1] = {0, 1}
+        st.rerun()
+    if tb2.button("🔄 Reset to NCS default", key="concept_reset",
+                   use_container_width=True,
+                   help="Replace the current concept matrix with the NCS-"
+                        "style default starter."):
+        import copy
+        st.session_state["concept_dimensions"] = copy.deepcopy(
+            _DEFAULT_CONCEPT_DIMENSIONS)
+        st.session_state["concept_selected"] = {
+            di: set(range(len(d["options"])))
+            for di, d in enumerate(st.session_state["concept_dimensions"])
+        }
+        st.session_state["concept_results"] = {}
+        st.rerun()
+    if tb3.button("🧹 Clear results", key="concept_clear_results",
+                   use_container_width=True,
+                   help="Clear the last batch results — boxes return to "
+                        "neutral colours."):
+        st.session_state["concept_results"] = {}
+        st.rerun()
+
+    # Combination count + run button
+    n_combos = 1
+    for di, d in enumerate(dimensions):
+        n_picks = len(selected.get(di, set()))
+        n_combos *= max(1, n_picks)
+    tb4.metric("Combinations to run", f"{n_combos:,}",
+               help="Product of selected options across dimensions. Each "
+                    "combination triggers one full simulation + economics "
+                    "evaluation.")
+
+    # ---- The garden view ----
+    svg = _render_concept_garden_svg(dimensions, selected, results)
+    st.markdown(f'<div style="overflow-x:auto;width:100%">{svg}</div>',
+                 unsafe_allow_html=True)
+
+    # ---- Edit / pick UI in expanders, one per dimension ----
+    st.markdown("#### Dimension editor & option picker")
+    st.caption(
+        "Edit each dimension's options below. Patches are key/value pairs "
+        "applied to the base case (e.g. `oil_price_bbl: 55`). Special "
+        "keys: `_n_producers_override` (replicates/truncates the producers "
+        "table to N wells), `_facility_capex_override_MM` (rescales the "
+        "facility CAPEX schedule to a new total).")
+    dim_to_remove = None
+    for di, d in enumerate(dimensions):
+        with st.expander(f"📦  **{d['name']}** "
+                          f"— {len(d['options'])} options, "
+                          f"{len(selected.get(di, set()))} ticked",
+                          expanded=False):
+            ec1, ec2, ec3 = st.columns([3, 4, 1])
+            new_name = ec1.text_input(
+                "Dimension name", value=d["name"],
+                key=f"concept_dim_{di}_name")
+            new_desc = ec2.text_input(
+                "Description (optional)", value=d.get("description", ""),
+                key=f"concept_dim_{di}_desc")
+            d["name"] = new_name
+            d["description"] = new_desc
+            if ec3.button("🗑️", key=f"concept_dim_{di}_del",
+                           help="Delete this entire dimension"):
+                dim_to_remove = di
+            st.markdown("---")
+            opt_to_remove = None
+            for oi, opt in enumerate(d["options"]):
+                oc1, oc2, oc3, oc4, oc5 = st.columns([0.6, 2, 3, 3, 0.6])
+                # Selection checkbox
+                is_sel = oi in selected.get(di, set())
+                new_sel = oc1.checkbox(
+                    "✓", value=is_sel,
+                    key=f"concept_pick_{di}_{oi}",
+                    label_visibility="collapsed",
+                    help="Include this option in the batch sweep.")
+                if new_sel and not is_sel:
+                    selected.setdefault(di, set()).add(oi)
+                elif (not new_sel) and is_sel:
+                    selected.setdefault(di, set()).discard(oi)
+                opt["label"] = oc2.text_input(
+                    "Label", value=opt["label"],
+                    key=f"concept_opt_{di}_{oi}_label",
+                    label_visibility="collapsed")
+                opt["description"] = oc3.text_input(
+                    "Description", value=opt.get("description", ""),
+                    key=f"concept_opt_{di}_{oi}_desc",
+                    label_visibility="collapsed",
+                    placeholder="Short description")
+                # Patches as a YAML-like inline string for compactness.
+                # Stored as dict internally; rendered/edited as
+                # `key: value, key: value` text.
+                cur_patch_str = ", ".join(
+                    f"{k}: {v}" for k, v in opt.get("patches", {}).items())
+                new_patch_str = oc4.text_input(
+                    "Patches", value=cur_patch_str,
+                    key=f"concept_opt_{di}_{oi}_patches",
+                    label_visibility="collapsed",
+                    placeholder="oil_price_bbl: 55, well_cost_mode: rig_rate",
+                    help="Comma-separated `key: value` overrides applied "
+                         "to the base case scalar state.")
+                # Parse patches back to dict
+                parsed = {}
+                for pair in new_patch_str.split(","):
+                    if ":" not in pair:
+                        continue
+                    k, v = pair.split(":", 1)
+                    k, v = k.strip(), v.strip()
+                    if not k:
+                        continue
+                    # Type inference
+                    try:
+                        v_typed = float(v)
+                        if v_typed.is_integer() and "." not in v:
+                            v_typed = int(v_typed)
+                    except ValueError:
+                        if v.lower() in ("true", "false"):
+                            v_typed = (v.lower() == "true")
+                        else:
+                            v_typed = v
+                    parsed[k] = v_typed
+                opt["patches"] = parsed
+                if oc5.button("✖", key=f"concept_opt_{di}_{oi}_del",
+                               help="Delete this option"):
+                    opt_to_remove = oi
+            if opt_to_remove is not None:
+                d["options"].pop(opt_to_remove)
+                # Re-key selections
+                new_sel = set()
+                for oi in selected.get(di, set()):
+                    if oi < opt_to_remove:
+                        new_sel.add(oi)
+                    elif oi > opt_to_remove:
+                        new_sel.add(oi - 1)
+                selected[di] = new_sel
+                st.rerun()
+            if st.button("➕ Add option", key=f"concept_opt_add_{di}"):
+                d["options"].append({
+                    "label": f"Option {chr(65 + len(d['options']))}",
+                    "description": "", "patches": {}})
+                selected.setdefault(di, set()).add(len(d["options"]) - 1)
+                st.rerun()
+    if dim_to_remove is not None:
+        dimensions.pop(dim_to_remove)
+        # Re-key selections
+        new_selected = {}
+        for di, opts in selected.items():
+            if di < dim_to_remove:
+                new_selected[di] = opts
+            elif di > dim_to_remove:
+                new_selected[di - 1] = opts
+        st.session_state["concept_selected"] = new_selected
+        st.rerun()
+
+    # ---- Run batch ----
+    st.markdown("---")
+    run_c1, run_c2 = st.columns([2, 5])
+    do_run = run_c1.button(
+        f"🚀 Run batch ({n_combos:,} combos)",
+        type="primary", use_container_width=True,
+        disabled=(n_combos == 0))
+    if n_combos > 200:
+        run_c2.warning(
+            f"**{n_combos:,} combinations** — this will take a while. "
+            f"Consider narrowing the sweep before pressing Run.")
+    elif n_combos > 50:
+        run_c2.info(
+            f"Sweeping {n_combos:,} combinations; expect "
+            f"~{n_combos * 1.5:.0f}s on Streamlit Cloud.")
+    if do_run:
+        # Build the base payload from the current sidebar state
+        try:
+            base_payload = collect_inputs_payload()
+        except Exception as e:
+            st.error(f"Could not snapshot the base case: {e}")
+            return
+        # Enumerate combinations
+        import itertools
+        picks_lists = []
+        for di, d in enumerate(dimensions):
+            sel_idxs = sorted(selected.get(di, set()))
+            if not sel_idxs:
+                continue
+            picks_lists.append([(d["name"], d["options"][oi])
+                                 for oi in sel_idxs])
+        results_new = {}
+        progress = st.progress(0.0, text="Running batch…")
+        total = 1
+        for L in picks_lists:
+            total *= len(L)
+        done = 0
+        for combo in itertools.product(*picks_lists):
+            picks_for_apply = [
+                {"label": opt["label"], "patches": opt.get("patches", {})}
+                for _, opt in combo]
+            patched = _apply_concept_patches(base_payload, picks_for_apply)
+            # Name = dimension labels joined
+            name = " · ".join(opt["label"] for _, opt in combo)
+            patched.setdefault("_meta", {})["name"] = name
+            try:
+                res = run_payload_case(patched, default_start_date,
+                                        default_units=st.session_state.get(
+                                            "units", "field"))
+                if res.get("ok"):
+                    kpis = res.get("kpis", {})
+                    npv = kpis.get("npv_USD") or kpis.get("npv_MM")
+                    if npv is not None and npv > 1e6:
+                        npv_MM = npv / 1e6
+                    else:
+                        npv_MM = npv
+                    cum_primary = kpis.get("cum_primary")
+                    rf = kpis.get("final_rf")
+                    irr = kpis.get("irr")
+                    breakeven = kpis.get("breakeven_oil")
+                    capex_disc_MM = kpis.get("capex_disc_MM")
+                    co2_total_Mt = kpis.get("co2_total_Mt")
+                else:
+                    npv_MM = cum_primary = rf = irr = breakeven = None
+                    capex_disc_MM = co2_total_Mt = None
+                key = frozenset((dn, opt["label"]) for dn, opt in combo)
+                results_new[key] = {
+                    "name": name,
+                    "npv_MM": npv_MM,
+                    "cum_primary": cum_primary,
+                    "final_rf": rf,
+                    "irr": irr,
+                    "breakeven_oil": breakeven,
+                    "capex_disc_MM": capex_disc_MM,
+                    "co2_total_Mt": co2_total_Mt,
+                    "picks": [(dn, opt["label"]) for dn, opt in combo],
+                    "ok": res.get("ok", False),
+                    "error": res.get("error"),
+                }
+            except Exception as e:
+                key = frozenset((dn, opt["label"]) for dn, opt in combo)
+                results_new[key] = {
+                    "name": name, "npv_MM": None, "cum_primary": None,
+                    "final_rf": None, "irr": None, "breakeven_oil": None,
+                    "capex_disc_MM": None, "co2_total_Mt": None,
+                    "picks": [(dn, opt["label"]) for dn, opt in combo],
+                    "ok": False, "error": str(e),
+                }
+            done += 1
+            progress.progress(done / max(total, 1),
+                               text=f"Running batch… {done}/{total}")
+        progress.empty()
+        st.session_state["concept_results"] = results_new
+        st.success(f"Completed {done}/{total} combinations.")
+        st.rerun()
+
+    # ---- Results table ----
+    if results:
+        st.markdown("---")
+        st.markdown("#### 📊 Batch results")
+        rows = []
+        for key, r in results.items():
+            row = {"Combination": r.get("name", "")}
+            for dim_name, label in key:
+                row[dim_name] = label
+            row["NPV ($MM)"] = (f"{r['npv_MM']:,.0f}"
+                                 if r.get("npv_MM") is not None else "—")
+            row["IRR"] = (f"{r['irr']:.1%}"
+                          if r.get("irr") is not None else "—")
+            row["Final RF"] = (f"{r['final_rf']:.1%}"
+                                if r.get("final_rf") is not None else "—")
+            row["BE oil ($/bbl)"] = (f"{r['breakeven_oil']:.1f}"
+                                      if r.get("breakeven_oil") is not None
+                                      else "—")
+            row["Status"] = "✅" if r.get("ok") else "❌"
+            rows.append(row)
+        df_res = pd.DataFrame(rows)
+        # Sort by NPV descending if present
+        try:
+            df_res["_sort"] = df_res["NPV ($MM)"].str.replace(
+                "[,—]", "", regex=True)
+            df_res["_sort"] = pd.to_numeric(df_res["_sort"], errors="coerce")
+            df_res = df_res.sort_values(
+                "_sort", ascending=False, na_position="last")
+            df_res = df_res.drop(columns=["_sort"])
+        except Exception:
+            pass
+        st.dataframe(df_res, use_container_width=True, hide_index=True)
+        # CSV download
+        csv = df_res.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "📥 Download results (CSV)", data=csv,
+            file_name="concept_batch_results.csv", mime="text/csv")
+        # Errors expander
+        errs = [(r["name"], r["error"]) for r in results.values()
+                if not r.get("ok") and r.get("error")]
+        if errs:
+            with st.expander(f"⚠️ {len(errs)} combinations failed — details"):
+                for name, err in errs:
+                    st.markdown(f"**{name}** — `{err}`")
+
+        # ============================================================
+        # CONCEPT COMPARISON CHART
+        # ============================================================
+        # NPV post-tax vs total discounted CAPEX, with P10/Mean/P90
+        # markers per "concept" and emissions on the secondary axis.
+        # The user defines "concepts" by grouping combinations along
+        # one chosen dimension — e.g. group by Host facility to compare
+        # FPSO vs Tie-back vs Jacket, with each concept's P90/Mean/P10
+        # showing the spread across the OTHER dimensions.
+        st.markdown("---")
+        st.markdown("#### 🎯 Concept Comparison — NPV vs CAPEX, "
+                    "P90 / Mean / P10 by concept")
+        st.caption(
+            "Group the batch results into named concepts along one "
+            "dimension. Each concept gets three markers — **P90** "
+            "(downside), **Mean**, **P10** (upside) — plotted as NPV "
+            "post-tax against total discounted CAPEX, with the "
+            "concept's lifetime CO₂ emissions on the right axis. "
+            "Reads like the classic NCS DG1 concept-comparison "
+            "chart. Pick which dimension defines the concept "
+            "groupings below.")
+
+        # Dimension chooser — which dimension defines the concept
+        dim_names = [d["name"] for d in dimensions]
+        # Persist grouping choice across reruns
+        grp_key = "concept_compare_group_dim"
+        cur_grp = st.session_state.get(grp_key, dim_names[0] if dim_names else "")
+        if cur_grp not in dim_names and dim_names:
+            cur_grp = dim_names[0]
+        grouping_dim = st.selectbox(
+            "Group concepts by",
+            options=dim_names,
+            index=dim_names.index(cur_grp) if cur_grp in dim_names else 0,
+            key=grp_key,
+            help="Each value of this dimension becomes one concept; "
+                 "the P90/Mean/P10 spread is computed across every "
+                 "combination of the OTHER dimensions.")
+
+        # Optional concept-label rewrites (e.g. "FPSO" → "Recommended
+        # Concept"). Stored as JSON-ish dict in session_state.
+        rename_key = f"concept_compare_renames_{grouping_dim}"
+        if rename_key not in st.session_state:
+            st.session_state[rename_key] = {}
+        # Build the group → list-of-results mapping
+        groups = {}  # concept_label → list of result dicts
+        for r in results.values():
+            if not r.get("ok"):
+                continue
+            picks_dict = dict(r.get("picks", []))
+            grp_value = picks_dict.get(grouping_dim, "?")
+            disp_label = st.session_state[rename_key].get(
+                grp_value, grp_value)
+            groups.setdefault(disp_label, []).append(r)
+
+        # Optional renaming UI
+        with st.expander("🏷️ Rename concepts (optional)", expanded=False):
+            st.caption(
+                "Override the auto-generated concept labels — e.g. tag "
+                "your favourite case as 'Recommended Concept' so it "
+                "stands out on the chart.")
+            for raw_label in sorted({dict(r.get("picks", [])).get(
+                    grouping_dim, "?") for r in results.values()
+                    if r.get("ok")}):
+                new_lbl = st.text_input(
+                    f"'{raw_label}' →",
+                    value=st.session_state[rename_key].get(
+                        raw_label, raw_label),
+                    key=f"concept_rename_{grouping_dim}_{raw_label}")
+                st.session_state[rename_key][raw_label] = new_lbl
+
+        # Per-concept selector — which concepts to actually plot
+        plot_concepts_key = f"concept_compare_plot_{grouping_dim}"
+        all_concepts = list(groups.keys())
+        if not all_concepts:
+            st.info("No successful results to chart. Run a batch first.")
+        else:
+            picked_concepts = st.multiselect(
+                "Concepts to plot",
+                options=all_concepts,
+                default=st.session_state.get(plot_concepts_key,
+                                              all_concepts),
+                key=plot_concepts_key,
+                help="Untick any concept you want to hide from the "
+                     "chart (e.g. clearly dominated alternatives).")
+
+            # Compute P90/Mean/P10 per concept
+            import numpy as np
+            chart_rows = []
+            for label in picked_concepts:
+                rs = groups.get(label, [])
+                npvs = np.array(
+                    [r["npv_MM"] for r in rs
+                     if r.get("npv_MM") is not None], dtype=float)
+                capexes = np.array(
+                    [r["capex_disc_MM"] for r in rs
+                     if r.get("capex_disc_MM") is not None], dtype=float)
+                bes = np.array(
+                    [r["breakeven_oil"] for r in rs
+                     if r.get("breakeven_oil") is not None], dtype=float)
+                emissions = np.array(
+                    [r["co2_total_Mt"] for r in rs
+                     if r.get("co2_total_Mt") is not None], dtype=float)
+                if len(npvs) == 0:
+                    continue
+                # P90 = downside (10th pct), P10 = upside (90th pct) —
+                # petroleum convention (P90 is the value 90% of cases
+                # exceed; equivalent to the 10th percentile of the
+                # underlying distribution).
+                p90 = float(np.percentile(npvs, 10))
+                p10 = float(np.percentile(npvs, 90))
+                mean_npv = float(np.mean(npvs))
+                # CAPEX representative: the median of the CAPEX values
+                # in this group (CAPEX is dominated by the facility +
+                # well count, not the price/strategy distribution).
+                cap_med = (float(np.median(capexes)) if len(capexes)
+                            else 0.0)
+                be_med = (float(np.median(bes)) if len(bes) else None)
+                em_med = (float(np.median(emissions)) if len(emissions)
+                            else None)
+                chart_rows.append({
+                    "concept": label,
+                    "p90": p90, "mean": mean_npv, "p10": p10,
+                    "capex_disc_MM": cap_med,
+                    "breakeven_oil": be_med,
+                    "emissions_Mt": em_med,
+                    "n_cases": len(npvs),
+                })
+
+            if not chart_rows:
+                st.info("Selected concepts have no successful results.")
+            else:
+                # Build the figure: NPV markers on the left axis, emissions
+                # bars on the right axis, both keyed by CAPEX on the x.
+                fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Plot P90/Mean/P10 as three points per concept, stacked
+                # vertically, with the mean labelled. Use the project's
+                # green palette to echo the reference chart.
+                colors_npv = ["#2ca02c", "#2ca02c", "#2ca02c"]
+                # P90 — lower point
+                fig_cc.add_trace(go.Scatter(
+                    x=[r["capex_disc_MM"] for r in chart_rows],
+                    y=[r["p90"] for r in chart_rows],
+                    mode="markers+text",
+                    name="P90 (downside)",
+                    marker=dict(size=14, color=colors_npv[0],
+                                 line=dict(color="black", width=1)),
+                    text=[f"P90 — {r['concept']}" for r in chart_rows],
+                    textposition="middle right",
+                    textfont=dict(size=10),
+                    hovertemplate=(
+                        "<b>%{text}</b><br>"
+                        "CAPEX: $%{x:,.0f}MM<br>"
+                        "NPV P90: $%{y:,.0f}MM<extra></extra>"),
+                ), secondary_y=False)
+                # Mean — middle point
+                fig_cc.add_trace(go.Scatter(
+                    x=[r["capex_disc_MM"] for r in chart_rows],
+                    y=[r["mean"] for r in chart_rows],
+                    mode="markers+text",
+                    name="Mean",
+                    marker=dict(size=18, color=colors_npv[1],
+                                 line=dict(color="black", width=1.5),
+                                 symbol="circle"),
+                    text=[f"<b>{r['concept']}</b>" for r in chart_rows],
+                    textposition="middle right",
+                    textfont=dict(size=11, color="black"),
+                    hovertemplate=(
+                        "<b>%{text}</b><br>"
+                        "CAPEX: $%{x:,.0f}MM<br>"
+                        "NPV mean: $%{y:,.0f}MM<extra></extra>"),
+                ), secondary_y=False)
+                # P10 — upper point
+                fig_cc.add_trace(go.Scatter(
+                    x=[r["capex_disc_MM"] for r in chart_rows],
+                    y=[r["p10"] for r in chart_rows],
+                    mode="markers+text",
+                    name="P10 (upside)",
+                    marker=dict(size=14, color=colors_npv[2],
+                                 line=dict(color="black", width=1)),
+                    text=[f"P10 — {r['concept']}" for r in chart_rows],
+                    textposition="middle right",
+                    textfont=dict(size=10),
+                    hovertemplate=(
+                        "<b>%{text}</b><br>"
+                        "CAPEX: $%{x:,.0f}MM<br>"
+                        "NPV P10: $%{y:,.0f}MM<extra></extra>"),
+                ), secondary_y=False)
+
+                # Vertical bracket lines connecting P90 → P10 per concept
+                for r in chart_rows:
+                    fig_cc.add_trace(go.Scatter(
+                        x=[r["capex_disc_MM"], r["capex_disc_MM"]],
+                        y=[r["p90"], r["p10"]],
+                        mode="lines",
+                        line=dict(color="#888", width=1, dash="dot"),
+                        showlegend=False,
+                        hoverinfo="skip",
+                    ), secondary_y=False)
+
+                # Breakeven labels next to each mean marker
+                for r in chart_rows:
+                    if r["breakeven_oil"] is not None:
+                        fig_cc.add_annotation(
+                            x=r["capex_disc_MM"], y=r["mean"],
+                            text=f"BE ${r['breakeven_oil']:.0f}",
+                            showarrow=False,
+                            xshift=14, yshift=-18,
+                            font=dict(size=9, color="#444"),
+                        )
+
+                # Emissions on the secondary axis as small blue squares
+                em_rows = [r for r in chart_rows
+                            if r["emissions_Mt"] is not None]
+                if em_rows:
+                    fig_cc.add_trace(go.Scatter(
+                        x=[r["capex_disc_MM"] for r in em_rows],
+                        y=[r["emissions_Mt"] for r in em_rows],
+                        mode="markers+text",
+                        name="Total emissions",
+                        marker=dict(size=11, color="#1f77b4",
+                                     symbol="square",
+                                     line=dict(color="black", width=0.5)),
+                        text=[f"{r['emissions_Mt']:.1f} Mt"
+                              for r in em_rows],
+                        textposition="bottom right",
+                        textfont=dict(size=9, color="#1f77b4"),
+                        hovertemplate=(
+                            "Emissions: %{y:.2f} Mt CO₂-eq<br>"
+                            "CAPEX: $%{x:,.0f}MM<extra></extra>"),
+                    ), secondary_y=True)
+
+                fig_cc.update_xaxes(
+                    title_text="Total discounted CAPEX ($MM, 100% project)")
+                fig_cc.update_yaxes(
+                    title_text="NPV post-tax ($MM, 100% project)",
+                    secondary_y=False,
+                    title_font=dict(color="#2ca02c"),
+                    tickfont=dict(color="#2ca02c"))
+                fig_cc.update_yaxes(
+                    title_text="Total CO₂-eq emissions (Mt)",
+                    secondary_y=True,
+                    title_font=dict(color="#1f77b4"),
+                    tickfont=dict(color="#1f77b4"))
+                fig_cc.update_layout(
+                    title=("Concept Comparison — NPV post-tax vs CAPEX, "
+                           f"grouped by {grouping_dim}"),
+                    height=560,
+                    legend=dict(orientation="h", y=-0.18),
+                    hovermode="closest",
+                )
+                # Reference horizontal zero-NPV line
+                fig_cc.add_hline(y=0, line=dict(color="grey", dash="dot"),
+                                  secondary_y=False)
+                st.plotly_chart(fh.apply_plot_template(fig_cc),
+                                use_container_width=True)
+
+                # Companion summary table
+                df_cc = pd.DataFrame(chart_rows)
+                df_cc_show = df_cc.copy()
+                df_cc_show["P90 NPV ($MM)"] = df_cc_show["p90"].map(
+                    lambda v: f"{v:,.0f}")
+                df_cc_show["Mean NPV ($MM)"] = df_cc_show["mean"].map(
+                    lambda v: f"{v:,.0f}")
+                df_cc_show["P10 NPV ($MM)"] = df_cc_show["p10"].map(
+                    lambda v: f"{v:,.0f}")
+                df_cc_show["CAPEX ($MM disc.)"] = df_cc_show[
+                    "capex_disc_MM"].map(lambda v: f"{v:,.0f}")
+                df_cc_show["BE oil ($/bbl)"] = df_cc_show[
+                    "breakeven_oil"].map(
+                        lambda v: f"{v:,.1f}" if pd.notna(v) else "—")
+                df_cc_show["Emissions (Mt)"] = df_cc_show[
+                    "emissions_Mt"].map(
+                        lambda v: f"{v:,.2f}" if pd.notna(v) else "—")
+                df_cc_show["# cases"] = df_cc_show["n_cases"]
+                df_cc_show = df_cc_show[[
+                    "concept", "P90 NPV ($MM)", "Mean NPV ($MM)",
+                    "P10 NPV ($MM)", "CAPEX ($MM disc.)",
+                    "BE oil ($/bbl)", "Emissions (Mt)", "# cases"]]
+                df_cc_show.columns = [
+                    "Concept", "P90", "Mean", "P10", "CAPEX disc.",
+                    "BE oil", "Emissions", "# cases"]
+                st.dataframe(df_cc_show, use_container_width=True,
+                              hide_index=True)
+
+        # ============================================================
+        # QUALITATIVE DECISION MATRIX
+        # ============================================================
+        # The bubble chart above ranks concepts on quantitative NPV /
+        # CAPEX / emissions axes. This second panel is the classic
+        # qualitative complement: a Type × Criteria × Concept matrix
+        # where each cell carries a traffic-light colour (green / yellow
+        # / red / grey-NA) reflecting the user's judgement on
+        # non-quantifiable criteria — HSE, regulatory, reputational,
+        # operability, technology maturity. Reads exactly like the
+        # NCS DG1 / DG2 decision-support tables operators submit to
+        # the project board.
+        st.markdown("---")
+        st.markdown("#### 🚦 Qualitative decision matrix — "
+                    "traffic-light scoring per criterion")
+        st.caption(
+            "Score each concept against qualitative criteria — HSE, "
+            "schedule, technology, regulatory, robustness, operability "
+            "— using a green / yellow / red rating. Concept columns "
+            "pull automatically from the groupings used in the bubble "
+            "chart above (the same `Group concepts by` dimension), so "
+            "the row of quantitative bubbles and the row of qualitative "
+            "judgements speak about the same set of concepts.")
+
+        # ---- Default criteria taxonomy (editable) ----
+        # Pre-loaded with the NCS-typical structure shown in the
+        # reference image. The user can edit, add, or delete rows.
+        _DEFAULT_QUAL_CRITERIA = [
+            # (type, criterion)
+            ("SSU/HSE", "Safety"),
+            ("SSU/HSE", "Health"),
+            ("SSU/HSE", "Environment"),
+            ("SSU/HSE", "CO2 footprint and power consumption"),
+            ("Risk exposure", "Total schedule"),
+            ("Risk exposure", "Technology maturity"),
+            ("Risk exposure", "Concept complexity"),
+            ("Risk exposure", "Authority approval"),
+            ("Risk exposure", "Reputation exposure"),
+            ("Risk exposure", "Local content"),
+            ("Risk exposure", "Country risk"),
+            ("Robustness", "Compliance to strategic direction"),
+            ("Robustness", "Contractor availability / competitive bids"),
+            ("Robustness", "Flow assurance"),
+            ("Robustness", "Increased production"),
+            ("Robustness", "Marketing / trading flexibility"),
+            ("Operability", "Reservoir management"),
+            ("Operability", "Operation complexity"),
+            ("Operability", "Operational cost level"),
+            ("Operability", "System availability"),
+            ("Operability", "OPEX flexibility"),
+        ]
+
+        # Concept columns to score — pulled from the groups computed
+        # above for the bubble chart. Fall back to a default set if
+        # no batch results exist yet so the user can still play with
+        # the matrix before running.
+        try:
+            qual_concepts = list(groups.keys()) if groups else []
+        except NameError:
+            qual_concepts = []
+        if not qual_concepts:
+            qual_concepts = ["Concept A", "Concept B", "Concept C"]
+            st.info(
+                "No batch results yet — using placeholder concept names. "
+                "Run a batch above to auto-link the columns to your real "
+                "concepts.")
+
+        # ---- State ----
+        # Store the matrix as a dict of dicts:
+        #   {(type, criterion): {concept_label: colour_label}}
+        # colour labels are short strings the data_editor can validate.
+        qual_state_key = "concept_qual_matrix"
+        if qual_state_key not in st.session_state:
+            st.session_state[qual_state_key] = {}
+
+        # ---- Criteria editor in an expander ----
+        with st.expander("✏️ Edit criteria (type + criterion rows)",
+                          expanded=False):
+            st.caption(
+                "Add, remove or rename the criteria. The `Type` column "
+                "groups related criteria together — repeated values "
+                "merge visually in the matrix below.")
+            crit_df_key = "concept_qual_criteria_df"
+            if crit_df_key not in st.session_state:
+                st.session_state[crit_df_key] = pd.DataFrame(
+                    _DEFAULT_QUAL_CRITERIA, columns=["Type", "Criterion"])
+            edited_crit = st.data_editor(
+                st.session_state[crit_df_key],
+                num_rows="dynamic",
+                use_container_width=True,
+                key="concept_qual_criteria_editor",
+                column_config={
+                    "Type": st.column_config.TextColumn(
+                        "Type",
+                        help="Category — repeating values group rows"),
+                    "Criterion": st.column_config.TextColumn(
+                        "Criterion",
+                        help="Specific item to score against each "
+                             "concept"),
+                },
+            )
+            if not edited_crit.equals(st.session_state[crit_df_key]):
+                st.session_state[crit_df_key] = edited_crit
+
+        criteria = st.session_state[crit_df_key]
+        # Filter empty rows
+        criteria = criteria[
+            criteria["Type"].astype(str).str.strip() != ""].reset_index(
+                drop=True)
+        criteria = criteria[
+            criteria["Criterion"].astype(str).str.strip() != ""].reset_index(
+                drop=True)
+
+        if len(criteria) == 0:
+            st.warning("Add at least one criterion to score concepts.")
+        else:
+            # ---- Build the matrix dataframe ----
+            # Columns: Type, Criterion, <one column per concept>
+            COLOUR_OPTIONS = ["🟢 Green", "🟡 Yellow", "🔴 Red", "⚪ N/A"]
+            COLOUR_DEFAULT = "⚪ N/A"
+            COLOUR_HEX = {
+                "🟢 Green": "#2ca02c",
+                "🟡 Yellow": "#ffd700",
+                "🔴 Red": "#d62728",
+                "⚪ N/A": "#eaeaea",
+            }
+
+            # Build initial dataframe from session_state + criteria + concepts
+            stored = st.session_state[qual_state_key]
+            rows = []
+            for _, crit_row in criteria.iterrows():
+                t = str(crit_row["Type"])
+                c = str(crit_row["Criterion"])
+                row = {"Type": t, "Criterion": c}
+                for cn in qual_concepts:
+                    row[cn] = stored.get((t, c), {}).get(
+                        cn, COLOUR_DEFAULT)
+                rows.append(row)
+            matrix_df = pd.DataFrame(rows)
+
+            # Tools row above the editor
+            tc1, tc2, tc3 = st.columns([2, 2, 5])
+            if tc1.button("🟢 Set all to Green",
+                           key="qual_all_green",
+                           use_container_width=True):
+                for _, r in criteria.iterrows():
+                    key = (str(r["Type"]), str(r["Criterion"]))
+                    stored.setdefault(key, {})
+                    for cn in qual_concepts:
+                        stored[key][cn] = "🟢 Green"
+                st.rerun()
+            if tc2.button("♻️ Reset matrix",
+                           key="qual_reset",
+                           use_container_width=True,
+                           help="Clear every cell back to N/A."):
+                st.session_state[qual_state_key] = {}
+                st.rerun()
+
+            # ---- Editable matrix ----
+            # SelectboxColumn renders a dropdown per cell. The user can
+            # change the rating; we commit back to session_state.
+            col_config = {
+                "Type": st.column_config.TextColumn(
+                    "Type", width="medium", disabled=True),
+                "Criterion": st.column_config.TextColumn(
+                    "Criterion", width="large", disabled=True),
+            }
+            for cn in qual_concepts:
+                col_config[cn] = st.column_config.SelectboxColumn(
+                    cn,
+                    options=COLOUR_OPTIONS,
+                    default=COLOUR_DEFAULT,
+                    required=True,
+                    help=f"Score for {cn} on this criterion",
+                )
+            edited_matrix = st.data_editor(
+                matrix_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config=col_config,
+                num_rows="fixed",
+                key="concept_qual_matrix_editor",
+            )
+
+            # Commit back into the stable state dict
+            for _, mrow in edited_matrix.iterrows():
+                key = (str(mrow["Type"]), str(mrow["Criterion"]))
+                stored.setdefault(key, {})
+                for cn in qual_concepts:
+                    if cn in mrow.index:
+                        stored[key][cn] = str(mrow[cn])
+
+            # ---- Render the matrix as a coloured HTML/SVG view ----
+            # The editor is functional but visually dull. Below it we
+            # render the same data as an HTML table with the cells
+            # filled by their traffic-light colour, mimicking the
+            # reference image. This is the "pretty" view that goes
+            # into screenshots / decks.
+            st.markdown(
+                "##### Coloured view — drag this into a deck or "
+                "screenshot it")
+            html_rows = ['<table style="border-collapse:collapse;'
+                          'width:100%;font-family:Helvetica,Arial,'
+                          'sans-serif;font-size:11px">']
+            # Header
+            html_rows.append(
+                '<tr style="background:#fbe9c2;text-align:center;'
+                'font-weight:700">'
+                '<th style="padding:8px;border:1px solid #ccc;'
+                'width:120px">Type</th>'
+                '<th style="padding:8px;border:1px solid #ccc;'
+                'width:280px">Criterion</th>')
+            for cn in qual_concepts:
+                html_rows.append(
+                    f'<th style="padding:8px;border:1px solid #ccc;'
+                    f'min-width:110px;max-width:160px">{cn}</th>')
+            html_rows.append("</tr>")
+            # Body — merge consecutive identical Type cells with rowspan
+            prev_type = None
+            type_span_count = {}
+            for _, mrow in edited_matrix.iterrows():
+                t = str(mrow["Type"])
+                type_span_count[t] = type_span_count.get(t, 0) + 1
+            seen_type_emitted = {}
+            for _, mrow in edited_matrix.iterrows():
+                t = str(mrow["Type"])
+                c = str(mrow["Criterion"])
+                html_rows.append('<tr>')
+                if t not in seen_type_emitted:
+                    seen_type_emitted[t] = True
+                    html_rows.append(
+                        f'<td rowspan="{type_span_count[t]}" '
+                        f'style="background:#f4e2d8;padding:8px;'
+                        f'border:1px solid #ccc;vertical-align:middle;'
+                        f'text-align:center;font-weight:600">'
+                        f'{t}</td>')
+                html_rows.append(
+                    f'<td style="padding:6px 10px;border:1px solid #ccc;'
+                    f'background:white">{c}</td>')
+                for cn in qual_concepts:
+                    rating = str(mrow.get(cn, COLOUR_DEFAULT))
+                    fill = COLOUR_HEX.get(rating, "#eaeaea")
+                    # Render as a coloured circle, like the reference
+                    html_rows.append(
+                        f'<td style="padding:6px;border:1px solid #ccc;'
+                        f'text-align:center;background:white">'
+                        f'<span style="display:inline-block;width:26px;'
+                        f'height:26px;border-radius:50%;background:{fill};'
+                        f'border:1px solid #777;'
+                        f'box-shadow:inset 2px 2px 4px rgba(255,255,255,0.4),'
+                        f'inset -2px -2px 4px rgba(0,0,0,0.15)"></span>'
+                        f'</td>')
+                html_rows.append('</tr>')
+            html_rows.append("</table>")
+            st.markdown("".join(html_rows), unsafe_allow_html=True)
+
+            # ---- Tally summary ----
+            # Count greens / yellows / reds per concept — handy for a
+            # quick narrative "Concept A has 18 greens vs Concept C's 12".
+            st.markdown("##### Score summary")
+            summary_rows = []
+            for cn in qual_concepts:
+                g = sum(1 for _, mrow in edited_matrix.iterrows()
+                         if mrow.get(cn) == "🟢 Green")
+                y = sum(1 for _, mrow in edited_matrix.iterrows()
+                         if mrow.get(cn) == "🟡 Yellow")
+                r = sum(1 for _, mrow in edited_matrix.iterrows()
+                         if mrow.get(cn) == "🔴 Red")
+                na = sum(1 for _, mrow in edited_matrix.iterrows()
+                          if mrow.get(cn) == "⚪ N/A")
+                # Simple weighted score: green = +1, yellow = 0,
+                # red = −1, n/a = 0. Lets the user rank concepts on
+                # the qualitative dimension alone.
+                score = g - r
+                summary_rows.append({
+                    "Concept": cn, "🟢 Green": g, "🟡 Yellow": y,
+                    "🔴 Red": r, "⚪ N/A": na,
+                    "Net score (G−R)": score,
+                })
+            df_summary = pd.DataFrame(summary_rows).sort_values(
+                "Net score (G−R)", ascending=False)
+            st.dataframe(df_summary, use_container_width=True,
+                          hide_index=True)
+            st.caption(
+                "**Net score** = green count − red count, scored evenly "
+                "across criteria (no weighting). Use it as a quick "
+                "ordinal ranking — pair it with the NPV ranking from "
+                "the bubble chart for a balanced view.")
+
+        # ============================================================
+        # DESIGN-TO-COST STAIRCASE
+        # ============================================================
+        # Classic NCS DG1 "Design to Cost" plot: rank the concepts left
+        # → right by ascending discounted CAPEX, draw an L-shaped step
+        # for each, annotate NPV/BE on top and ΔNPV/ΔBE on the rise.
+        # The concept with the highest NPV is the "recommended solution"
+        # — every later step adds non-profitable scope (ΔNPV < 0).
+        # Reads the way operators present the screening verdict to the
+        # project board.
+        st.markdown("---")
+        st.markdown("#### 🪜 Design-to-Cost staircase — "
+                    "ranked by ascending CAPEX")
+        st.caption(
+            "Steps ordered by ascending discounted CAPEX. Each step "
+            "shows the absolute **NPV** and **breakeven price** of the "
+            "concept, plus **ΔNPV** and **ΔBE** versus the previous "
+            "step. The concept just before ΔNPV first turns negative "
+            "is the **Recommended solution** — adding any further "
+            "scope erodes value. The first step at the lowest CAPEX is "
+            "the **Bare bone** case.")
+        try:
+            staircase_groups = groups if groups else {}
+        except NameError:
+            staircase_groups = {}
+        if not staircase_groups:
+            st.info("Run a batch above to populate the staircase.")
+        else:
+            # Build one (concept, mean NPV, mean CAPEX, mean BE) point
+            # per concept group. The medians used in the bubble chart
+            # are robust to a few weird combinations and reflect the
+            # representative case; we use the same here for consistency.
+            import numpy as np
+            staircase = []
+            for label, rs in staircase_groups.items():
+                npvs = [r["npv_MM"] for r in rs
+                         if r.get("npv_MM") is not None]
+                capexes = [r["capex_disc_MM"] for r in rs
+                            if r.get("capex_disc_MM") is not None]
+                bes = [r["breakeven_oil"] for r in rs
+                        if r.get("breakeven_oil") is not None]
+                if not npvs or not capexes:
+                    continue
+                staircase.append({
+                    "concept": label,
+                    "npv_MM": float(np.median(npvs)),
+                    "capex_disc_MM": float(np.median(capexes)),
+                    "breakeven_oil": (float(np.median(bes))
+                                       if bes else None),
+                })
+            if not staircase:
+                st.info(
+                    "Selected groups have no usable NPV/CAPEX data — "
+                    "every combination failed or returned no values.")
+            else:
+                # Sort by ascending CAPEX — the staircase axis
+                staircase.sort(key=lambda x: x["capex_disc_MM"])
+
+                # Insert a synthetic "Reference (approved plans)" step
+                # at zero CAPEX / zero NPV — this is what the reference
+                # slide shows on the far left. Keeps the visual familiar
+                # to anyone who's seen the NCS DTC template before.
+                staircase.insert(0, {
+                    "concept": "Reference (approved plans)",
+                    "npv_MM": 0.0,
+                    "capex_disc_MM": 0.0,
+                    "breakeven_oil": None,
+                    "_is_reference": True,
+                })
+
+                # The "recommended" step is the one with the highest
+                # NPV — anything to the right of it is non-profitable
+                # addition.
+                npv_arr = [s["npv_MM"] for s in staircase]
+                rec_idx = int(np.argmax(npv_arr))
+
+                # Auto-name the steps the way the reference slide does:
+                # 0 = Reference, 1 = Bare bone, intermediates = Profitable
+                # additions, recommended = Recommended solution, after =
+                # Non-profitable additions.
+                for i, step in enumerate(staircase):
+                    if step.get("_is_reference"):
+                        step["role"] = "Reference"
+                    elif i == 1:
+                        step["role"] = "Bare bone"
+                    elif i == rec_idx:
+                        step["role"] = "Recommended solution"
+                    elif i < rec_idx:
+                        step["role"] = "Profitable additions"
+                    else:
+                        step["role"] = "Non-profitable additions"
+
+                # ---- Build the figure ----
+                # An L-shaped step is two perpendicular thick lines
+                # (a horizontal segment at the new NPV level and a
+                # vertical riser from the previous NPV to the new one).
+                # Plotly's Scatter with `lines` mode and explicit
+                # waypoints gives us exact control over the step shape.
+                fig_st = go.Figure()
+
+                # Compute the x-positions: equal spacing for readability
+                # (the actual CAPEX is shown as a label). Real CAPEX
+                # values can cluster badly and crush the staircase.
+                n = len(staircase)
+                x_positions = list(range(n))
+                step_w = 0.42   # half-width of each horizontal slab
+
+                # Colour palette by role
+                role_color = {
+                    "Reference": "#bbbbbb",
+                    "Bare bone": "#888888",
+                    "Profitable additions": "#888888",
+                    "Recommended solution": "#888888",
+                    "Non-profitable additions": "#888888",
+                }
+                # The L-shaped step itself — drawn as a thick grey
+                # outline, with the recommended step optionally
+                # highlighted via a red dotted halo (added afterwards).
+                for i, step in enumerate(staircase):
+                    x = x_positions[i]
+                    y = step["npv_MM"]
+                    prev_y = (staircase[i-1]["npv_MM"]
+                              if i > 0 else 0.0)
+                    # Step polyline: from (x-step_w, prev_y) up to
+                    # (x-step_w, y), across to (x+step_w, y). Drawn as
+                    # two lines so we can make the riser thinner.
+                    # Riser (vertical)
+                    fig_st.add_trace(go.Scatter(
+                        x=[x - step_w, x - step_w],
+                        y=[prev_y, y],
+                        mode="lines",
+                        line=dict(color="#aaaaaa", width=10),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    ))
+                    # Tread (horizontal)
+                    fig_st.add_trace(go.Scatter(
+                        x=[x - step_w, x + step_w],
+                        y=[y, y],
+                        mode="lines",
+                        line=dict(color=role_color[step["role"]],
+                                   width=14),
+                        hoverinfo="text",
+                        text=f"<b>{step['concept']}</b><br>"
+                             f"NPV: ${step['npv_MM']:,.0f}MM<br>"
+                             f"CAPEX: ${step['capex_disc_MM']:,.0f}MM"
+                             + (f"<br>BE: ${step['breakeven_oil']:,.1f}/bbl"
+                                 if step.get("breakeven_oil") else ""),
+                        showlegend=False,
+                    ))
+
+                # The red dotted "Recommended" halo — a circle around
+                # the recommended step, drawn via add_shape.
+                rec = staircase[rec_idx]
+                rec_x = x_positions[rec_idx]
+                rec_y = rec["npv_MM"]
+                # Halo size scales with the NPV range so it's visible
+                npv_range = max(npv_arr) - min(0.0, min(npv_arr))
+                halo_rx = 0.55
+                halo_ry = npv_range * 0.22 if npv_range > 0 else 50.0
+                fig_st.add_shape(
+                    type="circle",
+                    x0=rec_x - halo_rx, x1=rec_x + halo_rx,
+                    y0=rec_y - halo_ry, y1=rec_y + halo_ry * 0.6,
+                    line=dict(color="#d62728", width=2.5, dash="dot"),
+                    fillcolor="rgba(0,0,0,0)",
+                )
+
+                # Annotations on top of each step: NPV + BE
+                for i, step in enumerate(staircase):
+                    x = x_positions[i]
+                    y = step["npv_MM"]
+                    if step.get("_is_reference"):
+                        label_lines = ["0"]
+                    else:
+                        lines = [f"NPV ${step['npv_MM']:,.0f}MM"]
+                        if step.get("breakeven_oil") is not None:
+                            lines.append(
+                                f"BE ${step['breakeven_oil']:.0f}/bbl")
+                        label_lines = lines
+                    fig_st.add_annotation(
+                        x=x, y=y,
+                        text="<br>".join(label_lines),
+                        showarrow=False,
+                        yshift=28,
+                        font=dict(size=10, color="black"),
+                    )
+
+                # Delta annotations on the riser between steps i-1 and i
+                for i in range(1, len(staircase)):
+                    x = x_positions[i]
+                    y_prev = staircase[i-1]["npv_MM"]
+                    y_cur = staircase[i]["npv_MM"]
+                    delta_npv = y_cur - y_prev
+                    delta_be = None
+                    if (staircase[i].get("breakeven_oil") is not None
+                            and staircase[i-1].get("breakeven_oil")
+                                is not None):
+                        delta_be = (staircase[i]["breakeven_oil"]
+                                     - staircase[i-1]["breakeven_oil"])
+                    delta_text_parts = [
+                        f"ΔNPV ${delta_npv:+,.0f}MM"]
+                    if delta_be is not None:
+                        delta_text_parts.append(
+                            f"ΔBE ${delta_be:+,.1f}/bbl")
+                    # Colour by sign — green for +, red for −
+                    col = "#2ca02c" if delta_npv > 0 else "#d62728"
+                    fig_st.add_annotation(
+                        x=x - step_w, y=(y_prev + y_cur) / 2.0,
+                        text="<br>".join(delta_text_parts),
+                        showarrow=False,
+                        xshift=-50,
+                        font=dict(size=10, color=col,
+                                   family="Helvetica"),
+                        align="right",
+                    )
+
+                # Concept label below each step
+                for i, step in enumerate(staircase):
+                    x = x_positions[i]
+                    role = step["role"]
+                    # Show the concept name AND the role tag underneath
+                    label = f"<b>{step['concept']}</b><br><i>{role}</i>"
+                    if not step.get("_is_reference"):
+                        label += (
+                            f"<br>CAPEX "
+                            f"${step['capex_disc_MM']:,.0f}MM")
+                    fig_st.add_annotation(
+                        x=x, y=min(0.0, min(npv_arr)),
+                        text=label,
+                        showarrow=False,
+                        yshift=-30,
+                        yanchor="top",
+                        font=dict(size=10,
+                                   color="#d62728" if i == rec_idx
+                                   else "black"),
+                        align="center",
+                    )
+
+                # Layout — hide the actual x-tick numbers (positions
+                # are arbitrary), keep y axis as NPV scale
+                ymin = min(0.0, min(npv_arr)) - npv_range * 0.35
+                ymax = max(npv_arr) + npv_range * 0.30
+                fig_st.update_layout(
+                    title=dict(
+                        text="🪜 Design to Cost — concept ranking",
+                        font=dict(size=15)),
+                    xaxis=dict(
+                        showticklabels=False,
+                        showgrid=False,
+                        zeroline=False,
+                        range=[-0.8, n - 0.2]),
+                    yaxis=dict(
+                        title="NPV post-tax ($MM)",
+                        zeroline=True,
+                        zerolinecolor="#444",
+                        zerolinewidth=1,
+                        range=[ymin, ymax]),
+                    height=max(500, 60 * n + 200),
+                    plot_bgcolor="white",
+                    showlegend=False,
+                    margin=dict(l=80, r=40, t=80, b=140),
+                )
+
+                st.plotly_chart(fh.apply_plot_template(fig_st),
+                                use_container_width=True)
+
+                # ---- Companion ranking table ----
+                st.markdown("##### Staircase ranking table")
+                rank_rows = []
+                for i, step in enumerate(staircase):
+                    prev = staircase[i-1] if i > 0 else None
+                    dnpv = (step["npv_MM"] - prev["npv_MM"]
+                             if prev else None)
+                    dbe = None
+                    if (prev and step.get("breakeven_oil") is not None
+                            and prev.get("breakeven_oil") is not None):
+                        dbe = (step["breakeven_oil"]
+                                - prev["breakeven_oil"])
+                    rank_rows.append({
+                        "Step": i, "Role": step["role"],
+                        "Concept": step["concept"],
+                        "CAPEX disc. ($MM)": (
+                            f"{step['capex_disc_MM']:,.0f}"),
+                        "NPV ($MM)": f"{step['npv_MM']:,.0f}",
+                        "BE oil ($/bbl)": (
+                            f"{step['breakeven_oil']:.1f}"
+                            if step.get('breakeven_oil') is not None
+                            else "—"),
+                        "ΔNPV ($MM)": (
+                            f"{dnpv:+,.0f}" if dnpv is not None
+                            else "—"),
+                        "ΔBE ($/bbl)": (
+                            f"{dbe:+.1f}" if dbe is not None
+                            else "—"),
+                    })
+                df_rank = pd.DataFrame(rank_rows)
+                st.dataframe(df_rank, use_container_width=True,
+                              hide_index=True)
+                st.caption(
+                    f"**Recommended:** {staircase[rec_idx]['concept']} "
+                    f"— highest NPV in the staircase. Concepts beyond "
+                    f"this point add scope that doesn't earn its own "
+                    f"discounted CAPEX back at the assumed prices.")
+
+
 if __name__ == "__main__":
     main()
+
+
+
