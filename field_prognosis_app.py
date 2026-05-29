@@ -9554,6 +9554,14 @@ def main():
 
     if st.session_state["results"] is None:
         st.info("Configure the inputs and click **Run prognosis**.")
+        # The Concept Selector (hanging-garden batch builder) doesn't need
+        # a completed base run — it sweeps its own combinations off the
+        # current sidebar inputs. Surface it here so it's reachable before
+        # the first Run, not buried behind the results gate.
+        with st.expander("🌳 Concept Selector — hanging-garden batch "
+                          "builder (available now, no run needed)",
+                          expanded=False):
+            concept_selector_section(inputs["start_date"])
         scenario_compare_section(units, fluid, asm, econ, wells)
         return
 
@@ -9709,6 +9717,13 @@ def main():
         "Sensitivity", "Monte Carlo", "Data", "Methodology",
         "🌳 Concept Selector",
     ])
+    st.caption(
+        "💡 The rightmost tab **🌳 Concept Selector** is the "
+        "hanging-garden concept builder — define concept dimensions, "
+        "sweep every combination, and compare them on NPV / CAPEX / "
+        "emissions, a qualitative traffic-light matrix and a "
+        "Design-to-Cost staircase. Scroll the tab strip right if you "
+        "don't see it.")
 
     with tabs[0]:
         st.plotly_chart(plot_production(df, fluid, units), use_container_width=True)
@@ -13839,10 +13854,103 @@ def concept_selector_section(default_start_date):
         }
     if "concept_results" not in st.session_state:
         st.session_state["concept_results"] = {}
+    # Dirty flag — set true whenever the matrix is edited, cleared on Apply.
+    # Drives the orange "edited, not yet applied" state on the Run button.
+    if "concept_dirty" not in st.session_state:
+        st.session_state["concept_dirty"] = False
+    # Applied snapshot — the matrix state that was in force at the last
+    # Apply. The batch always runs against the APPLIED snapshot, never the
+    # half-edited live state, so the user gets deterministic behaviour.
+    if "concept_applied" not in st.session_state:
+        st.session_state["concept_applied"] = None
 
     dimensions = st.session_state["concept_dimensions"]
     selected = st.session_state["concept_selected"]
     results = st.session_state["concept_results"]
+
+    # ---- Base case source -------------------------------------------------
+    # The batch sweeps each combination ON TOP OF a base payload. By default
+    # that's the current sidebar inputs, but the user can instead load a
+    # saved case from the local database or upload a YAML / JSON case file.
+    with st.expander("📂 Base case source — sidebar, saved case, or "
+                      "uploaded YAML/JSON", expanded=False):
+        st.caption(
+            "Every concept combination is applied as a patch on top of a "
+            "base case. Choose where that base comes from. Saved cases "
+            "live in the local case database (the same ones the Case "
+            "Manager uses); YAML/JSON files use the same schema as the "
+            "JSON export.")
+        base_source = st.radio(
+            "Base case",
+            ["Current sidebar inputs", "Saved case (database)",
+             "Upload YAML / JSON"],
+            key="concept_base_source", horizontal=True)
+        st.session_state["concept_base_payload"] = None  # default: live
+        if base_source == "Saved case (database)":
+            try:
+                cases = fh.list_cases()
+            except Exception:
+                cases = []
+            if not cases:
+                st.info("No saved cases found in the database. Save a "
+                        "case from the Case Manager first.")
+            else:
+                case_labels = [
+                    f"{c['name']}  ·  {c.get('saved_at','')[:16]}"
+                    for c in cases]
+                pick = st.selectbox("Pick a saved case", case_labels,
+                                     key="concept_base_case_pick")
+                idx = case_labels.index(pick)
+                if st.button("📥 Load this case as base",
+                              key="concept_load_case"):
+                    try:
+                        data = fh.load_case(cases[idx]["filename"])
+                        st.session_state["concept_base_payload"] = \
+                            data.get("payload", {})
+                        st.success(
+                            f"Loaded '{cases[idx]['name']}' as the batch "
+                            f"base case.")
+                    except Exception as e:
+                        st.error(f"Could not load case: {e}")
+        elif base_source == "Upload YAML / JSON":
+            up = st.file_uploader(
+                "Upload a case file (.yaml / .yml / .json)",
+                type=["yaml", "yml", "json"],
+                key="concept_base_upload")
+            if up is not None:
+                try:
+                    raw = up.read().decode("utf-8")
+                    if up.name.lower().endswith(".json"):
+                        import json as _json
+                        parsed = _json.loads(raw)
+                    else:
+                        import yaml as _yaml
+                        parsed = _yaml.safe_load(raw)
+                    # Accept either a full case ({"payload": {...}}) or a
+                    # bare payload ({"scalar":..., "tables":...}).
+                    payload = parsed.get("payload", parsed) \
+                        if isinstance(parsed, dict) else {}
+                    # Restore any serialised dataframes
+                    try:
+                        payload = fh._restore_dataframes(payload)
+                    except Exception:
+                        pass
+                    st.session_state["concept_base_payload"] = payload
+                    st.success(
+                        f"Loaded '{up.name}' as the batch base case "
+                        f"({len(payload.get('scalar', {}))} scalar keys, "
+                        f"{len(payload.get('tables', {}))} tables).")
+                except Exception as e:
+                    st.error(f"Could not parse the file: {e}")
+        # Show what's currently the base
+        _bp = st.session_state.get("concept_base_payload")
+        if _bp:
+            _nm = _bp.get("_meta", {}).get("name", "uploaded/loaded case")
+            st.info(f"**Base case:** {_nm} (loaded). The sweep will patch "
+                    f"each combination on top of this.")
+        else:
+            st.info("**Base case:** current sidebar inputs (live).")
+
 
     # ---- Top toolbar ----
     tb1, tb2, tb3, tb4 = st.columns([2, 2, 2, 3])
@@ -14008,25 +14116,75 @@ def concept_selector_section(default_start_date):
         st.session_state["concept_selected"] = new_selected
         st.rerun()
 
-    # ---- Run batch ----
+    # ---- Apply + Run batch ----
     st.markdown("---")
-    run_c1, run_c2 = st.columns([2, 5])
-    do_run = run_c1.button(
-        f"🚀 Run batch ({n_combos:,} combos)",
-        type="primary", use_container_width=True,
-        disabled=(n_combos == 0))
-    if n_combos > 200:
+
+    # Serialise the current matrix to detect edits vs the applied snapshot.
+    def _serialize_matrix(dims, sel):
+        return json.dumps({
+            "dims": [{"name": d["name"],
+                       "options": [{"label": o["label"],
+                                    "patches": o.get("patches", {})}
+                                   for o in d["options"]]}
+                      for d in dims],
+            "selected": {str(k): sorted(v) for k, v in sel.items()},
+        }, sort_keys=True, default=str)
+
+    current_sig = _serialize_matrix(dimensions, selected)
+    applied_sig = st.session_state.get("concept_applied")
+    is_dirty = (applied_sig is None) or (current_sig != applied_sig)
+    st.session_state["concept_dirty"] = is_dirty
+
+    apply_c, run_c1, run_c2 = st.columns([2, 2, 4])
+
+    # Apply button — commits the current matrix as the snapshot the batch
+    # will run against. Turns the Run button green; until pressed the Run
+    # button stays orange to signal "you have unapplied edits".
+    apply_label = ("✅ Apply edits" if is_dirty
+                   else "✓ Applied (up to date)")
+    if apply_c.button(apply_label, key="concept_apply",
+                       use_container_width=True,
+                       type=("secondary" if not is_dirty else "primary"),
+                       disabled=(not is_dirty)):
+        st.session_state["concept_applied"] = current_sig
+        st.session_state["concept_dirty"] = False
+        st.rerun()
+
+    # Run button — orange when there are unapplied edits, green when clean.
+    # Streamlit's button `type` is primary (red/orange-ish) or secondary;
+    # we colour a custom button via markdown when dirty to make the state
+    # unmistakable, and gate the actual run on the applied state.
+    if is_dirty:
+        run_c1.markdown(
+            "<div style='background:#ff8c00;color:white;padding:8px 12px;"
+            "border-radius:6px;text-align:center;font-weight:600;"
+            "cursor:not-allowed'>🚀 Run batch — apply edits first</div>",
+            unsafe_allow_html=True)
+        do_run = False
         run_c2.warning(
-            f"**{n_combos:,} combinations** — this will take a while. "
-            f"Consider narrowing the sweep before pressing Run.")
-    elif n_combos > 50:
-        run_c2.info(
-            f"Sweeping {n_combos:,} combinations; expect "
-            f"~{n_combos * 1.5:.0f}s on Streamlit Cloud.")
+            "You have **unapplied edits** to the concept matrix. Click "
+            "**Apply edits** to lock them in, then Run. This guarantees "
+            "the batch runs the matrix you see.")
+    else:
+        do_run = run_c1.button(
+            f"🚀 Run batch ({n_combos:,} combos)",
+            type="primary", use_container_width=True,
+            disabled=(n_combos == 0))
+        if n_combos > 200:
+            run_c2.warning(
+                f"**{n_combos:,} combinations** — this will take a while. "
+                f"Consider narrowing the sweep before pressing Run.")
+        elif n_combos > 50:
+            run_c2.info(
+                f"Sweeping {n_combos:,} combinations; expect "
+                f"~{n_combos * 1.5:.0f}s on Streamlit Cloud.")
     if do_run:
-        # Build the base payload from the current sidebar state
+        # Build the base payload — from a loaded case if one is set,
+        # otherwise from the current sidebar state.
         try:
-            base_payload = collect_inputs_payload()
+            base_payload = st.session_state.get("concept_base_payload")
+            if not base_payload:
+                base_payload = collect_inputs_payload()
         except Exception as e:
             st.error(f"Could not snapshot the base case: {e}")
             return
@@ -14136,11 +14294,102 @@ def concept_selector_section(default_start_date):
         except Exception:
             pass
         st.dataframe(df_res, use_container_width=True, hide_index=True)
-        # CSV download
+        # ---- Downloads: CSV (flat) + nested YAML (full audit trail) ----
+        dl1, dl2 = st.columns(2)
         csv = df_res.to_csv(index=False).encode("utf-8")
-        st.download_button(
+        dl1.download_button(
             "📥 Download results (CSV)", data=csv,
-            file_name="concept_batch_results.csv", mime="text/csv")
+            file_name="concept_batch_results.csv", mime="text/csv",
+            use_container_width=True)
+
+        # Build a nested, human-readable YAML capturing the WHOLE study:
+        # the matrix definition (dimensions + options + their patches),
+        # which options were swept, the base-case source, a UTC timestamp,
+        # and every combination's picks + KPIs. This is the audit artefact
+        # for tracking exactly what was run and what came out.
+        try:
+            import yaml as _yaml
+            from datetime import datetime as _dt, timezone as _tz
+            _base_src = st.session_state.get("concept_base_source",
+                                              "Current sidebar inputs")
+            _base_loaded = st.session_state.get("concept_base_payload")
+            export_doc = {
+                "fieldvista_concept_study": {
+                    "schema_version": 1,
+                    "generated_utc": _dt.now(_tz.utc).isoformat(
+                        timespec="seconds"),
+                    "app_version": str(getattr(fh, "FP_HELPERS_VERSION",
+                                                "?")),
+                    "base_case": {
+                        "source": _base_src,
+                        "loaded_case_name": (
+                            (_base_loaded or {}).get("_meta", {}).get(
+                                "name") if _base_loaded else
+                            "live sidebar inputs"),
+                    },
+                    "matrix": {
+                        "dimensions": [
+                            {
+                                "name": d["name"],
+                                "description": d.get("description", ""),
+                                "options": [
+                                    {
+                                        "label": o["label"],
+                                        "description": o.get(
+                                            "description", ""),
+                                        "patches": o.get("patches", {}),
+                                        "swept": (
+                                            oi in selected.get(di, set())),
+                                    }
+                                    for oi, o in enumerate(d["options"])
+                                ],
+                            }
+                            for di, d in enumerate(dimensions)
+                        ],
+                    },
+                    "n_combinations": len(results),
+                    "results": [
+                        {
+                            "name": r.get("name"),
+                            "picks": {dn: lbl
+                                       for dn, lbl in r.get("picks", [])},
+                            "kpis": {
+                                "npv_MM": r.get("npv_MM"),
+                                "irr": r.get("irr"),
+                                "final_rf": r.get("final_rf"),
+                                "breakeven_oil_usd_bbl": r.get(
+                                    "breakeven_oil"),
+                                "capex_disc_MM": r.get("capex_disc_MM"),
+                                "co2_total_Mt": r.get("co2_total_Mt"),
+                            },
+                            "ok": r.get("ok", False),
+                            "error": r.get("error"),
+                        }
+                        for r in sorted(
+                            results.values(),
+                            key=lambda x: (x.get("npv_MM")
+                                            if x.get("npv_MM") is not None
+                                            else -9e18),
+                            reverse=True)
+                    ],
+                }
+            }
+            yaml_bytes = _yaml.safe_dump(
+                export_doc, sort_keys=False, allow_unicode=True,
+                default_flow_style=False).encode("utf-8")
+            dl2.download_button(
+                "🧾 Download study (nested YAML)", data=yaml_bytes,
+                file_name="concept_study.yaml",
+                mime="application/x-yaml",
+                use_container_width=True,
+                help="Full audit trail — the concept matrix (every "
+                     "dimension, option and its patch), which options "
+                     "were swept, the base-case source, a UTC "
+                     "timestamp, and every combination's picks + KPIs. "
+                     "Re-loadable as a base case and ideal for version "
+                     "tracking in git.")
+        except Exception as _e:
+            dl2.info(f"YAML export unavailable: {_e}")
         # Errors expander
         errs = [(r["name"], r["error"]) for r in results.values()
                 if not r.get("ok") and r.get("error")]
