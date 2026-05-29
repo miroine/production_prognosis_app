@@ -7367,7 +7367,9 @@ def economics_section(units, start_date):
                             "export_pipeline_km", 0),
                         "flowline_km": dc_spec.get("flowline_km", 0),
                         "is_gas": (FLUID_SYSTEMS.get(
-                            fluid, {"primary": "oil"})["primary"] == "gas"),
+                            st.session_state.get(
+                                "fluid", "Oil with associated gas"),
+                            {"primary": "oil"})["primary"] == "gas"),
                     })
                     for heading, rec in advice:
                         st.markdown(f"**{heading}** — {rec}")
@@ -9105,6 +9107,34 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # ---- Page navigation ----
+    # FieldVista has two top-level pages: the main field-development
+    # prognosis (production + economics + all the results tabs), and the
+    # standalone Concept Selector (a hanging-garden batch tool that runs
+    # independent cases, not derived from the current sidebar run).
+    page = st.sidebar.radio(
+        "📑 Page",
+        ["🛢️ Field prognosis", "🌳 Concept Selector"],
+        key="active_page",
+        help="Field prognosis — the full production + economics model. "
+             "Concept Selector — a standalone hanging-garden tool where "
+             "each option links to its own case (YAML or saved case) and "
+             "the batch runs them one by one.")
+    st.sidebar.markdown("---")
+    if page == "🌳 Concept Selector":
+        # Standalone page — does not need the main run flow at all.
+        concept_selector_section(date.today())
+        st.markdown(
+            f"""
+            <div class="app-footer">
+                <b>FieldVista</b> — Concept Selector ·
+                © 2026 <b>Merouane Hamdani</b> · MIT License
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+
     # ---- Guided walkthrough ----
     # A self-contained onboarding panel that takes the user from a blank
     # app to a complete field-development case, in the same order as the
@@ -9553,15 +9583,10 @@ def main():
         st.rerun()
 
     if st.session_state["results"] is None:
-        st.info("Configure the inputs and click **Run prognosis**.")
-        # The Concept Selector (hanging-garden batch builder) doesn't need
-        # a completed base run — it sweeps its own combinations off the
-        # current sidebar inputs. Surface it here so it's reachable before
-        # the first Run, not buried behind the results gate.
-        with st.expander("🌳 Concept Selector — hanging-garden batch "
-                          "builder (available now, no run needed)",
-                          expanded=False):
-            concept_selector_section(inputs["start_date"])
+        st.info("Configure the inputs and click **Run prognosis**. "
+                "Looking for the concept long-list tool? It's now its own "
+                "page — pick **🌳 Concept Selector** at the top of the "
+                "sidebar.")
         scenario_compare_section(units, fluid, asm, econ, wells)
         return
 
@@ -9715,15 +9740,7 @@ def main():
         "Production", "Cumulatives & RF", "Per-well",
         "Drilling sequence", "Material balance", "Economics",
         "Sensitivity", "Monte Carlo", "Data", "Methodology",
-        "🌳 Concept Selector",
     ])
-    st.caption(
-        "💡 The rightmost tab **🌳 Concept Selector** is the "
-        "hanging-garden concept builder — define concept dimensions, "
-        "sweep every combination, and compare them on NPV / CAPEX / "
-        "emissions, a qualitative traffic-light matrix and a "
-        "Design-to-Cost staircase. Scroll the tab strip right if you "
-        "don't see it.")
 
     with tabs[0]:
         st.plotly_chart(plot_production(df, fluid, units), use_container_width=True)
@@ -10473,9 +10490,6 @@ def main():
                 f"Reference data: public Sokkeldirektoratet (Norwegian "
                 f"Offshore Directorate) field production records — rounded "
                 f"screening values. {vfld['notes']}")
-
-    with tabs[10]:
-        concept_selector_section(inputs["start_date"])
 
     scenario_compare_section(units, fluid, asm, econ, wells)
 
@@ -13442,6 +13456,124 @@ _DEFAULT_CONCEPT_DIMENSIONS = [
 ]
 
 
+def _concept_study_to_doc(dimensions, selected, results, base_source,
+                          base_loaded):
+    """Assemble the nested study dict (matrix + base + results)."""
+    from datetime import datetime as _dt, timezone as _tz
+    return {
+        "fieldvista_concept_study": {
+            "schema_version": 1,
+            "generated_utc": _dt.now(_tz.utc).isoformat(timespec="seconds"),
+            "app_version": str(getattr(fh, "FP_HELPERS_VERSION", "?")),
+            "base_case": {
+                "source": base_source,
+                "loaded_case_name": (
+                    (base_loaded or {}).get("_meta", {}).get("name")
+                    if base_loaded else "live sidebar inputs"),
+            },
+            "matrix": {
+                "dimensions": [
+                    {
+                        "name": d["name"],
+                        "description": d.get("description", ""),
+                        "options": [
+                            {
+                                "label": o["label"],
+                                "description": o.get("description", ""),
+                                "patches": o.get("patches", {}),
+                                "swept": (oi in selected.get(di, set())),
+                            }
+                            for oi, o in enumerate(d["options"])
+                        ],
+                    }
+                    for di, d in enumerate(dimensions)
+                ],
+            },
+            "n_combinations": len(results),
+            "results": [
+                {
+                    "name": r.get("name"),
+                    "picks": {dn: lbl for dn, lbl in r.get("picks", [])},
+                    "kpis": {
+                        "npv_MM": r.get("npv_MM"),
+                        "irr": r.get("irr"),
+                        "final_rf": r.get("final_rf"),
+                        "breakeven_oil_usd_bbl": r.get("breakeven_oil"),
+                        "capex_disc_MM": r.get("capex_disc_MM"),
+                        "co2_total_Mt": r.get("co2_total_Mt"),
+                    },
+                    "ok": r.get("ok", False),
+                    "error": r.get("error"),
+                }
+                for r in sorted(
+                    results.values(),
+                    key=lambda x: (x.get("npv_MM")
+                                    if x.get("npv_MM") is not None
+                                    else -9e18),
+                    reverse=True)
+            ],
+        }
+    }
+
+
+def _concept_doc_to_matrix(doc):
+    """Reconstruct (dimensions, selected) from a study doc.
+
+    Inverse of _concept_study_to_doc for the matrix portion — lets a
+    study YAML be re-imported to rebuild the editable matrix.
+    Returns (dimensions_list, selected_dict) or raises on bad schema.
+    """
+    root = doc.get("fieldvista_concept_study", doc)
+    dims_in = root.get("matrix", {}).get("dimensions", [])
+    dimensions = []
+    selected = {}
+    for di, d in enumerate(dims_in):
+        opts = []
+        sel = set()
+        for oi, o in enumerate(d.get("options", [])):
+            opts.append({
+                "label": o.get("label", f"Option {oi+1}"),
+                "description": o.get("description", ""),
+                "patches": o.get("patches", {}) or {},
+            })
+            if o.get("swept", True):
+                sel.add(oi)
+        dimensions.append({
+            "name": d.get("name", f"Dimension {di+1}"),
+            "description": d.get("description", ""),
+            "options": opts,
+        })
+        selected[di] = sel
+    if not dimensions:
+        raise ValueError("No dimensions found in study document.")
+    return dimensions, selected
+
+
+def _concept_pareto_front(rows):
+    """Given a list of dicts with 'capex_disc_MM' and a NPV key 'mean'
+    (or 'npv_MM'), return the set of concept labels on the efficient
+    frontier (max NPV for min CAPEX). A concept is dominated if another
+    has CAPEX ≤ and NPV ≥ with at least one strict.
+    """
+    pts = []
+    for r in rows:
+        cap = r.get("capex_disc_MM")
+        npv = r.get("mean", r.get("npv_MM"))
+        if cap is None or npv is None:
+            continue
+        pts.append((r["concept"], float(cap), float(npv)))
+    nondominated = set()
+    for label, cap, npv in pts:
+        dominated = False
+        for _, cap2, npv2 in pts:
+            if (cap2 <= cap and npv2 >= npv) and (cap2 < cap or npv2 > npv):
+                dominated = True
+                break
+        if not dominated:
+            nondominated.add(label)
+    return nondominated
+
+
 def _apply_concept_patches(payload: dict, picks: list) -> dict:
     """Apply a list of option-patch dicts to a base payload.
 
@@ -13535,37 +13667,36 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
     combination — used to colour boxes by the BEST NPV that flows
     through that option.
     """
-    col_w = 175
-    gap_x = 16
-    header_h = 44
-    row_h = 44
-    row_gap = 8
-    pad = 20
+    col_w = 230
+    gap_x = 20
+    header_h = 64
+    row_h = 56
+    row_gap = 10
+    pad = 24
     n_cols = len(dimensions)
     max_options = max((len(d["options"]) for d in dimensions), default=1)
     width = pad * 2 + n_cols * col_w + (n_cols - 1) * gap_x
-    height = pad * 2 + header_h + 12 + (row_h + row_gap) * max_options + 30
+    height = pad * 2 + header_h + 16 + (row_h + row_gap) * max_options + 40
 
-    # Compute best NPV per option (so colour reflects best combination
-    # touching that option).
+    # Map each option to its NPV (one case per option now — no
+    # combinations, so it's a direct lookup by (dim_name, label)).
     best_per_opt = {}      # key: (dim_idx, opt_idx) → npv_MM
     if results_by_pick:
-        for picks_key, res in results_by_pick.items():
+        # Build a (dim_name,label) → npv lookup from the result records
+        npv_by_pick = {}
+        for res in results_by_pick.values():
             npv = res.get("npv_MM")
             if npv is None:
                 continue
-            for dim_name, label in picks_key:
-                # Find indices
-                for di, d in enumerate(dimensions):
-                    if d["name"] != dim_name:
-                        continue
-                    for oi, o in enumerate(d["options"]):
-                        if o["label"] == label:
-                            key = (di, oi)
-                            cur = best_per_opt.get(key)
-                            if cur is None or npv > cur:
-                                best_per_opt[key] = npv
-        # NPV range across all results
+            dn = res.get("dim")
+            lbl = res.get("label")
+            if dn is not None and lbl is not None:
+                npv_by_pick[(dn, lbl)] = npv
+        for di, d in enumerate(dimensions):
+            for oi, o in enumerate(d["options"]):
+                npv = npv_by_pick.get((d["name"], o["label"]))
+                if npv is not None:
+                    best_per_opt[(di, oi)] = npv
         all_npvs = [r.get("npv_MM") for r in results_by_pick.values()
                     if r.get("npv_MM") is not None]
         npv_lo = min(all_npvs) if all_npvs else 0.0
@@ -13584,19 +13715,41 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
     # Columns
     for di, d in enumerate(dimensions):
         x = pad + di * (col_w + gap_x)
-        # Header bar
-        out.append(f'<rect x="{x}" y="{header_h - 24}" width="{col_w}" '
-                   f'height="28" fill="#2c7fb8" rx="4"/>')
-        # Wrap title if needed
+        # Header bar — taller, holds up to two wrapped lines
+        out.append(f'<rect x="{x}" y="{header_h - 44}" width="{col_w}" '
+                   f'height="44" fill="#2c7fb8" rx="5"/>')
+        # Wrap the title onto up to two lines by words rather than
+        # truncating, so long dimension names stay readable.
         title = d["name"]
-        if len(title) > 22:
-            title = title[:21] + "…"
-        out.append(f'<text x="{x + col_w/2}" y="{header_h - 6}" '
-                   f'font-size="11" font-weight="700" fill="white" '
-                   f'text-anchor="middle">{title}</text>')
+        max_chars = 26
+        if len(title) <= max_chars:
+            t_lines = [title]
+        else:
+            words = title.split(" ")
+            t_lines, cur = [], ""
+            for w in words:
+                if len(cur) + len(w) + 1 <= max_chars:
+                    cur = (cur + " " + w).strip()
+                else:
+                    t_lines.append(cur)
+                    cur = w
+            if cur:
+                t_lines.append(cur)
+            t_lines = t_lines[:2]
+        if len(t_lines) == 1:
+            out.append(f'<text x="{x + col_w/2}" y="{header_h - 16}" '
+                       f'font-size="13" font-weight="700" fill="white" '
+                       f'text-anchor="middle">{t_lines[0]}</text>')
+        else:
+            out.append(f'<text x="{x + col_w/2}" y="{header_h - 24}" '
+                       f'font-size="12" font-weight="700" fill="white" '
+                       f'text-anchor="middle">{t_lines[0]}</text>')
+            out.append(f'<text x="{x + col_w/2}" y="{header_h - 8}" '
+                       f'font-size="12" font-weight="700" fill="white" '
+                       f'text-anchor="middle">{t_lines[1]}</text>')
         # Options
         for oi, opt in enumerate(d["options"]):
-            y = header_h + 12 + oi * (row_h + row_gap)
+            y = header_h + 16 + oi * (row_h + row_gap)
             is_selected = oi in selected.get(di, set())
             # Colour: if results exist for this option, use NPV ramp;
             # else neutral (selected = blue, unselected = grey).
@@ -13622,9 +13775,9 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
                 f'rx="4"/>')
             # Option label — split into two lines if it has a space and is long
             label = opt["label"]
-            if len(label) <= 22:
+            if len(label) <= 28:
                 out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 + 4}" '
-                           f'font-size="11" font-weight="600" '
+                           f'font-size="12" font-weight="600" '
                            f'fill="{text_color}" text-anchor="middle">'
                            f'{label}</text>')
             else:
@@ -13951,6 +14104,103 @@ def concept_selector_section(default_start_date):
         else:
             st.info("**Base case:** current sidebar inputs (live).")
 
+    # ---- Study library: save / load / import the whole matrix ----
+    with st.expander("💾 Study library — save, load & import concept "
+                      "matrices", expanded=False):
+        st.caption(
+            "A *study* is the whole concept matrix (dimensions, options, "
+            "patches, sweep selection) plus its last results. Save named "
+            "studies to the local database, reload them later, or import "
+            "a study YAML/JSON exported from the results section below. "
+            "Ideal for versioning concept long-lists in git.")
+        sl1, sl2 = st.columns(2)
+        with sl1:
+            st.markdown("**Save current matrix as a study**")
+            study_name = st.text_input(
+                "Study name", value="My concept study",
+                key="concept_study_name")
+            if st.button("💾 Save study to database",
+                          key="concept_save_study",
+                          use_container_width=True):
+                try:
+                    doc = _concept_study_to_doc(
+                        st.session_state["concept_dimensions"],
+                        st.session_state["concept_selected"],
+                        st.session_state.get("concept_results", {}),
+                        st.session_state.get("concept_base_source",
+                                              "Current sidebar inputs"),
+                        st.session_state.get("concept_base_payload"))
+                    fh.save_concept_study(study_name, doc)
+                    st.success(f"Saved study '{study_name}'.")
+                except Exception as e:
+                    st.error(f"Could not save study: {e}")
+        with sl2:
+            st.markdown("**Load a saved study**")
+            try:
+                studies = fh.list_concept_studies()
+            except Exception:
+                studies = []
+            if studies:
+                labels = [f"{s['name']}  ·  {s['n_combinations']} combos  "
+                          f"·  {s.get('saved_at','')[:16]}"
+                          for s in studies]
+                pick = st.selectbox("Saved studies", labels,
+                                     key="concept_study_pick")
+                idx = labels.index(pick)
+                lc1, lc2 = st.columns(2)
+                if lc1.button("📂 Load study", key="concept_load_study",
+                               use_container_width=True):
+                    try:
+                        doc = fh.load_concept_study(
+                            studies[idx]["filename"])
+                        dims, sel = _concept_doc_to_matrix(doc)
+                        st.session_state["concept_dimensions"] = dims
+                        st.session_state["concept_selected"] = sel
+                        st.session_state["concept_results"] = {}
+                        st.session_state["concept_applied"] = None
+                        st.success(
+                            f"Loaded study '{studies[idx]['name']}'. "
+                            f"Re-run to populate results.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not load study: {e}")
+                if lc2.button("🗑️ Delete study",
+                               key="concept_delete_study",
+                               use_container_width=True):
+                    try:
+                        fh.delete_concept_study(studies[idx]["filename"])
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not delete: {e}")
+            else:
+                st.info("No saved studies yet.")
+        st.markdown("---")
+        st.markdown("**Import a study file (rebuilds the matrix)**")
+        imp = st.file_uploader(
+            "Upload study YAML / JSON", type=["yaml", "yml", "json"],
+            key="concept_study_import")
+        if imp is not None:
+            if st.button("📥 Import matrix from this file",
+                          key="concept_do_import"):
+                try:
+                    raw = imp.read().decode("utf-8")
+                    if imp.name.lower().endswith(".json"):
+                        import json as _json
+                        doc = _json.loads(raw)
+                    else:
+                        import yaml as _yaml
+                        doc = _yaml.safe_load(raw)
+                    dims, sel = _concept_doc_to_matrix(doc)
+                    st.session_state["concept_dimensions"] = dims
+                    st.session_state["concept_selected"] = sel
+                    st.session_state["concept_results"] = {}
+                    st.session_state["concept_applied"] = None
+                    st.success(
+                        f"Imported {len(dims)} dimensions from "
+                        f"'{imp.name}'. Re-run to populate results.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Could not import: {e}")
 
     # ---- Top toolbar ----
     tb1, tb2, tb3, tb4 = st.columns([2, 2, 2, 3])
@@ -13986,15 +14236,15 @@ def concept_selector_section(default_start_date):
         st.session_state["concept_results"] = {}
         st.rerun()
 
-    # Combination count + run button
-    n_combos = 1
-    for di, d in enumerate(dimensions):
-        n_picks = len(selected.get(di, set()))
-        n_combos *= max(1, n_picks)
-    tb4.metric("Combinations to run", f"{n_combos:,}",
-               help="Product of selected options across dimensions. Each "
-                    "combination triggers one full simulation + economics "
-                    "evaluation.")
+    # Selected-option count — each selected option is one standalone case
+    # (no cartesian product). This is the number of cases the batch runs.
+    n_combos = sum(len(selected.get(di, set()))
+                   for di in range(len(dimensions)))
+    tb4.metric("Cases to run", f"{n_combos:,}",
+               help="Each ticked option runs as its own standalone case "
+                    "(its linked YAML / saved case, or the base case + "
+                    "its patches). No combinations are formed — options "
+                    "run one by one.")
 
     # ---- The garden view ----
     svg = _render_concept_garden_svg(dimensions, selected, results)
@@ -14051,42 +14301,111 @@ def concept_selector_section(default_start_date):
                     key=f"concept_opt_{di}_{oi}_desc",
                     label_visibility="collapsed",
                     placeholder="Short description")
-                # Patches as a YAML-like inline string for compactness.
-                # Stored as dict internally; rendered/edited as
-                # `key: value, key: value` text.
-                cur_patch_str = ", ".join(
-                    f"{k}: {v}" for k, v in opt.get("patches", {}).items())
-                new_patch_str = oc4.text_input(
-                    "Patches", value=cur_patch_str,
-                    key=f"concept_opt_{di}_{oi}_patches",
-                    label_visibility="collapsed",
-                    placeholder="oil_price_bbl: 55, well_cost_mode: rig_rate",
-                    help="Comma-separated `key: value` overrides applied "
-                         "to the base case scalar state.")
-                # Parse patches back to dict
-                parsed = {}
-                for pair in new_patch_str.split(","):
-                    if ":" not in pair:
-                        continue
-                    k, v = pair.split(":", 1)
-                    k, v = k.strip(), v.strip()
-                    if not k:
-                        continue
-                    # Type inference
-                    try:
-                        v_typed = float(v)
-                        if v_typed.is_integer() and "." not in v:
-                            v_typed = int(v_typed)
-                    except ValueError:
-                        if v.lower() in ("true", "false"):
-                            v_typed = (v.lower() == "true")
-                        else:
-                            v_typed = v
-                    parsed[k] = v_typed
-                opt["patches"] = parsed
+                # Case link — each option carries either a linked saved
+                # case (by filename) or an uploaded/loaded full payload.
+                # The status shows what's attached; the patches text box
+                # is still supported for power users as an override layer
+                # applied on top of the linked case.
+                _linked = opt.get("case_name")
+                _patch_n = len(opt.get("patches", {}))
+                _status = (f"📎 {_linked}" if _linked
+                            else (f"{_patch_n} patch(es)" if _patch_n
+                                  else "— no case —"))
+                oc4.markdown(
+                    f"<div style='padding-top:6px;font-size:12px;"
+                    f"color:#555'>{_status}</div>",
+                    unsafe_allow_html=True)
                 if oc5.button("✖", key=f"concept_opt_{di}_{oi}_del",
                                help="Delete this option"):
                     opt_to_remove = oi
+                # Per-option case linker (expander keeps the row compact)
+                with st.container():
+                    le1, le2, le3 = st.columns([3, 3, 2])
+                    # Link a saved case
+                    try:
+                        _cases = fh.list_cases()
+                    except Exception:
+                        _cases = []
+                    _case_opts = ["— none —"] + [c["name"] for c in _cases]
+                    _cur = opt.get("case_name", "— none —")
+                    _idx = (_case_opts.index(_cur)
+                            if _cur in _case_opts else 0)
+                    _pick = le1.selectbox(
+                        "Link saved case", _case_opts, index=_idx,
+                        key=f"concept_opt_{di}_{oi}_caselink",
+                        label_visibility="collapsed")
+                    if _pick != "— none —":
+                        if opt.get("case_name") != _pick:
+                            # Load and attach the case payload
+                            try:
+                                _match = next(c for c in _cases
+                                               if c["name"] == _pick)
+                                _data = fh.load_case(_match["filename"])
+                                opt["case_payload"] = _data.get(
+                                    "payload", {})
+                                opt["case_name"] = _pick
+                            except Exception:
+                                pass
+                    else:
+                        if opt.get("case_name"):
+                            opt["case_name"] = None
+                            opt["case_payload"] = None
+                    # Upload a YAML/JSON case for this option
+                    _up = le2.file_uploader(
+                        "or upload YAML/JSON",
+                        type=["yaml", "yml", "json"],
+                        key=f"concept_opt_{di}_{oi}_upload",
+                        label_visibility="collapsed")
+                    if _up is not None:
+                        try:
+                            _raw = _up.read().decode("utf-8")
+                            if _up.name.lower().endswith(".json"):
+                                import json as _json
+                                _parsed = _json.loads(_raw)
+                            else:
+                                import yaml as _yaml
+                                _parsed = _yaml.safe_load(_raw)
+                            _pl = (_parsed.get("payload", _parsed)
+                                   if isinstance(_parsed, dict) else {})
+                            try:
+                                _pl = fh._restore_dataframes(_pl)
+                            except Exception:
+                                pass
+                            opt["case_payload"] = _pl
+                            opt["case_name"] = _up.name
+                        except Exception:
+                            pass
+                    # Patch override (optional, advanced)
+                    cur_patch_str = ", ".join(
+                        f"{k}: {v}"
+                        for k, v in opt.get("patches", {}).items())
+                    new_patch_str = le3.text_input(
+                        "Patches (optional)", value=cur_patch_str,
+                        key=f"concept_opt_{di}_{oi}_patches",
+                        label_visibility="collapsed",
+                        placeholder="oil_price_bbl: 55",
+                        help="Optional key:value overrides applied on top "
+                             "of the linked case (or the base case if no "
+                             "case is linked).")
+                    parsed = {}
+                    for pair in new_patch_str.split(","):
+                        if ":" not in pair:
+                            continue
+                        k, v = pair.split(":", 1)
+                        k, v = k.strip(), v.strip()
+                        if not k:
+                            continue
+                        try:
+                            v_typed = float(v)
+                            if v_typed.is_integer() and "." not in v:
+                                v_typed = int(v_typed)
+                        except ValueError:
+                            if v.lower() in ("true", "false"):
+                                v_typed = (v.lower() == "true")
+                            else:
+                                v_typed = v
+                        parsed[k] = v_typed
+                    opt["patches"] = parsed
             if opt_to_remove is not None:
                 d["options"].pop(opt_to_remove)
                 # Re-key selections
@@ -14178,9 +14497,35 @@ def concept_selector_section(default_start_date):
             run_c2.info(
                 f"Sweeping {n_combos:,} combinations; expect "
                 f"~{n_combos * 1.5:.0f}s on Streamlit Cloud.")
+    # ---- Run options (caching + probabilistic) ----
+    ro1, ro2 = st.columns(2)
+    use_cache = ro1.checkbox(
+        "♻️ Cache combinations (skip unchanged)", value=True,
+        key="concept_use_cache",
+        help="Cache each combination's result keyed by the hash of its "
+             "patched payload. On the next Run, combinations whose "
+             "inputs haven't changed are reused instead of recomputed — "
+             "big speed-up when you tweak one dimension and re-sweep.")
+    mc_per_concept = ro2.checkbox(
+        "🎲 Probabilistic (Monte-Carlo P90/Mean/P10 per combo)",
+        value=False, key="concept_mc",
+        help="Run a fast Monte-Carlo pass per combination (oil price, "
+             "OPEX and CAPEX varied ±20% lognormal) to get a real "
+             "P90/Mean/P10 NPV for each, instead of a single "
+             "deterministic value. Slower — adds ~100 evaluations per "
+             "combination.")
+    if mc_per_concept:
+        mc_iters = st.slider(
+            "Monte-Carlo iterations per combination", 25, 250, 100, 25,
+            key="concept_mc_iters",
+            help="More iterations = smoother percentiles but slower. "
+                 "100 is a good screening compromise.")
+    else:
+        mc_iters = 0
+
     if do_run:
-        # Build the base payload — from a loaded case if one is set,
-        # otherwise from the current sidebar state.
+        # Base payload — fallback for options that don't link their own
+        # case (their patches apply on top of this).
         try:
             base_payload = st.session_state.get("concept_base_payload")
             if not base_payload:
@@ -14188,31 +14533,71 @@ def concept_selector_section(default_start_date):
         except Exception as e:
             st.error(f"Could not snapshot the base case: {e}")
             return
-        # Enumerate combinations
-        import itertools
-        picks_lists = []
+        if "concept_combo_cache" not in st.session_state:
+            st.session_state["concept_combo_cache"] = {}
+        combo_cache = st.session_state["concept_combo_cache"]
+        cache_hits = 0
+        import hashlib as _hashlib
+
+        # Build the run list: EVERY selected option across all dimensions
+        # is its own standalone case. No cartesian product — each option
+        # runs once, on its own linked case (or the base case + its
+        # patches if no case is linked). This is the "commingled" batch:
+        # we gather all the individual option-cases into one list and run
+        # them one by one.
+        run_items = []  # (dim_name, option_dict)
         for di, d in enumerate(dimensions):
-            sel_idxs = sorted(selected.get(di, set()))
-            if not sel_idxs:
-                continue
-            picks_lists.append([(d["name"], d["options"][oi])
-                                 for oi in sel_idxs])
+            for oi in sorted(selected.get(di, set())):
+                run_items.append((d["name"], d["options"][oi]))
+
         results_new = {}
-        progress = st.progress(0.0, text="Running batch…")
-        total = 1
-        for L in picks_lists:
-            total *= len(L)
+        total = len(run_items)
+        if total == 0:
+            st.warning("No options selected — tick at least one option to "
+                       "run.")
+            return
+        progress = st.progress(0.0, text="Running cases…")
         done = 0
-        for combo in itertools.product(*picks_lists):
-            picks_for_apply = [
-                {"label": opt["label"], "patches": opt.get("patches", {})}
-                for _, opt in combo]
-            patched = _apply_concept_patches(base_payload, picks_for_apply)
-            # Name = dimension labels joined
-            name = " · ".join(opt["label"] for _, opt in combo)
-            patched.setdefault("_meta", {})["name"] = name
+        for dim_name, opt in run_items:
+            label = opt["label"]
+            name = f"{dim_name} — {label}"
+            # Resolve the case for this option: its linked case payload if
+            # present, else the base payload; then apply any patch
+            # overrides on top.
+            import copy as _copy
+            if opt.get("case_payload"):
+                case_payload = _copy.deepcopy(opt["case_payload"])
+            else:
+                case_payload = _copy.deepcopy(base_payload)
+            if opt.get("patches"):
+                case_payload = _apply_concept_patches(
+                    case_payload,
+                    [{"label": label, "patches": opt["patches"]}])
+            case_payload.setdefault("_meta", {})["name"] = name
+            key = (dim_name, label)
+
             try:
-                res = run_payload_case(patched, default_start_date,
+                _payload_sig = json.dumps(case_payload, sort_keys=True,
+                                           default=str)
+            except Exception:
+                _payload_sig = repr(case_payload)
+            _cache_key = _hashlib.md5(
+                (_payload_sig + f"|mc{mc_iters}").encode()).hexdigest()
+            if use_cache and _cache_key in combo_cache:
+                cached = dict(combo_cache[_cache_key])
+                cached["name"] = name
+                cached["picks"] = [(dim_name, label)]
+                cached["dim"] = dim_name
+                cached["label"] = label
+                results_new[key] = cached
+                cache_hits += 1
+                done += 1
+                progress.progress(done / max(total, 1),
+                                   text=f"Running cases… {done}/{total} "
+                                        f"(cache hits: {cache_hits})")
+                continue
+            try:
+                res = run_payload_case(case_payload, default_start_date,
                                         default_units=st.session_state.get(
                                             "units", "field"))
                 if res.get("ok"):
@@ -14231,9 +14616,47 @@ def concept_selector_section(default_start_date):
                 else:
                     npv_MM = cum_primary = rf = irr = breakeven = None
                     capex_disc_MM = co2_total_Mt = None
-                key = frozenset((dn, opt["label"]) for dn, opt in combo)
-                results_new[key] = {
+                # ---- Optional Monte-Carlo pass for this case ----
+                npv_p90 = npv_p10 = npv_mc_mean = None
+                if mc_iters > 0 and res.get("ok"):
+                    import numpy as _np
+                    _rng = _np.random.default_rng(12345)
+                    _npvs = []
+                    _sc0 = case_payload.get("scalar", {})
+                    _op0 = float(_sc0.get("oil_price_bbl", 75.0))
+                    _ov0 = float(_sc0.get("opex_var_oil",
+                                           _sc0.get("opex_var_gas", 5.5)))
+                    _cw0 = float(_sc0.get("capex_well", 120.0))
+                    for _ in range(int(mc_iters)):
+                        _trial = dict(case_payload)
+                        _ts = dict(_sc0)
+                        _ts["oil_price_bbl"] = _op0 * float(
+                            _rng.lognormal(0, 0.20))
+                        _okey = ("opex_var_oil" if "opex_var_oil" in _ts
+                                  else "opex_var_gas")
+                        _ts[_okey] = _ov0 * float(_rng.lognormal(0, 0.20))
+                        _ts["capex_well"] = _cw0 * float(
+                            _rng.lognormal(0, 0.20))
+                        _trial["scalar"] = _ts
+                        try:
+                            _r = run_payload_case(
+                                _trial, default_start_date,
+                                default_units=st.session_state.get(
+                                    "units", "field"))
+                            _n = _r.get("kpis", {}).get("npv_MM")
+                            if _n is not None:
+                                _npvs.append(_n)
+                        except Exception:
+                            pass
+                    if _npvs:
+                        _arr = _np.array(_npvs, dtype=float)
+                        npv_p90 = float(_np.percentile(_arr, 10))
+                        npv_p10 = float(_np.percentile(_arr, 90))
+                        npv_mc_mean = float(_np.mean(_arr))
+                rec_payload = {
                     "name": name,
+                    "dim": dim_name,
+                    "label": label,
                     "npv_MM": npv_MM,
                     "cum_primary": cum_primary,
                     "final_rf": rf,
@@ -14241,25 +14664,34 @@ def concept_selector_section(default_start_date):
                     "breakeven_oil": breakeven,
                     "capex_disc_MM": capex_disc_MM,
                     "co2_total_Mt": co2_total_Mt,
-                    "picks": [(dn, opt["label"]) for dn, opt in combo],
+                    "npv_p90": npv_p90,
+                    "npv_p10": npv_p10,
+                    "npv_mc_mean": npv_mc_mean,
+                    "picks": [(dim_name, label)],
                     "ok": res.get("ok", False),
                     "error": res.get("error"),
                 }
+                results_new[key] = rec_payload
+                if use_cache:
+                    combo_cache[_cache_key] = dict(rec_payload)
             except Exception as e:
-                key = frozenset((dn, opt["label"]) for dn, opt in combo)
                 results_new[key] = {
-                    "name": name, "npv_MM": None, "cum_primary": None,
+                    "name": name, "dim": dim_name, "label": label,
+                    "npv_MM": None, "cum_primary": None,
                     "final_rf": None, "irr": None, "breakeven_oil": None,
                     "capex_disc_MM": None, "co2_total_Mt": None,
-                    "picks": [(dn, opt["label"]) for dn, opt in combo],
+                    "npv_p90": None, "npv_p10": None, "npv_mc_mean": None,
+                    "picks": [(dim_name, label)],
                     "ok": False, "error": str(e),
                 }
             done += 1
             progress.progress(done / max(total, 1),
-                               text=f"Running batch… {done}/{total}")
+                               text=f"Running cases… {done}/{total} "
+                                    f"(cache hits: {cache_hits})")
         progress.empty()
         st.session_state["concept_results"] = results_new
-        st.success(f"Completed {done}/{total} combinations.")
+        st.success(f"Completed {done}/{total} cases "
+                   f"({cache_hits} reused from cache).")
         st.rerun()
 
     # ---- Results table ----
@@ -14268,9 +14700,11 @@ def concept_selector_section(default_start_date):
         st.markdown("#### 📊 Batch results")
         rows = []
         for key, r in results.items():
-            row = {"Combination": r.get("name", "")}
-            for dim_name, label in key:
-                row[dim_name] = label
+            row = {"Dimension": r.get("dim", key[0] if isinstance(
+                       key, tuple) else ""),
+                   "Option": r.get("label", key[1] if isinstance(
+                       key, tuple) and len(key) > 1 else ""),
+                   "Case": r.get("name", "")}
             row["NPV ($MM)"] = (f"{r['npv_MM']:,.0f}"
                                  if r.get("npv_MM") is not None else "—")
             row["IRR"] = (f"{r['irr']:.1%}"
@@ -14428,26 +14862,28 @@ def concept_selector_section(default_start_date):
         if cur_grp not in dim_names and dim_names:
             cur_grp = dim_names[0]
         grouping_dim = st.selectbox(
-            "Group concepts by",
+            "Show options from dimension",
             options=dim_names,
             index=dim_names.index(cur_grp) if cur_grp in dim_names else 0,
             key=grp_key,
-            help="Each value of this dimension becomes one concept; "
-                 "the P90/Mean/P10 spread is computed across every "
-                 "combination of the OTHER dimensions.")
+            help="Each option in this dimension is one concept on the "
+                 "chart. (Each option ran as its own standalone case.)")
 
         # Optional concept-label rewrites (e.g. "FPSO" → "Recommended
         # Concept"). Stored as JSON-ish dict in session_state.
         rename_key = f"concept_compare_renames_{grouping_dim}"
         if rename_key not in st.session_state:
             st.session_state[rename_key] = {}
-        # Build the group → list-of-results mapping
+        # Build the group → list-of-results mapping. Each result belongs
+        # to exactly one dimension (it's a single option-case), so we
+        # filter to the chosen dimension and key by the option label.
         groups = {}  # concept_label → list of result dicts
         for r in results.values():
             if not r.get("ok"):
                 continue
-            picks_dict = dict(r.get("picks", []))
-            grp_value = picks_dict.get(grouping_dim, "?")
+            if r.get("dim") != grouping_dim:
+                continue
+            grp_value = r.get("label", "?")
             disp_label = st.session_state[rename_key].get(
                 grp_value, grp_value)
             groups.setdefault(disp_label, []).append(r)
@@ -14458,9 +14894,9 @@ def concept_selector_section(default_start_date):
                 "Override the auto-generated concept labels — e.g. tag "
                 "your favourite case as 'Recommended Concept' so it "
                 "stands out on the chart.")
-            for raw_label in sorted({dict(r.get("picks", [])).get(
-                    grouping_dim, "?") for r in results.values()
-                    if r.get("ok")}):
+            for raw_label in sorted({r.get("label", "?")
+                    for r in results.values()
+                    if r.get("ok") and r.get("dim") == grouping_dim}):
                 new_lbl = st.text_input(
                     f"'{raw_label}' →",
                     value=st.session_state[rename_key].get(
@@ -14502,16 +14938,30 @@ def concept_selector_section(default_start_date):
                      if r.get("co2_total_Mt") is not None], dtype=float)
                 if len(npvs) == 0:
                     continue
-                # P90 = downside (10th pct), P10 = upside (90th pct) —
-                # petroleum convention (P90 is the value 90% of cases
-                # exceed; equivalent to the 10th percentile of the
-                # underlying distribution).
-                p90 = float(np.percentile(npvs, 10))
-                p10 = float(np.percentile(npvs, 90))
-                mean_npv = float(np.mean(npvs))
-                # CAPEX representative: the median of the CAPEX values
-                # in this group (CAPEX is dominated by the facility +
-                # well count, not the price/strategy distribution).
+                # If a Monte-Carlo pass was run, each case carries its own
+                # P90/Mean/P10 from the probabilistic NPV distribution —
+                # use those directly (they're the real uncertainty band).
+                # Otherwise fall back to the spread across the cases in
+                # this group (degenerate to a point for a single case).
+                mc_p90s = [r["npv_p90"] for r in rs
+                           if r.get("npv_p90") is not None]
+                mc_p10s = [r["npv_p10"] for r in rs
+                           if r.get("npv_p10") is not None]
+                mc_means = [r["npv_mc_mean"] for r in rs
+                            if r.get("npv_mc_mean") is not None]
+                if mc_p90s and mc_p10s:
+                    p90 = float(np.mean(mc_p90s))
+                    p10 = float(np.mean(mc_p10s))
+                    mean_npv = (float(np.mean(mc_means)) if mc_means
+                                else float(np.mean(npvs)))
+                    is_probabilistic = True
+                else:
+                    # P90 = downside (10th pct), P10 = upside (90th pct) —
+                    # petroleum convention.
+                    p90 = float(np.percentile(npvs, 10))
+                    p10 = float(np.percentile(npvs, 90))
+                    mean_npv = float(np.mean(npvs))
+                    is_probabilistic = False
                 cap_med = (float(np.median(capexes)) if len(capexes)
                             else 0.0)
                 be_med = (float(np.median(bes)) if len(bes) else None)
@@ -14524,7 +14974,16 @@ def concept_selector_section(default_start_date):
                     "breakeven_oil": be_med,
                     "emissions_Mt": em_med,
                     "n_cases": len(npvs),
+                    "probabilistic": is_probabilistic,
                 })
+
+            # ---- Pareto front (#7) ----
+            # Flag concepts on the efficient frontier (max NPV for min
+            # CAPEX). Dominated concepts are greyed so the eye goes to
+            # the frontier.
+            pareto_labels = _concept_pareto_front(chart_rows)
+            for r in chart_rows:
+                r["pareto"] = (r["concept"] in pareto_labels)
 
             if not chart_rows:
                 st.info("Selected concepts have no successful results.")
@@ -14559,10 +15018,17 @@ def concept_selector_section(default_start_date):
                     y=[r["mean"] for r in chart_rows],
                     mode="markers+text",
                     name="Mean",
-                    marker=dict(size=18, color=colors_npv[1],
-                                 line=dict(color="black", width=1.5),
-                                 symbol="circle"),
-                    text=[f"<b>{r['concept']}</b>" for r in chart_rows],
+                    marker=dict(
+                        size=[20 if r.get("pareto") else 15
+                              for r in chart_rows],
+                        color=["#2ca02c" if r.get("pareto") else "#cccccc"
+                               for r in chart_rows],
+                        line=dict(color="black", width=1.5),
+                        symbol=["star" if r.get("pareto") else "circle"
+                                for r in chart_rows]),
+                    text=[(f"<b>{r['concept']}</b>" if r.get("pareto")
+                           else f"{r['concept']} (dominated)")
+                          for r in chart_rows],
                     textposition="middle right",
                     textfont=dict(size=11, color="black"),
                     hovertemplate=(
@@ -14654,6 +15120,17 @@ def concept_selector_section(default_start_date):
                                   secondary_y=False)
                 st.plotly_chart(fh.apply_plot_template(fig_cc),
                                 use_container_width=True)
+                _any_prob = any(r.get("probabilistic")
+                                 for r in chart_rows)
+                st.caption(
+                    "★ = on the **Pareto frontier** (no other concept "
+                    "has both lower CAPEX and higher NPV); grey circles "
+                    "are dominated. "
+                    + ("P90/Mean/P10 are from the **Monte-Carlo** pass "
+                       "per case." if _any_prob else
+                       "P90/Mean/P10 reflect the spread across cases in "
+                       "each group — enable the Monte-Carlo option before "
+                       "running for a true probabilistic band."))
 
                 # Companion summary table
                 df_cc = pd.DataFrame(chart_rows)
@@ -14812,11 +15289,17 @@ def concept_selector_section(default_start_date):
 
             # Build initial dataframe from session_state + criteria + concepts
             stored = st.session_state[qual_state_key]
+            # Per-criterion weights (default 1.0). Keyed by (type,criterion).
+            qual_weights_key = "concept_qual_weights"
+            if qual_weights_key not in st.session_state:
+                st.session_state[qual_weights_key] = {}
+            weights_store = st.session_state[qual_weights_key]
             rows = []
             for _, crit_row in criteria.iterrows():
                 t = str(crit_row["Type"])
                 c = str(crit_row["Criterion"])
-                row = {"Type": t, "Criterion": c}
+                row = {"Type": t, "Criterion": c,
+                       "Weight": float(weights_store.get((t, c), 1.0))}
                 for cn in qual_concepts:
                     row[cn] = stored.get((t, c), {}).get(
                         cn, COLOUR_DEFAULT)
@@ -14846,9 +15329,15 @@ def concept_selector_section(default_start_date):
             # change the rating; we commit back to session_state.
             col_config = {
                 "Type": st.column_config.TextColumn(
-                    "Type", width="medium", disabled=True),
+                    "Type", width="small", disabled=True),
                 "Criterion": st.column_config.TextColumn(
-                    "Criterion", width="large", disabled=True),
+                    "Criterion", width="medium", disabled=True),
+                "Weight": st.column_config.NumberColumn(
+                    "Weight", width="small", min_value=0.0,
+                    max_value=10.0, step=0.5, format="%.1f",
+                    help="Relative importance of this criterion in the "
+                         "weighted score. 0 = ignore, higher = more "
+                         "influence."),
             }
             for cn in qual_concepts:
                 col_config[cn] = st.column_config.SelectboxColumn(
@@ -14867,13 +15356,17 @@ def concept_selector_section(default_start_date):
                 key="concept_qual_matrix_editor",
             )
 
-            # Commit back into the stable state dict
+            # Commit ratings + weights back into the stable state dicts
             for _, mrow in edited_matrix.iterrows():
                 key = (str(mrow["Type"]), str(mrow["Criterion"]))
                 stored.setdefault(key, {})
                 for cn in qual_concepts:
                     if cn in mrow.index:
                         stored[key][cn] = str(mrow[cn])
+                try:
+                    weights_store[key] = float(mrow.get("Weight", 1.0))
+                except Exception:
+                    weights_store[key] = 1.0
 
             # ---- Render the matrix as a coloured HTML/SVG view ----
             # The editor is functional but visually dull. Below it we
@@ -14939,38 +15432,120 @@ def concept_selector_section(default_start_date):
             html_rows.append("</table>")
             st.markdown("".join(html_rows), unsafe_allow_html=True)
 
-            # ---- Tally summary ----
-            # Count greens / yellows / reds per concept — handy for a
-            # quick narrative "Concept A has 18 greens vs Concept C's 12".
+            # ---- Tally + weighted score summary ----
             st.markdown("##### Score summary")
+            _val = {"🟢 Green": 1.0, "🟡 Yellow": 0.0,
+                    "🔴 Red": -1.0, "⚪ N/A": 0.0}
             summary_rows = []
+            qual_scores = {}   # concept → weighted score (for combined rank)
             for cn in qual_concepts:
-                g = sum(1 for _, mrow in edited_matrix.iterrows()
-                         if mrow.get(cn) == "🟢 Green")
-                y = sum(1 for _, mrow in edited_matrix.iterrows()
-                         if mrow.get(cn) == "🟡 Yellow")
-                r = sum(1 for _, mrow in edited_matrix.iterrows()
-                         if mrow.get(cn) == "🔴 Red")
-                na = sum(1 for _, mrow in edited_matrix.iterrows()
-                          if mrow.get(cn) == "⚪ N/A")
-                # Simple weighted score: green = +1, yellow = 0,
-                # red = −1, n/a = 0. Lets the user rank concepts on
-                # the qualitative dimension alone.
-                score = g - r
+                g = y = r = na = 0
+                weighted_num = 0.0
+                weight_den = 0.0
+                for _, mrow in edited_matrix.iterrows():
+                    rating = mrow.get(cn)
+                    w = float(mrow.get("Weight", 1.0) or 0.0)
+                    if rating == "🟢 Green":
+                        g += 1
+                    elif rating == "🟡 Yellow":
+                        y += 1
+                    elif rating == "🔴 Red":
+                        r += 1
+                    else:
+                        na += 1
+                    if rating != "⚪ N/A":
+                        weighted_num += _val.get(rating, 0.0) * w
+                        weight_den += w
+                net = g - r
+                # Weighted score normalised to [-1, +1] over the
+                # non-N/A criteria so concepts with different N/A counts
+                # stay comparable.
+                wscore = (weighted_num / weight_den
+                          if weight_den > 0 else 0.0)
+                qual_scores[cn] = wscore
                 summary_rows.append({
                     "Concept": cn, "🟢 Green": g, "🟡 Yellow": y,
                     "🔴 Red": r, "⚪ N/A": na,
-                    "Net score (G−R)": score,
+                    "Net (G−R)": net,
+                    "Weighted score": round(wscore, 3),
                 })
             df_summary = pd.DataFrame(summary_rows).sort_values(
-                "Net score (G−R)", ascending=False)
+                "Weighted score", ascending=False)
             st.dataframe(df_summary, use_container_width=True,
                           hide_index=True)
             st.caption(
-                "**Net score** = green count − red count, scored evenly "
-                "across criteria (no weighting). Use it as a quick "
-                "ordinal ranking — pair it with the NPV ranking from "
-                "the bubble chart for a balanced view.")
+                "**Net (G−R)** = green − red, unweighted. **Weighted "
+                "score** = Σ(rating×weight) ÷ Σweight over non-N/A "
+                "criteria, where green=+1, yellow=0, red=−1 — normalised "
+                "to [−1, +1] so it ranks concepts on the qualitative "
+                "axis accounting for the per-criterion weights you set.")
+            # Stash for the combined ranking below.
+            st.session_state["_concept_qual_scores"] = qual_scores
+
+            # ---- Combined ranking (#4) ----
+            # Blend the quantitative NPV ranking with the qualitative
+            # weighted score into a single ordered recommendation. The
+            # mix is user-configurable; default 70% economics / 30%
+            # qualitative — a common DG screening split.
+            st.markdown("##### 🏆 Combined ranking — economics + qualitative")
+            # Quantitative score per concept: mean NPV of the matching
+            # group (same grouping dimension as the bubble chart).
+            quant_npv = {}
+            try:
+                for cn in qual_concepts:
+                    rs = groups.get(cn, [])
+                    npvs = [r["npv_MM"] for r in rs
+                            if r.get("npv_MM") is not None]
+                    if npvs:
+                        quant_npv[cn] = float(np.mean(npvs))
+            except Exception:
+                quant_npv = {}
+            if not quant_npv:
+                st.info(
+                    "Run a batch and make sure the qualitative concept "
+                    "columns match a swept dimension to see the combined "
+                    "ranking.")
+            else:
+                wq = st.slider(
+                    "Economics weight (vs qualitative)", 0.0, 1.0, 0.70,
+                    0.05, key="concept_combined_weight",
+                    help="1.0 = rank purely on NPV; 0.0 = rank purely on "
+                         "the qualitative weighted score. Default 0.70 "
+                         "leans on economics but lets HSE / operability "
+                         "break ties.")
+                # Normalise each axis to [0,1] across the concepts so the
+                # blend is scale-free.
+                _npv_vals = list(quant_npv.values())
+                _nlo, _nhi = min(_npv_vals), max(_npv_vals)
+
+                def _nz(v):
+                    return ((v - _nlo) / (_nhi - _nlo)
+                            if _nhi > _nlo else 0.5)
+                # Qual score is already in [-1,1] → map to [0,1].
+                comb_rows = []
+                for cn in quant_npv:
+                    q_n = _nz(quant_npv[cn])
+                    q_q = (qual_scores.get(cn, 0.0) + 1.0) / 2.0
+                    composite = wq * q_n + (1 - wq) * q_q
+                    comb_rows.append({
+                        "Concept": cn,
+                        "Mean NPV ($MM)": f"{quant_npv[cn]:,.0f}",
+                        "Econ score (0-1)": round(q_n, 3),
+                        "Qual score (0-1)": round(q_q, 3),
+                        "Composite": round(composite, 3),
+                    })
+                df_comb = pd.DataFrame(comb_rows).sort_values(
+                    "Composite", ascending=False).reset_index(drop=True)
+                df_comb.insert(0, "Rank", df_comb.index + 1)
+                st.dataframe(df_comb, use_container_width=True,
+                              hide_index=True)
+                _winner = df_comb.iloc[0]["Concept"]
+                st.success(
+                    f"🏆 **Top-ranked concept: {_winner}** "
+                    f"(at {wq:.0%} economics / {1-wq:.0%} qualitative). "
+                    f"Adjust the weight slider to test how sensitive the "
+                    f"recommendation is to the economics-vs-qualitative "
+                    f"balance.")
 
         # ============================================================
         # DESIGN-TO-COST STAIRCASE

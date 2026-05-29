@@ -39,6 +39,56 @@ import pandas as pd
 CASE_DIR = Path.home() / ".field_prognosis_cases"
 CASE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Concept studies (hanging-garden batch sweeps) live in their own
+# subdirectory so they don't clutter the case picker.
+STUDY_DIR = CASE_DIR / "concept_studies"
+STUDY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def list_concept_studies() -> list:
+    """Return saved concept studies with metadata."""
+    studies = []
+    for p in sorted(STUDY_DIR.glob("*.json")):
+        try:
+            with open(p) as f:
+                data = json.load(f)
+            root = data.get("fieldvista_concept_study", {})
+            studies.append({
+                "name": data.get("_study_name", p.stem),
+                "saved_at": root.get("generated_utc", ""),
+                "n_combinations": root.get("n_combinations", 0),
+                "filename": p.name,
+            })
+        except Exception:
+            continue
+    studies.sort(key=lambda c: c.get("saved_at", ""), reverse=True)
+    return studies
+
+
+def save_concept_study(name: str, study_doc: dict) -> str:
+    """Persist a concept study document to disk. Returns the path."""
+    safe = _safe_name(name)
+    fpath = STUDY_DIR / f"{safe}.json"
+    out = dict(study_doc)
+    out["_study_name"] = name
+    with open(fpath, "w") as f:
+        json.dump(out, f, default=_json_default, indent=2)
+    return str(fpath)
+
+
+def load_concept_study(filename: str) -> dict:
+    fpath = STUDY_DIR / filename
+    with open(fpath) as f:
+        return json.load(f)
+
+
+def delete_concept_study(filename: str) -> bool:
+    fpath = STUDY_DIR / filename
+    if fpath.exists():
+        fpath.unlink()
+        return True
+    return False
+
 
 def _safe_name(name: str) -> str:
     s = re.sub(r"[^A-Za-z0-9_\- ]+", "", name).strip().replace(" ", "_")
