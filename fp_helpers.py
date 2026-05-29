@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "4.3"
+FP_HELPERS_VERSION = "4.4"
 
 import io
 import json
@@ -55,7 +55,9 @@ def list_concept_studies() -> list:
             root = data.get("fieldvista_concept_study", {})
             studies.append({
                 "name": data.get("_study_name", p.stem),
-                "saved_at": root.get("generated_utc", ""),
+                "saved_at": (data.get("_saved_at")
+                             or root.get("generated_utc", "")),
+                "version": data.get("_version", 1),
                 "n_combinations": root.get("n_combinations", 0),
                 "filename": p.name,
             })
@@ -65,15 +67,39 @@ def list_concept_studies() -> list:
     return studies
 
 
-def save_concept_study(name: str, study_doc: dict) -> str:
-    """Persist a concept study document to disk. Returns the path."""
+def save_concept_study(name: str, study_doc: dict,
+                       version: int | None = None) -> str:
+    """Persist a concept study to disk with a saved-date and version.
+
+    If `version` is None, auto-increments from any existing study of the
+    same name (so repeated saves of "My study" become v1, v2, v3 …).
+    Returns the path.
+    """
+    from datetime import datetime as _dt, timezone as _tz
     safe = _safe_name(name)
     fpath = STUDY_DIR / f"{safe}.json"
+    if version is None:
+        version = 1
+        if fpath.exists():
+            try:
+                with open(fpath) as f:
+                    prev = json.load(f)
+                version = int(prev.get("_version", 1)) + 1
+            except Exception:
+                version = 1
     out = dict(study_doc)
     out["_study_name"] = name
+    out["_version"] = version
+    out["_saved_at"] = _dt.now(_tz.utc).isoformat(timespec="seconds")
     with open(fpath, "w") as f:
         json.dump(out, f, default=_json_default, indent=2)
     return str(fpath)
+
+
+def duplicate_concept_study(filename: str, new_name: str) -> str:
+    """Copy an existing study under a new name (version reset to 1)."""
+    data = load_concept_study(filename)
+    return save_concept_study(new_name, data, version=1)
 
 
 def load_concept_study(filename: str) -> dict:
@@ -308,12 +334,27 @@ def breakeven_price(df, is_oil, econ_inputs, wells, base_oil_price: float,
 
     Returns dict with breakeven oil price, gas price, multiplier.
     Returns None for any field that can't be reached within bounds.
+
+    IMPORTANT — the breakeven is evaluated on a FIXED production profile
+    with the economic-limit cutoff DISABLED (horizon basis). Breakeven is
+    a property of the project's costs, volumes and price — it must not
+    depend on the scenario's starting oil price. If the price-dependent
+    economic cutoff were left on, a low trial price would truncate the
+    loss-making tail and the solver would converge to an artificially low
+    breakeven; worse, two cases that differ only in their assumed price
+    would report different breakevens (illogical). Forcing horizon mode
+    removes that coupling so a given field+cost structure has ONE
+    breakeven regardless of the price scenario it was run under.
     """
-    # Make a copy of econ to avoid mutating
     from copy import copy
 
+    # Neutralise the economic cutoff for the breakeven evaluation only.
+    e_base = copy(econ_inputs)
+    if hasattr(e_base, "economic_cutoff_mode"):
+        e_base.economic_cutoff_mode = "horizon"
+
     def npv_at(mult: float) -> float:
-        e = copy(econ_inputs)
+        e = copy(e_base)
         e.oil_price = base_oil_price * mult
         e.gas_price = base_gas_price * mult
         df_e = compute_economics_fn(df, is_oil, e, wells)

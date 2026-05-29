@@ -9039,7 +9039,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "4.3"
+    _EXPECTED_FP_VERSION = "4.4"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -13456,6 +13456,162 @@ _DEFAULT_CONCEPT_DIMENSIONS = [
 ]
 
 
+# Predefined concept-dimension templates mirroring the DG1 hanging-garden
+# building-block columns: Subsurface, Drilling & Well, SURF, Topside
+# facilities. Each is a list of dimensions the user can load as a starting
+# point and then edit. Patches are screening-level deltas — the user
+# refines them (or links full cases) per option.
+_CONCEPT_TEMPLATES = {
+    "Subsurface": [
+        {"name": "Drainage strategy", "description": "Recovery mechanism.",
+         "options": [
+             {"label": "Depletion", "description": "Primary depletion.",
+              "patches": {"strategy": "Depletion", "vrr": 0.0}},
+             {"label": "Water injection", "description": "Waterflood.",
+              "patches": {"strategy": "Water injection", "vrr": 1.0,
+                           "inj_eff": 0.85}},
+             {"label": "Gas injection", "description": "Gas re-injection.",
+              "patches": {"strategy": "Gas injection", "vrr": 1.0,
+                           "inj_eff": 0.80}},
+             {"label": "WAG", "description": "Water-alternating-gas.",
+              "patches": {"strategy": "WAG", "vrr": 1.05,
+                           "inj_eff": 0.90}},
+         ]},
+        {"name": "Production management", "description": "Gas/water mgmt.",
+         "options": [
+             {"label": "Gas re-injection", "description": "", "patches": {}},
+             {"label": "Gas export", "description": "", "patches": {}},
+             {"label": "PWRI", "description": "Produced-water re-injection.",
+              "patches": {}},
+         ]},
+        {"name": "Number of producers", "description": "Well count.",
+         "options": [
+             {"label": "4 wells", "description": "",
+              "patches": {"_n_producers_override": 4}},
+             {"label": "6 wells", "description": "",
+              "patches": {"_n_producers_override": 6}},
+             {"label": "8 wells", "description": "",
+              "patches": {"_n_producers_override": 8}},
+         ]},
+        {"name": "Lower completion", "description": "Sand/zone control.",
+         "options": [
+             {"label": "Open hole", "description": "", "patches": {}},
+             {"label": "Cased & perforated", "description": "",
+              "patches": {}},
+             {"label": "Screens / gravel pack", "description": "",
+              "patches": {}},
+         ]},
+    ],
+    "Drilling & Well": [
+        {"name": "Well type", "description": "Trajectory.",
+         "options": [
+             {"label": "Vertical", "description": "", "patches": {}},
+             {"label": "Deviated", "description": "", "patches": {}},
+             {"label": "Horizontal", "description": "", "patches": {}},
+         ]},
+        {"name": "Drilling rig", "description": "Rig class / dayrate.",
+         "options": [
+             {"label": "Jack-up", "description": "Shallow water.",
+              "patches": {"well_cost_mode": "rig_rate",
+                           "rig_dayrate": 250.0}},
+             {"label": "Semi-sub", "description": "Harsh environment.",
+              "patches": {"well_cost_mode": "rig_rate",
+                           "rig_dayrate": 500.0}},
+             {"label": "Drillship", "description": "Deep water.",
+              "patches": {"well_cost_mode": "rig_rate",
+                           "rig_dayrate": 700.0}},
+         ]},
+        {"name": "Completion type", "description": "Upper completion.",
+         "options": [
+             {"label": "Single zone", "description": "", "patches": {}},
+             {"label": "Smart (multi-zone)", "description": "ICVs.",
+              "patches": {}},
+             {"label": "Monobore", "description": "", "patches": {}},
+         ]},
+        {"name": "Artificial lift", "description": "Lift method.",
+         "options": [
+             {"label": "None (natural flow)", "description": "",
+              "patches": {}},
+             {"label": "Gas lift", "description": "", "patches": {}},
+             {"label": "ESP", "description": "", "patches": {}},
+         ]},
+    ],
+    "SURF": [
+        {"name": "Field architecture", "description": "SURF layout.",
+         "options": [
+             {"label": "Cluster (manifold)", "description": "", "patches": {}},
+             {"label": "Daisy chain", "description": "", "patches": {}},
+             {"label": "Satellite wells", "description": "", "patches": {}},
+             {"label": "Template", "description": "", "patches": {}},
+         ]},
+        {"name": "Host facility", "description": "Production hub.",
+         "options": [
+             {"label": "Tie-back to existing", "description": "",
+              "patches": {"_facility_capex_override_MM": 200.0}},
+             {"label": "New FPSO", "description": "",
+              "patches": {"_facility_capex_override_MM": 1700.0}},
+             {"label": "Subsea to shore", "description": "",
+              "patches": {"_facility_capex_override_MM": 900.0}},
+         ]},
+        {"name": "Flowline", "description": "Flowline type.",
+         "options": [
+             {"label": "Wet insulated", "description": "", "patches": {}},
+             {"label": "Pipe-in-pipe", "description": "", "patches": {}},
+             {"label": "Electrically heated (DEH)", "description": "",
+              "patches": {}},
+         ]},
+        {"name": "Hydrate management", "description": "Flow assurance.",
+         "options": [
+             {"label": "MEG with reclamation", "description": "",
+              "patches": {}},
+             {"label": "Methanol once-through", "description": "",
+              "patches": {}},
+             {"label": "Insulation only", "description": "", "patches": {}},
+         ]},
+        {"name": "Installation method", "description": "Pipelay.",
+         "options": [
+             {"label": "Reeling", "description": "", "patches": {}},
+             {"label": "S-lay", "description": "", "patches": {}},
+             {"label": "J-lay", "description": "", "patches": {}},
+         ]},
+    ],
+    "Topside facilities": [
+        {"name": "Processing capacity", "description": "Throughput basis.",
+         "options": [
+             {"label": "Use existing", "description": "", "patches": {}},
+             {"label": "Debottleneck", "description": "", "patches": {}},
+             {"label": "New train", "description": "", "patches": {}},
+         ]},
+        {"name": "Gas compression", "description": "Export/lift gas.",
+         "options": [
+             {"label": "Use existing", "description": "", "patches": {}},
+             {"label": "New compressor skid", "description": "",
+              "patches": {}},
+         ]},
+        {"name": "Power supply", "description": "Power to SURF/topside.",
+         "options": [
+             {"label": "Existing generation", "description": "",
+              "patches": {}},
+             {"label": "New gas turbine", "description": "", "patches": {}},
+             {"label": "Power from shore", "description": "", "patches": {}},
+         ]},
+        {"name": "Produced water", "description": "Water handling.",
+         "options": [
+             {"label": "Use existing", "description": "", "patches": {}},
+             {"label": "New CFU / cyclones", "description": "",
+              "patches": {}},
+             {"label": "PWRI", "description": "", "patches": {}},
+         ]},
+        {"name": "Living quarters", "description": "POB during tie-in.",
+         "options": [
+             {"label": "Spare LQ capacity", "description": "", "patches": {}},
+             {"label": "Temporary cabins", "description": "", "patches": {}},
+             {"label": "Flotel", "description": "", "patches": {}},
+         ]},
+    ],
+}
+
+
 def _concept_study_to_doc(dimensions, selected, results, base_source,
                           base_loaded):
     """Assemble the nested study dict (matrix + base + results)."""
@@ -13669,7 +13825,8 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
     """
     col_w = 230
     gap_x = 20
-    header_h = 64
+    title_h = 34          # dedicated band for the chart title
+    header_h = 64 + title_h   # headers sit below the title band
     row_h = 56
     row_gap = 10
     pad = 24
@@ -13709,7 +13866,7 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
            f'style="background:white;border:1px solid #ddd;'
            f'border-radius:8px;font-family:Helvetica,Arial,sans-serif">']
     # Title
-    out.append(f'<text x="{pad}" y="22" font-size="13" font-weight="600" '
+    out.append(f'<text x="{pad}" y="26" font-size="15" font-weight="700" '
                f'fill="#0B3D91">Concept long list — selected options '
                f'in colour, NPV ramp red → green</text>')
     # Columns
@@ -13773,34 +13930,37 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
                 f'<rect x="{x}" y="{y}" width="{col_w}" height="{row_h}" '
                 f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_w}" '
                 f'rx="4"/>')
-            # Option label — split into two lines if it has a space and is long
+            # Option label — centred, leaving the bottom strip for the
+            # NPV badge so the two never overlap.
             label = opt["label"]
-            if len(label) <= 28:
-                out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 + 4}" '
+            _label_y = (y + row_h / 2 - 6) if (is_selected
+                        and best_npv is not None) else (y + row_h / 2 + 4)
+            if len(label) <= 30:
+                out.append(f'<text x="{x + col_w/2}" y="{_label_y}" '
                            f'font-size="12" font-weight="600" '
                            f'fill="{text_color}" text-anchor="middle">'
                            f'{label}</text>')
             else:
-                # Split at midpoint space
                 mid = len(label) // 2
                 space = label.find(" ", mid - 4)
                 if space == -1:
                     space = mid
                 l1, l2 = label[:space].strip(), label[space:].strip()
-                out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 - 2}" '
-                           f'font-size="10" font-weight="600" '
+                out.append(f'<text x="{x + col_w/2}" y="{_label_y - 7}" '
+                           f'font-size="11" font-weight="600" '
                            f'fill="{text_color}" text-anchor="middle">'
                            f'{l1}</text>')
-                out.append(f'<text x="{x + col_w/2}" y="{y + row_h/2 + 12}" '
-                           f'font-size="10" font-weight="600" '
+                out.append(f'<text x="{x + col_w/2}" y="{_label_y + 7}" '
+                           f'font-size="11" font-weight="600" '
                            f'fill="{text_color}" text-anchor="middle">'
                            f'{l2}</text>')
-            # NPV badge if results exist
+            # NPV badge — centred along the bottom edge of the box, below
+            # the label, so it never sits on top of the option name.
             if is_selected and best_npv is not None:
                 out.append(
-                    f'<text x="{x + col_w - 8}" y="{y + 14}" '
-                    f'font-size="9" font-weight="700" fill="#222" '
-                    f'text-anchor="end">${best_npv:,.0f}MM</text>')
+                    f'<text x="{x + col_w/2}" y="{y + row_h - 7}" '
+                    f'font-size="10" font-weight="700" fill="#1a1a1a" '
+                    f'text-anchor="middle">${best_npv:,.0f}MM</text>')
     # Colour legend at the bottom
     if results_by_pick and npv_hi > npv_lo:
         legy = height - 20
@@ -14130,8 +14290,13 @@ def concept_selector_section(default_start_date):
                         st.session_state.get("concept_base_source",
                                               "Current sidebar inputs"),
                         st.session_state.get("concept_base_payload"))
-                    fh.save_concept_study(study_name, doc)
-                    st.success(f"Saved study '{study_name}'.")
+                    path = fh.save_concept_study(study_name, doc)
+                    # Reflect the version that was written
+                    _saved = [s for s in fh.list_concept_studies()
+                              if s["name"] == study_name]
+                    _v = _saved[0]["version"] if _saved else 1
+                    st.success(f"Saved '{study_name}' as v{_v} "
+                               f"({_saved[0]['saved_at'][:16].replace('T',' ') if _saved else ''}).")
                 except Exception as e:
                     st.error(f"Could not save study: {e}")
         with sl2:
@@ -14141,14 +14306,15 @@ def concept_selector_section(default_start_date):
             except Exception:
                 studies = []
             if studies:
-                labels = [f"{s['name']}  ·  {s['n_combinations']} combos  "
-                          f"·  {s.get('saved_at','')[:16]}"
+                labels = [f"{s['name']}  ·  v{s.get('version',1)}  ·  "
+                          f"{s['n_combinations']} cases  ·  "
+                          f"{s.get('saved_at','')[:16].replace('T',' ')}"
                           for s in studies]
                 pick = st.selectbox("Saved studies", labels,
                                      key="concept_study_pick")
                 idx = labels.index(pick)
-                lc1, lc2 = st.columns(2)
-                if lc1.button("📂 Load study", key="concept_load_study",
+                lc1, lc2, lc3 = st.columns(3)
+                if lc1.button("📂 Load", key="concept_load_study",
                                use_container_width=True):
                     try:
                         doc = fh.load_concept_study(
@@ -14159,12 +14325,25 @@ def concept_selector_section(default_start_date):
                         st.session_state["concept_results"] = {}
                         st.session_state["concept_applied"] = None
                         st.success(
-                            f"Loaded study '{studies[idx]['name']}'. "
+                            f"Loaded '{studies[idx]['name']}' "
+                            f"v{studies[idx].get('version',1)}. "
                             f"Re-run to populate results.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Could not load study: {e}")
-                if lc2.button("🗑️ Delete study",
+                if lc2.button("📑 Duplicate", key="concept_dup_study",
+                               use_container_width=True,
+                               help="Save a copy under a new name "
+                                    "(version reset to 1)."):
+                    try:
+                        _newn = f"{studies[idx]['name']} (copy)"
+                        fh.duplicate_concept_study(
+                            studies[idx]["filename"], _newn)
+                        st.success(f"Duplicated as '{_newn}'.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Could not duplicate: {e}")
+                if lc3.button("🗑️ Delete",
                                key="concept_delete_study",
                                use_container_width=True):
                     try:
@@ -14201,6 +14380,55 @@ def concept_selector_section(default_start_date):
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not import: {e}")
+
+    # ---- Template loader ----
+    # Predefined hanging-garden building-block sets (Subsurface, Drilling
+    # & Well, SURF, Topside) from the DG1 concept long-list. Loading one
+    # replaces the matrix with that discipline's dimensions, which the
+    # user can then rename / edit / link cases to.
+    with st.expander("📋 Load a predefined template "
+                      "(Subsurface / Drilling / SURF / Topside)",
+                      expanded=False):
+        st.caption(
+            "Start from a discipline-standard set of concept dimensions "
+            "mirroring the DG1 building-block columns. Loading replaces "
+            "the current matrix — save your work first if needed. You can "
+            "rename any dimension or option and link cases afterwards.")
+        tpl_cols = st.columns(len(_CONCEPT_TEMPLATES) + 1)
+        tpl_names = list(_CONCEPT_TEMPLATES.keys())
+        for _i, _tname in enumerate(tpl_names):
+            if tpl_cols[_i].button(_tname, key=f"concept_tpl_{_i}",
+                                    use_container_width=True):
+                import copy
+                st.session_state["concept_dimensions"] = copy.deepcopy(
+                    _CONCEPT_TEMPLATES[_tname])
+                st.session_state["concept_selected"] = {
+                    di: set(range(len(d["options"])))
+                    for di, d in enumerate(
+                        st.session_state["concept_dimensions"])}
+                st.session_state["concept_results"] = {}
+                st.session_state["concept_applied"] = None
+                st.success(f"Loaded the '{_tname}' template.")
+                st.rerun()
+        # "All disciplines" combines every template into one big matrix
+        if tpl_cols[-1].button("🔗 All combined", key="concept_tpl_all",
+                                use_container_width=True,
+                                help="Concatenate every discipline's "
+                                     "dimensions into one full-value-"
+                                     "chain matrix."):
+            import copy
+            combined = []
+            for _t in tpl_names:
+                combined.extend(copy.deepcopy(_CONCEPT_TEMPLATES[_t]))
+            st.session_state["concept_dimensions"] = combined
+            st.session_state["concept_selected"] = {
+                di: set(range(len(d["options"])))
+                for di, d in enumerate(combined)}
+            st.session_state["concept_results"] = {}
+            st.session_state["concept_applied"] = None
+            st.success("Loaded the full-value-chain template "
+                       "(all disciplines).")
+            st.rerun()
 
     # ---- Top toolbar ----
     tb1, tb2, tb3, tb4 = st.columns([2, 2, 2, 3])
@@ -14248,8 +14476,10 @@ def concept_selector_section(default_start_date):
 
     # ---- The garden view ----
     svg = _render_concept_garden_svg(dimensions, selected, results)
-    st.markdown(f'<div style="overflow-x:auto;width:100%">{svg}</div>',
-                 unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="overflow-x:auto;width:100%">'
+        f'<div style="min-width:900px">{svg}</div></div>',
+        unsafe_allow_html=True)
 
     # ---- Edit / pick UI in expanders, one per dimension ----
     st.markdown("#### Dimension editor & option picker")
@@ -15356,17 +15586,46 @@ def concept_selector_section(default_start_date):
                 key="concept_qual_matrix_editor",
             )
 
-            # Commit ratings + weights back into the stable state dicts
-            for _, mrow in edited_matrix.iterrows():
-                key = (str(mrow["Type"]), str(mrow["Criterion"]))
-                stored.setdefault(key, {})
+            # Edit-then-apply: committing every cell edit to session_state
+            # on each keystroke (and re-rendering the coloured view, the
+            # score summary and the combined ranking) makes the page lag
+            # badly. Instead we only commit when the user clicks Apply,
+            # and the downstream views render from the APPLIED snapshot,
+            # not the live editor. This keeps typing/clicking responsive.
+            qa1, qa2 = st.columns([2, 5])
+            if qa1.button("✅ Apply matrix edits", key="concept_qual_apply",
+                           type="primary", use_container_width=True,
+                           help="Commit the current ratings & weights. "
+                                "The coloured view and scores below only "
+                                "refresh on Apply — keeps editing smooth."):
+                for _, mrow in edited_matrix.iterrows():
+                    key = (str(mrow["Type"]), str(mrow["Criterion"]))
+                    stored.setdefault(key, {})
+                    for cn in qual_concepts:
+                        if cn in mrow.index:
+                            stored[key][cn] = str(mrow[cn])
+                    try:
+                        weights_store[key] = float(mrow.get("Weight", 1.0))
+                    except Exception:
+                        weights_store[key] = 1.0
+                st.session_state["_concept_qual_applied"] = True
+                st.rerun()
+            qa2.caption(
+                "Edit ratings/weights above, then click **Apply** to "
+                "refresh the coloured matrix, scores and ranking below.")
+
+            # Downstream views render from the committed snapshot
+            # (`stored`/`weights_store`), rebuilt into a frame so the
+            # rendering code below is unchanged but reads applied data.
+            applied_rows = []
+            for _, crit_row in criteria.iterrows():
+                t = str(crit_row["Type"]); c = str(crit_row["Criterion"])
+                row = {"Type": t, "Criterion": c,
+                       "Weight": float(weights_store.get((t, c), 1.0))}
                 for cn in qual_concepts:
-                    if cn in mrow.index:
-                        stored[key][cn] = str(mrow[cn])
-                try:
-                    weights_store[key] = float(mrow.get("Weight", 1.0))
-                except Exception:
-                    weights_store[key] = 1.0
+                    row[cn] = stored.get((t, c), {}).get(cn, COLOUR_DEFAULT)
+                applied_rows.append(row)
+            edited_matrix = pd.DataFrame(applied_rows)
 
             # ---- Render the matrix as a coloured HTML/SVG view ----
             # The editor is functional but visually dull. Below it we
