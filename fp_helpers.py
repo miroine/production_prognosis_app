@@ -2822,6 +2822,47 @@ def _rows_to_dict_of_lists(rows: list[dict]) -> dict:
     return {c: [r.get(c) for r in rows] for c in cols}
 
 
+def normalize_payload_tables(payload: dict) -> dict:
+    """Ensure every table in a payload is in the canonical column-oriented
+    dict-of-lists form that run_payload_case expects.
+
+    Cases loaded from disparate sources (JSON cases, hand-edited files,
+    YAML parsed loosely) can have tables as list-of-row-dicts. Reading
+    those with pdata.get('name') / pdata['rig'][i] fails or silently
+    returns wrong data — which is exactly what made the same case give
+    different results in the Concept Selector vs Field prognosis. This
+    normalises them so both paths feed the engine identical structures.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    tbls = out.get("tables")
+    if isinstance(tbls, dict):
+        fixed = {}
+        for tname, tbl in tbls.items():
+            if isinstance(tbl, list):
+                # list-of-row-dicts → dict-of-lists
+                fixed[tname] = _rows_to_dict_of_lists(
+                    [dict(r) for r in tbl if isinstance(r, dict)])
+            elif isinstance(tbl, dict):
+                # could be a __dataframe__ marker or already dict-of-lists
+                if "__dataframe__" in tbl and len(tbl) == 1:
+                    inner = tbl["__dataframe__"]
+                    if isinstance(inner, list):
+                        fixed[tname] = _rows_to_dict_of_lists(
+                            [dict(r) for r in inner if isinstance(r, dict)])
+                    elif isinstance(inner, dict):
+                        fixed[tname] = inner
+                    else:
+                        fixed[tname] = tbl
+                else:
+                    fixed[tname] = tbl
+            else:
+                fixed[tname] = tbl
+        out["tables"] = fixed
+    return out
+
+
 def payload_to_yaml(payload: dict, meta: dict | None = None) -> str:
     """Serialize an internal case payload to a YAML string.
 

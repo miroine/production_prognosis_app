@@ -14299,7 +14299,8 @@ def concept_selector_section(default_start_date):
                     try:
                         data = fh.load_case(cases[idx]["filename"])
                         st.session_state["concept_base_payload"] = \
-                            data.get("payload", {})
+                            fh.normalize_payload_tables(
+                                data.get("payload", {}))
                         st.success(
                             f"Loaded '{cases[idx]['name']}' as the batch "
                             f"base case.")
@@ -14316,18 +14317,22 @@ def concept_selector_section(default_start_date):
                     if up.name.lower().endswith(".json"):
                         import json as _json
                         parsed = _json.loads(raw)
+                        # Accept either a full case ({"payload": {...}}) or
+                        # a bare payload ({"scalar":..., "tables":...}).
+                        payload = parsed.get("payload", parsed) \
+                            if isinstance(parsed, dict) else {}
+                        try:
+                            payload = fh._restore_dataframes(payload)
+                        except Exception:
+                            pass
+                        payload = fh.normalize_payload_tables(payload)
                     else:
-                        import yaml as _yaml
-                        parsed = _yaml.safe_load(raw)
-                    # Accept either a full case ({"payload": {...}}) or a
-                    # bare payload ({"scalar":..., "tables":...}).
-                    payload = parsed.get("payload", parsed) \
-                        if isinstance(parsed, dict) else {}
-                    # Restore any serialised dataframes
-                    try:
-                        payload = fh._restore_dataframes(payload)
-                    except Exception:
-                        pass
+                        # YAML → use the canonical parser so tables are
+                        # converted from row-lists to dict-of-lists (same
+                        # as the main app's YAML import). This is what
+                        # makes a case give identical results whether run
+                        # in Field prognosis or loaded here.
+                        payload, _m = fh.yaml_to_payload(raw)
                     st.session_state["concept_base_payload"] = payload
                     st.success(
                         f"Loaded '{up.name}' as the batch base case "
@@ -14666,8 +14671,9 @@ def concept_selector_section(default_start_date):
                                 _match = next(c for c in _cases
                                                if c["name"] == _pick)
                                 _data = fh.load_case(_match["filename"])
-                                opt["case_payload"] = _data.get(
-                                    "payload", {})
+                                opt["case_payload"] = \
+                                    fh.normalize_payload_tables(
+                                        _data.get("payload", {}))
                                 opt["case_name"] = _pick
                             except Exception:
                                 pass
@@ -14687,19 +14693,31 @@ def concept_selector_section(default_start_date):
                             if _up.name.lower().endswith(".json"):
                                 import json as _json
                                 _parsed = _json.loads(_raw)
+                                _pl = (_parsed.get("payload", _parsed)
+                                       if isinstance(_parsed, dict) else {})
+                                try:
+                                    _pl = fh._restore_dataframes(_pl)
+                                except Exception:
+                                    pass
+                                # JSON cases store tables as dict-of-lists
+                                # already; normalise any row-list tables.
+                                _pl = fh.normalize_payload_tables(_pl)
                             else:
-                                import yaml as _yaml
-                                _parsed = _yaml.safe_load(_raw)
-                            _pl = (_parsed.get("payload", _parsed)
-                                   if isinstance(_parsed, dict) else {})
-                            try:
-                                _pl = fh._restore_dataframes(_pl)
-                            except Exception:
-                                pass
+                                # YAML: use the canonical parser so tables
+                                # (written as list-of-row-dicts) are
+                                # converted to the column-oriented
+                                # dict-of-lists that run_payload_case
+                                # expects — exactly like the main app's
+                                # YAML import. Using safe_load directly
+                                # here was the bug: tables stayed as row
+                                # lists and the engine read them wrong,
+                                # giving different results than Field
+                                # prognosis for the very same case.
+                                _pl, _meta_in = fh.yaml_to_payload(_raw)
                             opt["case_payload"] = _pl
                             opt["case_name"] = _up.name
-                        except Exception:
-                            pass
+                        except Exception as _e:
+                            st.warning(f"Could not parse {_up.name}: {_e}")
                     # Patch override (optional, advanced) — draft only,
                     # committed on Apply.
                     cur_patch_str = ", ".join(
