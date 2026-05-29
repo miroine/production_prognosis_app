@@ -11270,10 +11270,12 @@ def run_payload_case(payload: dict, default_start_date,
             pass
 
         # Total recoverable resources in oil-equivalent (MMboe):
-        # oil (MMstb) + gas (Bscf → MMboe at 6 Mscf/boe).
+        # oil (MMstb) + gas converted at 6 Mscf/boe.
+        # cum_gas is in Bscf: 1 Bscf = 1e9 scf = 1e6 Mscf; at 6 Mscf/boe
+        # that's 1e6/6 boe = (1/6) MMboe. So MMboe_gas = cum_gas_Bscf / 6.
         resources_mmboe = None
         try:
-            resources_mmboe = float(cum_oil) + float(cum_gas) * 1000.0 / 6.0
+            resources_mmboe = float(cum_oil) + float(cum_gas) / 6.0
         except Exception:
             pass
 
@@ -11543,6 +11545,18 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
     else:
         tariff_gas_f = to_field(float(scalar.get("tariff_gas", 0.3)), "price_gas", units)
 
+    # Fiscal regime — normalise the stored label to the engine token so a
+    # case saved with NCS (or PSC) actually applies that regime. Without
+    # this the regime was dropped and only the (often zero) flat tax_rate
+    # was used, making pre-tax NPV equal after-tax NPV.
+    _regime_raw = str(scalar.get("fiscal_regime", "Tax/Royalty"))
+    if _regime_raw.startswith("NCS"):
+        _regime = "NCS"
+    elif _regime_raw.startswith("PSC"):
+        _regime = "PSC"
+    else:
+        _regime = "Tax/Royalty"
+
     econ_dict = {
         "oil_price": oil_price_f,
         "gas_price": gas_price_f,
@@ -11561,6 +11575,13 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "ngl_opex_bbl": float(scalar.get("ngl_opex", 5.0)),
         "ngl_shrinkage_pct": float(scalar.get("ngl_shrink", 0.0)),
         "rig_meta": rig_meta,
+        "fiscal_regime": _regime,
+        "ncs_cit_rate": float(scalar.get("ncs_cit_rate", 0.22)),
+        "ncs_spt_rate": float(scalar.get("ncs_spt_rate", 0.718)),
+        "ncs_uplift_rate": float(scalar.get("ncs_uplift_rate", 0.1769)),
+        "ncs_depreciation_years": float(
+            scalar.get("ncs_depreciation_years", 6.0)),
+        "ncs_uplift_years": float(scalar.get("ncs_uplift_years", 4.0)),
         "economic_cutoff_mode": ("economic"
             if str(scalar.get("economic_cutoff_mode_label", "")).startswith("Economic")
             else "horizon"),
