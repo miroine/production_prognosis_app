@@ -3437,285 +3437,436 @@ def benchmark_concept_cost(grand_total_MMUSD: float,
 
 
 def build_well_completion_svg(spec: dict) -> str:
-    """Cross-section schematic of a well + its completion.
+    """Equinor-style well + completion cross-section schematic.
 
-    Draws a vertical (or deviated) wellbore from surface/mudline to TD,
-    with casing strings, cement, tubing, packer(s), completion type
-    (open hole / cased+perforated / screens / gravel pack), artificial
-    lift, and the reservoir interval. Deliberately schematic but
-    geologically sensible. `spec` keys (all optional, sensible defaults):
+    Draws a subsea well from sea surface through the mudline to TD with a
+    realistic build trajectory, telescoping casing strings with labelled
+    shoes (size + mTVD + mMD), DHSV, control/balancing/electric lines,
+    P/T gauge, production packer, middle-completion packer with plug,
+    liner hanger, and the lower completion (cemented & perforated liner,
+    gravel-pack screens, slotted liner or open hole) in the reservoir.
 
-      well_type            : "Vertical" | "Deviated" | "Horizontal"
-      water_depth_m        : seabed depth (0 for onshore/platform dry well)
-      td_m                 : total measured depth
-      reservoir_top_m      : top of reservoir (TVD)
-      reservoir_thick_m    : reservoir interval thickness
-      n_casing             : number of casing strings (2-4)
-      completion_type      : "Open hole" | "Cased & perforated" |
-                             "Slotted liner" | "Screens / gravel pack" |
-                             "Frac-pack"
-      lower_completion     : "Open hole" | "Cemented & perf" | "Screens"
-      artificial_lift      : "None" | "Gas lift" | "ESP" | "HSP"
-      zonal_isolation      : "None" | "Single packer" | "Smart (multi-zone)"
-      is_injector          : bool
+    `spec` keys (all optional, sensible defaults):
+      well_type        : "Vertical" | "Deviated" | "Horizontal"
+      water_depth_m    : seabed depth (0 = dry/platform tree at surface)
+      td_m             : total measured depth (MD)
+      reservoir_top_m  : top of reservoir (TVD)
+      reservoir_thick_m: reservoir interval thickness (TVD)
+      n_casing         : number of casing strings (2-4)
+      completion_type  : "Open hole" | "Cased & perforated" |
+                         "Slotted liner" | "Screens / gravel pack" |
+                         "Frac-pack"
+      artificial_lift  : "None" | "Gas lift" | "ESP" | "HSP"
+      zonal_isolation  : "None" | "Single packer" | "Smart (multi-zone)"
+      is_injector      : bool
     """
     def g(k, d=None):
         return spec.get(k, d)
 
     well_type = str(g("well_type", "Deviated"))
     wd = float(g("water_depth_m", 110.0) or 0.0)
-    td = float(g("td_m", 2600.0) or 2600.0)
-    res_top = float(g("reservoir_top_m", 2100.0) or 2100.0)
-    res_thick = float(g("reservoir_thick_m", 150.0) or 150.0)
+    td = float(g("td_m", 5122.0) or 5122.0)
+    res_top = float(g("reservoir_top_m", 3500.0) or 3500.0)
+    res_thick = float(g("reservoir_thick_m", 400.0) or 400.0)
     n_casing = int(g("n_casing", 3) or 3)
     completion = str(g("completion_type", "Cased & perforated"))
     artificial = str(g("artificial_lift", "None"))
     zonal = str(g("zonal_isolation", "Single packer"))
     is_inj = bool(g("is_injector", False))
 
-    W, H = 460, 640
-    surf_y = 70                     # surface / wellhead y
-    td_y = H - 40                   # TD y on canvas
-    # Map a TVD depth (m) to a canvas y
-    max_depth = max(td, res_top + res_thick) * 1.05
+    # Canvas — taller and with a right-hand margin for callout labels.
+    W, H = 620, 760
+    surf_y = 96                       # sea-surface y
+    pad_bottom = 60
+    # Mudline sits a little below the surface when offshore.
+    mud_frac = 0.16 if wd > 0 else 0.0
+    mud_y = surf_y + (H - surf_y - pad_bottom) * mud_frac if wd > 0 else surf_y
 
-    def depth_to_y(d_m):
-        return surf_y + (d_m / max_depth) * (td_y - surf_y)
+    # Depth axis maps TVD → y. We anchor a few real depths from the
+    # reference (30" @244, 20" @1200, 14" @3000, liner shoe @4047, TD).
+    max_depth = max(td, res_top + res_thick) * 1.04
 
-    cx = W // 2                     # wellbore centre x at surface
+    def d2y(d_tvd):
+        return mud_y + (d_tvd / max_depth) * (H - pad_bottom - mud_y)
+
+    # Trajectory geometry. The well runs vertical from the wellhead to a
+    # kick-off point (KOP), then builds to a tangent angle and runs
+    # straight to TD. We parametrise by measured depth and produce (x,y)
+    # waypoints; casing/tubing/annulus are drawn as offsets along this
+    # spine.
+    cx0 = 168                          # surface wellbore centre x
+    res_top_y = d2y(res_top)
+    res_bot_y = d2y(res_top + res_thick)
+    td_y = d2y(td)
+
+    if well_type == "Vertical":
+        kop_y = res_top_y - 40
+        build_dx = 0.0
+        end_x = cx0
+    elif well_type == "Horizontal":
+        kop_y = d2y(res_top * 0.55)
+        build_dx = 230.0
+        end_x = cx0 + build_dx
+    else:  # Deviated (default — matches the reference)
+        kop_y = d2y(res_top * 0.62)
+        build_dx = 200.0
+        end_x = cx0 + build_dx
+
+    # Spine waypoints (vertical -> curved build -> tangent to TD).
+    def spine_point(frac_y):
+        """Given a target canvas y, return the spine x at that depth."""
+        if frac_y <= kop_y:
+            return cx0
+        # build over a zone of ~ (res_top_y - kop_y)
+        build_end_y = res_top_y
+        if frac_y >= build_end_y:
+            # tangent section — linear continuation
+            t = 1.0
+        else:
+            t = (frac_y - kop_y) / max(1.0, (build_end_y - kop_y))
+            # ease-in curve for a smooth bend
+            t = t * t * (3 - 2 * t)
+        return cx0 + build_dx * t
+
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
              f'height="{H}" viewBox="0 0 {W} {H}" '
-             f'font-family="sans-serif">']
-    # Background: sky, sea (if offshore), formations
-    parts.append(f'<rect x="0" y="0" width="{W}" height="{H}" '
-                 f'fill="#f4efe6"/>')
+             f'font-family="Helvetica,Arial,sans-serif">']
+    parts.append(f'<rect x="0" y="0" width="{W}" height="{H}" fill="white"/>')
+
+    # ---- Sea & mudline (offshore) ----
     if wd > 0:
-        sea_y = depth_to_y(wd)
-        parts.append(f'<rect x="0" y="0" width="{W}" height="{sea_y}" '
-                     f'fill="#cfe6f4"/>')
-        parts.append(f'<line x1="0" y1="{surf_y}" x2="{W}" y2="{surf_y}" '
-                     f'stroke="#5a9bcf" stroke-width="2"/>')
-        parts.append(f'<text x="6" y="{surf_y-4}" font-size="10" '
-                     f'fill="#33648a">Sea surface</text>')
-        parts.append(f'<line x1="0" y1="{sea_y}" x2="{W}" y2="{sea_y}" '
-                     f'stroke="#7a6a45" stroke-width="2" '
-                     f'stroke-dasharray="4,2"/>')
-        parts.append(f'<text x="6" y="{sea_y-4}" font-size="10" '
-                     f'fill="#7a6a45">Mudline ({wd:.0f} m)</text>')
-        top_struct_y = sea_y
-    else:
-        parts.append(f'<text x="6" y="{surf_y-4}" font-size="10" '
-                     f'fill="#555">Wellhead / surface</text>')
-        top_struct_y = surf_y
+        # wavy sea surface
+        wave = f'M 70 {surf_y} '
+        for k in range(0, 14):
+            wx = 70 + k * 16
+            wy = surf_y + (4 if k % 2 == 0 else -4)
+            wave += f'Q {wx+8} {wy} {wx+16} {surf_y} '
+        parts.append(f'<path d="{wave}" fill="none" stroke="#2b6cb0" '
+                     f'stroke-width="2"/>')
+        # water-column double arrow
+        parts.append(f'<line x1="78" y1="{surf_y+4}" x2="78" y2="{mud_y-4}" '
+                     f'stroke="#2b6cb0" stroke-width="1.5"/>')
+        parts.append(f'<path d="M 74 {surf_y+10} L 78 {surf_y+2} '
+                     f'L 82 {surf_y+10}" fill="none" stroke="#2b6cb0" '
+                     f'stroke-width="1.5"/>')
+        parts.append(f'<path d="M 74 {mud_y-10} L 78 {mud_y-2} '
+                     f'L 82 {mud_y-10}" fill="none" stroke="#2b6cb0" '
+                     f'stroke-width="1.5"/>')
+        # mudline
+        parts.append(f'<line x1="40" y1="{mud_y:.0f}" x2="{W-200}" '
+                     f'y2="{mud_y:.0f}" stroke="#7a6a45" stroke-width="2"/>')
+        # seabed hatch
+        for hx in range(48, W - 200, 22):
+            parts.append(f'<line x1="{hx}" y1="{mud_y:.0f}" '
+                         f'x2="{hx-8}" y2="{mud_y+8:.0f}" '
+                         f'stroke="#9a8a60" stroke-width="1"/>')
 
-    # Formation bands (3 overburden layers + reservoir + base)
-    res_top_y = depth_to_y(res_top)
-    res_bot_y = depth_to_y(res_top + res_thick)
-    ob_colors = ["#e8ddc6", "#ddd0b2", "#d2c39e"]
-    n_ob = 3
-    for i in range(n_ob):
-        y0 = top_struct_y + (res_top_y - top_struct_y) * i / n_ob
-        y1 = top_struct_y + (res_top_y - top_struct_y) * (i+1) / n_ob
-        parts.append(f'<rect x="0" y="{y0:.0f}" width="{W}" '
-                     f'height="{y1-y0:.0f}" fill="{ob_colors[i]}"/>')
-    # Reservoir band (highlighted)
-    parts.append(f'<rect x="0" y="{res_top_y:.0f}" width="{W}" '
-                 f'height="{res_bot_y-res_top_y:.0f}" fill="#f6d98a" '
-                 f'stroke="#c99a2e" stroke-width="1"/>')
-    parts.append(f'<text x="{W-8}" y="{(res_top_y+res_bot_y)/2:.0f}" '
-                 f'font-size="11" fill="#8a6a10" text-anchor="end" '
-                 f'font-weight="bold">RESERVOIR</text>')
-    # base
-    parts.append(f'<rect x="0" y="{res_bot_y:.0f}" width="{W}" '
-                 f'height="{td_y-res_bot_y+40:.0f}" fill="#b9a87e"/>')
+    # ---- Casing strings: telescoping, each shorter & narrower ----
+    # Half-widths (px) for each string, widest outermost.
+    base_hw = [46, 36, 27, 18]
+    casing_hw = base_hw[:max(2, min(4, n_casing))]
+    # Default shoe depths echo the reference (244 / 1200 / 3000 / liner).
+    ref_shoes = [244.0, 1200.0, 3000.0, res_top + 50.0]
+    # scale ref shoes if the user's reservoir is shallower/deeper
+    shoe_depths = []
+    for i in range(len(casing_hw)):
+        if i < len(ref_shoes):
+            shoe_depths.append(min(ref_shoes[i], max_depth * 0.95))
+        else:
+            shoe_depths.append(res_top)
+    shoe_labels = ['30"', '20"', '14"', '10¾"×9⅞"']
 
-    # ---- Wellbore trajectory ----
-    # Vertical to a kick-off, then build angle for deviated/horizontal.
-    kop_y = depth_to_y(res_top * 0.45)
-    if well_type == "Vertical":
-        traj = [(cx, top_struct_y), (cx, res_bot_y)]
-        shoe_x = cx
-    elif well_type == "Horizontal":
-        # vertical to KOP, curve, then horizontal through reservoir
-        land_y = res_top_y
-        traj = [(cx, top_struct_y), (cx, kop_y),
-                (cx + 60, (kop_y+land_y)/2), (cx + 120, land_y),
-                (W - 30, land_y)]
-        shoe_x = W - 30
-    else:  # Deviated
-        traj = [(cx, top_struct_y), (cx, kop_y),
-                (cx + 70, res_bot_y)]
-        shoe_x = cx + 70
+    # draw outer→inner so inner strings overlay
+    casing_color = "#3a3a3a"
+    for i in range(len(casing_hw)):
+        hw = casing_hw[i]
+        shoe_y = d2y(shoe_depths[i])
+        # The conductor/surface strings are vertical near top; deeper
+        # strings follow the spine where they pass the build.
+        # We approximate each casing wall as a path following the spine.
+        steps = 26
+        left_pts, right_pts = [], []
+        y0 = mud_y
+        for s in range(steps + 1):
+            yy = y0 + (shoe_y - y0) * s / steps
+            sx = spine_point(yy)
+            left_pts.append((sx - hw, yy))
+            right_pts.append((sx + hw, yy))
+        # cement annulus (light grey) behind the two deepest-but-one
+        d_left = "M " + " L ".join(f"{x:.1f} {y:.1f}" for x, y in left_pts)
+        d_right = "M " + " L ".join(f"{x:.1f} {y:.1f}"
+                                     for x, y in reversed(right_pts))
+        # filled casing body (very light) to read as steel
+        body = (d_left + " L "
+                + " L ".join(f"{x:.1f} {y:.1f}"
+                              for x, y in reversed(right_pts)) + " Z")
+        parts.append(f'<path d="{body}" fill="#ececec" stroke="none" '
+                     f'opacity="0.6"/>')
+        # walls
+        parts.append(f'<path d="{d_left}" fill="none" stroke="{casing_color}" '
+                     f'stroke-width="2.2"/>')
+        parts.append(f'<path d="{d_right}" fill="none" '
+                     f'stroke="{casing_color}" stroke-width="2.2"/>')
+        # shoe — small flared wedges at the bottom of the string
+        sx = spine_point(shoe_y)
+        parts.append(f'<path d="M {sx-hw} {shoe_y:.1f} l -7 14 l 9 -3 Z" '
+                     f'fill="{casing_color}"/>')
+        parts.append(f'<path d="M {sx+hw} {shoe_y:.1f} l 7 14 l -9 -3 Z" '
+                     f'fill="{casing_color}"/>')
+        # shoe label on the LEFT with size + mTVD + mMD
+        lbl = shoe_labels[i] if i < len(shoe_labels) else '9⅞"'
+        # crude MD = TVD/cos for the deviated tangent below KOP
+        md = shoe_depths[i]
+        if shoe_depths[i] > res_top * 0.62 and well_type != "Vertical":
+            md = shoe_depths[i] * 1.22
+        parts.append(
+            f'<text x="8" y="{shoe_y-6:.0f}" font-size="9" '
+            f'fill="#222">{lbl} shoe</text>')
+        parts.append(
+            f'<text x="8" y="{shoe_y+4:.0f}" font-size="8" '
+            f'fill="#555">{shoe_depths[i]:.0f} mTVD</text>')
+        parts.append(
+            f'<text x="8" y="{shoe_y+14:.0f}" font-size="8" '
+            f'fill="#555">{md:.0f} mMD</text>')
 
-    def path_from(points):
-        d = f'M {points[0][0]:.0f} {points[0][1]:.0f} '
-        for px, py in points[1:]:
-            d += f'L {px:.0f} {py:.0f} '
+    # ---- Open hole below the last casing shoe to TD ----
+    last_shoe_y = d2y(shoe_depths[-1])
+    oh_hw = casing_hw[-1] - 3
+    steps = 26
+    oh_left, oh_right = [], []
+    for s in range(steps + 1):
+        yy = last_shoe_y + (td_y - last_shoe_y) * s / steps
+        sx = spine_point(yy)
+        oh_left.append((sx - oh_hw, yy))
+        oh_right.append((sx + oh_hw, yy))
+    # ragged open-hole walls
+    def ragged(pts, sign):
+        d = f"M {pts[0][0]:.1f} {pts[0][1]:.1f} "
+        for j, (x, y) in enumerate(pts[1:], 1):
+            jag = sign * (3 if j % 2 == 0 else 0)
+            d += f"L {x+jag:.1f} {y:.1f} "
         return d
+    parts.append(f'<path d="{ragged(oh_left,-1)}" fill="none" '
+                 f'stroke="#9a8a60" stroke-width="1.5"/>')
+    parts.append(f'<path d="{ragged(oh_right,1)}" fill="none" '
+                 f'stroke="#9a8a60" stroke-width="1.5"/>')
 
-    # ---- Casing strings (concentric, progressively shorter+narrower) ----
-    casing_widths = [34, 26, 18, 12][:n_casing]
-    casing_depths = []
-    for i in range(n_casing):
-        frac = (i + 1) / n_casing
-        casing_depths.append(top_struct_y +
-                             (res_top_y - top_struct_y) * frac)
-    casing_colors = ["#888", "#999", "#aaa", "#bbb"]
-    # Cement annulus shading (light grey behind outer casing)
-    for i in range(n_casing):
-        w = casing_widths[i]
-        bot = casing_depths[i]
-        if well_type == "Vertical" or i < n_casing - 1:
-            parts.append(
-                f'<rect x="{cx - w//2 - 3}" y="{top_struct_y:.0f}" '
-                f'width="{w + 6}" height="{bot - top_struct_y:.0f}" '
-                f'fill="#cfcfcf" opacity="0.5"/>')   # cement
-            parts.append(
-                f'<line x1="{cx - w//2}" y1="{top_struct_y:.0f}" '
-                f'x2="{cx - w//2}" y2="{bot:.0f}" '
-                f'stroke="{casing_colors[i]}" stroke-width="2.5"/>')
-            parts.append(
-                f'<line x1="{cx + w//2}" y1="{top_struct_y:.0f}" '
-                f'x2="{cx + w//2}" y2="{bot:.0f}" '
-                f'stroke="{casing_colors[i]}" stroke-width="2.5"/>')
-            # shoe
-            _shoe_labels = ['30"', '20"', '13 3/8"', '9 5/8"']
-            _shoe_lbl = _shoe_labels[i] if i < len(_shoe_labels) else ''
-            parts.append(
-                f'<text x="{cx + w//2 + 4}" y="{bot:.0f}" font-size="8" '
-                f'fill="#555">{_shoe_lbl} shoe</text>')
+    # ---- Tubing (production string) + control/balancing/electric lines ----
+    # Tubing runs from the tree down to the production packer near res top.
+    pkr_y = res_top_y - 26
+    tub_hw = 8
+    tcolor = "#2f6fb0" if is_inj else "#1f8a3a"
+    t_left, t_right, t_mid = [], [], []
+    for s in range(steps + 1):
+        yy = mud_y + (pkr_y - mud_y) * s / steps
+        sx = spine_point(yy)
+        t_left.append((sx - tub_hw, yy))
+        t_right.append((sx + tub_hw, yy))
+        t_mid.append((sx, yy))
+    parts.append('<path d="M ' + " L ".join(f"{x:.1f} {y:.1f}"
+                 for x, y in t_left) + '" fill="none" stroke="' + tcolor +
+                 '" stroke-width="2"/>')
+    parts.append('<path d="M ' + " L ".join(f"{x:.1f} {y:.1f}"
+                 for x, y in t_right) + '" fill="none" stroke="' + tcolor +
+                 '" stroke-width="2"/>')
+    # control line (blue), balancing line (red), electric DHPG (orange)
+    for off, col in ((-tub_hw - 4, "#1565c0"), (-tub_hw - 1, "#c62828"),
+                      (tub_hw + 3, "#e08a00")):
+        line = "M " + " L ".join(f"{x+off:.1f} {y:.1f}" for x, y in t_mid)
+        parts.append(f'<path d="{line}" fill="none" stroke="{col}" '
+                     f'stroke-width="1.1"/>')
 
-    # ---- Wellbore (open hole) line ----
-    parts.append(f'<path d="{path_from(traj)}" fill="none" '
-                 f'stroke="#222" stroke-width="2"/>')
+    # ---- DHSV (downhole safety valve) on the tubing, ~ below mudline ----
+    dhsv_y = mud_y + (pkr_y - mud_y) * 0.16
+    dsx = spine_point(dhsv_y)
+    parts.append(f'<circle cx="{dsx:.0f}" cy="{dhsv_y:.0f}" r="9" '
+                 f'fill="white" stroke="#222" stroke-width="1.5"/>')
+    parts.append(f'<path d="M {dsx-6:.0f} {dhsv_y-6:.0f} '
+                 f'L {dsx+6:.0f} {dhsv_y+6:.0f} M {dsx+6:.0f} {dhsv_y-6:.0f} '
+                 f'L {dsx-6:.0f} {dhsv_y+6:.0f}" stroke="#222" '
+                 f'stroke-width="1.3"/>')
+    parts.append(f'<text x="{dsx+16:.0f}" y="{dhsv_y-6:.0f}" font-size="9" '
+                 f'fill="#222">{"TRSCSSV" if "gravel" in completion.lower() else "DHSV"}</text>')
+    parts.append(f'<text x="{dsx+16:.0f}" y="{dhsv_y+5:.0f}" font-size="7" '
+                 f'fill="#777">Control/balancing line</text>')
 
-    # ---- Tubing (production string) down to packer ----
-    pkr_depth_y = res_top_y - 12
-    tubing_color = "#2f6fb0" if is_inj else "#1f8a3a"
-    if well_type == "Vertical":
-        parts.append(f'<line x1="{cx-4}" y1="{top_struct_y}" x2="{cx-4}" '
-                     f'y2="{pkr_depth_y:.0f}" stroke="{tubing_color}" '
-                     f'stroke-width="2"/>')
-        parts.append(f'<line x1="{cx+4}" y1="{top_struct_y}" x2="{cx+4}" '
-                     f'y2="{pkr_depth_y:.0f}" stroke="{tubing_color}" '
-                     f'stroke-width="2"/>')
-    else:
-        # tubing follows trajectory down to ~packer
-        tub_pts = [(x, y) for (x, y) in traj if y <= pkr_depth_y]
-        tub_pts.append((traj[min(len(tub_pts), len(traj)-1)][0],
-                        pkr_depth_y))
-        parts.append(f'<path d="{path_from(tub_pts)}" fill="none" '
-                     f'stroke="{tubing_color}" stroke-width="4"/>')
+    # ---- Subsea wellhead + VXT at mudline ----
+    parts.append(f'<rect x="{cx0-30}" y="{mud_y-30:.0f}" width="60" '
+                 f'height="18" fill="#cfcfcf" stroke="#222" '
+                 f'stroke-width="1.5"/>')
+    parts.append(f'<rect x="{cx0-20}" y="{mud_y-50:.0f}" width="40" '
+                 f'height="22" fill="#e6e6e6" stroke="#222" '
+                 f'stroke-width="1.5"/>')
+    # tree cross "valves"
+    parts.append(f'<line x1="{cx0-12}" y1="{mud_y-44:.0f}" x2="{cx0+12}" '
+                 f'y2="{mud_y-32:.0f}" stroke="#222"/>')
+    parts.append(f'<line x1="{cx0+12}" y1="{mud_y-44:.0f}" x2="{cx0-12}" '
+                 f'y2="{mud_y-32:.0f}" stroke="#222"/>')
+    parts.append(f'<text x="{W-200}" y="{mud_y-40:.0f}" font-size="11" '
+                 f'font-weight="700" fill="#222" text-anchor="start">'
+                 f'Subsea VXT</text>')
+    parts.append(f'<text x="{W-200}" y="{mud_y-22:.0f}" font-size="11" '
+                 f'font-weight="700" fill="#222" text-anchor="start">'
+                 f'Subsea Wellhead</text>')
 
-    # ---- Packer ----
-    if zonal != "None":
-        # packer at reservoir top
-        pkx = traj[-1][0] if well_type != "Vertical" else cx
-        # find x at packer depth
-        pkx = cx if well_type == "Vertical" else (cx + 35)
-        parts.append(f'<rect x="{pkx-14}" y="{pkr_depth_y-4:.0f}" '
-                     f'width="28" height="8" fill="#444" '
-                     f'stroke="#000"/>')
-        parts.append(f'<text x="{pkx+18}" y="{pkr_depth_y:.0f}" '
-                     f'font-size="9" fill="#444">Packer</text>')
-        if zonal.startswith("Smart"):
-            # second packer mid-reservoir for multi-zone
-            mid_y = (res_top_y + res_bot_y) / 2
-            mpx = cx if well_type == "Vertical" else (cx + 55)
-            parts.append(f'<rect x="{mpx-12}" y="{mid_y-4:.0f}" '
-                         f'width="24" height="7" fill="#444"/>')
-            parts.append(f'<text x="{mpx+16}" y="{mid_y:.0f}" '
-                         f'font-size="8" fill="#444">ICV / zone</text>')
+    # ---- Production packer ----
+    def draw_packer(py, label, fill="#1f6f6f", w=None):
+        sx = spine_point(py)
+        ww = (casing_hw[-1] if w is None else w)
+        parts.append(f'<rect x="{sx-ww:.0f}" y="{py-6:.0f}" '
+                     f'width="{2*ww:.0f}" height="12" fill="{fill}" '
+                     f'stroke="#000" stroke-width="1"/>')
+        # cross-hatch
+        for hx in range(int(sx-ww), int(sx+ww), 6):
+            parts.append(f'<line x1="{hx}" y1="{py-6:.0f}" x2="{hx+6}" '
+                         f'y2="{py+6:.0f}" stroke="#0a3a3a" '
+                         f'stroke-width="0.6"/>')
+        return sx
+
+    psx = draw_packer(pkr_y, "Production packer")
+    parts.append(f'<text x="{psx+ casing_hw[-1] + 8:.0f}" y="{pkr_y+4:.0f}" '
+                 f'font-size="9" fill="#222">Production packer</text>')
+
+    # P/T gauge just above the packer
+    ptg_y = pkr_y - 26
+    pgx = spine_point(ptg_y)
+    parts.append(f'<rect x="{pgx-5:.0f}" y="{ptg_y-5:.0f}" width="10" '
+                 f'height="10" fill="#1565c0" stroke="#000"/>')
+    parts.append(f'<text x="{pgx + casing_hw[-1] + 8:.0f}" '
+                 f'y="{ptg_y+3:.0f}" font-size="9" fill="#222">P/T Gauge'
+                 f'</text>')
+
+    # ---- Middle completion packer w/ disappearing plug + liner hanger ----
+    mid_y = (pkr_y + res_top_y) / 2
+    draw_packer(mid_y, "Middle", fill="#2a4d8f")
+    # plug glyph inside
+    msx = spine_point(mid_y)
+    parts.append(f'<rect x="{msx-6:.0f}" y="{mid_y-4:.0f}" width="12" '
+                 f'height="8" fill="#9ec3ff" stroke="#000"/>')
+    parts.append(f'<text x="{msx + casing_hw[-1] + 8:.0f}" '
+                 f'y="{mid_y+4:.0f}" font-size="9" fill="#222">'
+                 f'Middle completion packer w/disappearing plug</text>')
+    # liner hanger at reservoir top
+    lh_y = res_top_y - 4
+    lsx = spine_point(lh_y)
+    parts.append(f'<path d="M {lsx-oh_hw-4:.0f} {lh_y:.0f} '
+                 f'l 8 -8 M {lsx+oh_hw+4:.0f} {lh_y:.0f} l -8 -8" '
+                 f'stroke="#000" stroke-width="1.5" fill="none"/>')
+    parts.append(f'<text x="{lsx + casing_hw[-1] + 8:.0f}" '
+                 f'y="{lh_y+14:.0f}" font-size="9" fill="#222">Liner hanger'
+                 f'</text>')
 
     # ---- Lower completion across the reservoir ----
-    # Draw the completion symbol depending on type.
-    comp_x = traj[-1][0]
-    comp_top, comp_bot = res_top_y, res_bot_y
-    if "Open hole" in completion:
-        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
-                     f'fill="#7a4">Open-hole completion</text>')
-    elif "perforated" in completion.lower():
-        # perforation marks
-        for d in range(int(comp_top), int(comp_bot), 12):
-            parts.append(f'<line x1="{comp_x-9}" y1="{d}" x2="{comp_x-16}" '
-                         f'y2="{d+3}" stroke="#d33" stroke-width="2"/>')
-            parts.append(f'<line x1="{comp_x+9}" y1="{d}" x2="{comp_x+16}" '
-                         f'y2="{d+3}" stroke="#d33" stroke-width="2"/>')
-        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
-                     f'fill="#d33">Cased &amp; perforated</text>')
-    elif "Slotted" in completion:
-        for d in range(int(comp_top), int(comp_bot), 8):
-            parts.append(f'<line x1="{comp_x-7}" y1="{d}" x2="{comp_x-7}" '
-                         f'y2="{d+4}" stroke="#555" stroke-width="2"/>')
-            parts.append(f'<line x1="{comp_x+7}" y1="{d}" x2="{comp_x+7}" '
-                         f'y2="{d+4}" stroke="#555" stroke-width="2"/>')
-        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
-                     f'fill="#555">Slotted liner</text>')
-    elif "gravel" in completion.lower() or "Screens" in completion:
-        # sand screen — cross-hatch + gravel dots
-        parts.append(f'<rect x="{comp_x-10}" y="{comp_top:.0f}" width="20" '
-                     f'height="{comp_bot-comp_top:.0f}" fill="none" '
-                     f'stroke="#a60" stroke-width="1.5" '
-                     f'stroke-dasharray="2,2"/>')
+    comp_steps = 22
+    comp_pts = []
+    for s in range(comp_steps + 1):
+        yy = res_top_y + (td_y - res_top_y) * s / comp_steps
+        sx = spine_point(yy)
+        comp_pts.append((sx, yy))
+    cl = completion.lower()
+    if "open hole" in cl:
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
+                     f'font-size="10" fill="#7a4">Open-hole completion</text>')
+    elif "perforated" in cl or "cased" in cl:
+        # cemented & perforated liner — red perforation marks both sides
+        for (sx, yy) in comp_pts[1:-1]:
+            parts.append(f'<path d="M {sx-oh_hw:.0f} {yy:.0f} '
+                         f'l -10 -3 l 2 6 Z" fill="#d62728"/>')
+            parts.append(f'<path d="M {sx+oh_hw:.0f} {yy:.0f} '
+                         f'l 10 -3 l -2 6 Z" fill="#d62728"/>')
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
+                     f'font-size="10" fill="#222" font-weight="600">'
+                     f'7" cemented &amp; perforated liner</text>')
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2+14:.0f}" '
+                     f'font-size="9" fill="#555">in 8½" open hole</text>')
+    elif "gravel" in cl or "screens" in cl:
+        # gravel-packed screens — hatched wide screen + gravel stipple
+        scr_pts_l = [(sx-oh_hw-5, yy) for sx, yy in comp_pts]
+        scr_pts_r = [(sx+oh_hw+5, yy) for sx, yy in comp_pts]
+        scr = ("M " + " L ".join(f"{x:.0f} {y:.0f}" for x, y in scr_pts_l)
+               + " L " + " L ".join(f"{x:.0f} {y:.0f}"
+                                      for x, y in reversed(scr_pts_r)) + " Z")
+        parts.append(f'<path d="{scr}" fill="#d9d2c0" stroke="#a08a50" '
+                     f'stroke-width="1.2"/>')
         import random as _r
-        _r.seed(42)
-        for _ in range(40):
-            gx = comp_x - 14 + _r.random() * 28
-            gy = comp_top + _r.random() * (comp_bot - comp_top)
-            parts.append(f'<circle cx="{gx:.0f}" cy="{gy:.0f}" r="1.5" '
-                         f'fill="#c90"/>')
-        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
-                     f'fill="#a60">Screens + gravel pack</text>')
-    elif "Frac" in completion:
-        for d in range(int(comp_top), int(comp_bot), 16):
-            parts.append(f'<line x1="{comp_x}" y1="{d}" x2="{comp_x-30}" '
-                         f'y2="{d-4}" stroke="#d33" stroke-width="1"/>')
-            parts.append(f'<line x1="{comp_x}" y1="{d}" x2="{comp_x+30}" '
-                         f'y2="{d-4}" stroke="#d33" stroke-width="1"/>')
-        parts.append(f'<text x="20" y="{comp_bot+16:.0f}" font-size="10" '
-                     f'fill="#d33">Frac-pack</text>')
+        _r.seed(7)
+        for (sx, yy) in comp_pts:
+            for _ in range(3):
+                gx = sx + (_r.random()-0.5) * 2 * (oh_hw+4)
+                parts.append(f'<circle cx="{gx:.0f}" cy="{yy:.0f}" r="1.4" '
+                             f'fill="#b8902f"/>')
+        # screen hatching
+        for (sx, yy) in comp_pts[::1]:
+            parts.append(f'<line x1="{sx-oh_hw:.0f}" y1="{yy:.0f}" '
+                         f'x2="{sx+oh_hw:.0f}" y2="{yy:.0f}" '
+                         f'stroke="#8a7320" stroke-width="0.5"/>')
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
+                     f'font-size="10" fill="#222" font-weight="600">'
+                     f'5½" gravel-packed screens</text>')
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2+14:.0f}" '
+                     f'font-size="9" fill="#555">in 8½" open hole</text>')
+        # gravel-pack packer at top of screens
+        draw_packer(res_top_y + 16, "GP", fill="#111", w=oh_hw+5)
+        parts.append(f'<text x="{spine_point(res_top_y+16)+casing_hw[-1]+8:.0f}" '
+                     f'y="{res_top_y+20:.0f}" font-size="9" fill="#222">'
+                     f'Gravel pack packer</text>')
+    elif "slotted" in cl:
+        for (sx, yy) in comp_pts[1:-1]:
+            parts.append(f'<line x1="{sx-oh_hw:.0f}" y1="{yy:.0f}" '
+                         f'x2="{sx-oh_hw+5:.0f}" y2="{yy+3:.0f}" '
+                         f'stroke="#555" stroke-width="1.4"/>')
+            parts.append(f'<line x1="{sx+oh_hw:.0f}" y1="{yy:.0f}" '
+                         f'x2="{sx+oh_hw-5:.0f}" y2="{yy+3:.0f}" '
+                         f'stroke="#555" stroke-width="1.4"/>')
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
+                     f'font-size="10" fill="#222">Slotted liner</text>')
+    elif "frac" in cl:
+        for (sx, yy) in comp_pts[1:-1:2]:
+            parts.append(f'<line x1="{sx:.0f}" y1="{yy:.0f}" '
+                         f'x2="{sx-34:.0f}" y2="{yy-5:.0f}" stroke="#d62728" '
+                         f'stroke-width="1"/>')
+            parts.append(f'<line x1="{sx:.0f}" y1="{yy:.0f}" '
+                         f'x2="{sx+34:.0f}" y2="{yy-5:.0f}" stroke="#d62728" '
+                         f'stroke-width="1"/>')
+        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
+                     f'font-size="10" fill="#222">Frac-pack</text>')
+
+    # smart completion → second packer + ICV mid-reservoir
+    if zonal.startswith("Smart"):
+        icv_y = (res_top_y + td_y) / 2
+        draw_packer(icv_y, "ICV", fill="#5a2d8f")
+        isx = spine_point(icv_y)
+        parts.append(f'<text x="{isx + casing_hw[-1] + 8:.0f}" '
+                     f'y="{icv_y+4:.0f}" font-size="9" fill="#222">'
+                     f'ICV / zone control</text>')
 
     # ---- Artificial lift ----
     if artificial == "Gas lift":
-        # gas-lift valves on the tubing
-        for k in range(3):
-            gy = top_struct_y + (pkr_depth_y - top_struct_y) * (k+1)/4
-            gx = cx if well_type == "Vertical" else (
-                cx + 35 * ((gy-top_struct_y)/(pkr_depth_y-top_struct_y)))
+        for kk in range(3):
+            gy = mud_y + (pkr_y - mud_y) * (kk + 1) / 4
+            gx = spine_point(gy)
             parts.append(f'<rect x="{gx-6:.0f}" y="{gy-3:.0f}" width="12" '
                          f'height="6" fill="#fa0" stroke="#a60"/>')
-        parts.append(f'<text x="20" y="{surf_y+20}" font-size="10" '
+        parts.append(f'<text x="{W-200}" y="{mud_y+30:.0f}" font-size="9" '
                      f'fill="#a60">⚡ Gas-lift valves</text>')
     elif artificial in ("ESP", "HSP"):
-        ey = pkr_depth_y - 60
-        ex = cx if well_type == "Vertical" else (cx + 22)
+        ey = pkr_y - 70
+        ex = spine_point(ey)
         parts.append(f'<rect x="{ex-7:.0f}" y="{ey:.0f}" width="14" '
                      f'height="34" fill="#b30" stroke="#600" '
                      f'stroke-width="1.5"/>')
-        parts.append(f'<text x="{ex+12:.0f}" y="{ey+18:.0f}" '
-                     f'font-size="9" fill="#b30">{artificial} pump</text>')
+        parts.append(f'<text x="{ex+12:.0f}" y="{ey+18:.0f}" font-size="9" '
+                     f'fill="#b30">{artificial} pump</text>')
 
-    # ---- Wellhead / tree ----
-    if wd > 0:
-        # subsea tree on the mudline
-        parts.append(f'<rect x="{cx-16}" y="{top_struct_y-18:.0f}" '
-                     f'width="32" height="18" fill="#357" '
-                     f'stroke="#012" stroke-width="1.5"/>')
-        parts.append(f'<text x="{cx}" y="{top_struct_y-22:.0f}" '
-                     f'font-size="9" fill="#357" '
-                     f'text-anchor="middle">Subsea tree</text>')
-    else:
-        parts.append(f'<rect x="{cx-14}" y="{surf_y-22:.0f}" width="28" '
-                     f'height="22" fill="#357" stroke="#012" '
-                     f'stroke-width="1.5"/>')
-        parts.append(f'<text x="{cx}" y="{surf_y-26:.0f}" font-size="9" '
-                     f'fill="#357" text-anchor="middle">X-tree</text>')
+    # ---- TD marker ----
+    tsx = spine_point(td_y)
+    parts.append(f'<path d="M {tsx-oh_hw:.0f} {td_y:.0f} '
+                 f'L {tsx+oh_hw:.0f} {td_y:.0f}" stroke="#222" '
+                 f'stroke-width="2"/>')
+    parts.append(f'<text x="{tsx+oh_hw+6:.0f}" y="{td_y+4:.0f}" '
+                 f'font-size="10" font-weight="600" fill="#222">'
+                 f'8½" TD ({td:.0f} mMD)</text>')
 
-    # Depth labels
-    parts.append(f'<text x="6" y="{res_top_y:.0f}" font-size="9" '
-                 f'fill="#8a6a10">Top res {res_top:.0f} m</text>')
-    parts.append(f'<text x="6" y="{td_y:.0f}" font-size="9" '
-                 f'fill="#555">TD {td:.0f} m</text>')
     parts.append("</svg>")
     return "".join(parts)
 

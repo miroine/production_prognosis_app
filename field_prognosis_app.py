@@ -11240,14 +11240,54 @@ def run_payload_case(payload: dict, default_start_date,
         except Exception:
             irr = None
 
+        # NPV before tax — discount the pre-tax cashflow (after-tax
+        # cashflow + tax paid) on the same monthly basis as the headline
+        # NPV. Lets the user see the size of the fiscal take.
+        npv_pretax_MM = None
+        try:
+            cf_at = df_e_s["cashflow"].values.astype(float)
+            tax_arr = (df_e_s["tax"].values.astype(float)
+                       if "tax" in df_e_s.columns
+                       else np.zeros(len(cf_at)))
+            cf_pretax = cf_at + tax_arr
+            r_m = (1.0 + econ_s.discount_rate) ** (1/12.0) - 1.0
+            disc = (1.0 + r_m) ** np.arange(len(cf_pretax))
+            npv_pretax_MM = float((cf_pretax / disc).sum()) / 1e6
+        except Exception:
+            pass
+
+        # Total CAPEX, undiscounted ($MM) — wells + facilities + abandonment.
+        capex_total_MM = None
+        try:
+            _cw = (df_e_s["capex_well"].sum()
+                   if "capex_well" in df_e_s.columns else 0.0)
+            _cf = (df_e_s["capex_facility"].sum()
+                   if "capex_facility" in df_e_s.columns else 0.0)
+            _ab = (df_e_s["abandonment"].sum()
+                   if "abandonment" in df_e_s.columns else 0.0)
+            capex_total_MM = float(_cw + _cf + _ab) / 1e6
+        except Exception:
+            pass
+
+        # Total recoverable resources in oil-equivalent (MMboe):
+        # oil (MMstb) + gas (Bscf → MMboe at 6 Mscf/boe).
+        resources_mmboe = None
+        try:
+            resources_mmboe = float(cum_oil) + float(cum_gas) * 1000.0 / 6.0
+        except Exception:
+            pass
+
         res["kpis"] = {
             "npv_MM": npv_MM, "cum_oil_MMstb": cum_oil,
             "cum_gas_Bscf": cum_gas, "final_rf": final_rf,
             "peak_primary_rate": peak_rate, "payback_yrs": payback_yrs,
             "breakeven_oil": be_oil,
             "capex_disc_MM": capex_disc_MM,
+            "capex_total_MM": capex_total_MM,
             "co2_total_Mt": co2_total_Mt,
             "irr": irr,
+            "npv_pretax_MM": npv_pretax_MM,
+            "resources_mmboe": resources_mmboe,
         }
         res["df"] = df_s
         res["df_e"] = df_e_s
@@ -13651,10 +13691,13 @@ def _concept_study_to_doc(dimensions, selected, results, base_source,
                     "name": r.get("name"),
                     "picks": {dn: lbl for dn, lbl in r.get("picks", [])},
                     "kpis": {
-                        "npv_MM": r.get("npv_MM"),
+                        "npv_after_tax_MM": r.get("npv_MM"),
+                        "npv_pre_tax_MM": r.get("npv_pretax_MM"),
                         "irr": r.get("irr"),
                         "final_rf": r.get("final_rf"),
+                        "resources_mmboe": r.get("resources_mmboe"),
                         "breakeven_oil_usd_bbl": r.get("breakeven_oil"),
+                        "capex_total_MM": r.get("capex_total_MM"),
                         "capex_disc_MM": r.get("capex_disc_MM"),
                         "co2_total_Mt": r.get("co2_total_Mt"),
                     },
@@ -14078,11 +14121,14 @@ def well_planner_section(units, fluid):
             with colA:
                 st.image(_svg_to_data_uri(svg), use_container_width=True)
                 st.caption(
-                    "Schematic cross-section — not to scale. Casing "
-                    "strings (grey, telescoping), cement (light grey "
-                    "annulus), tubing (green producer / blue injector), "
-                    "packer(s), the lower completion across the "
-                    "reservoir, artificial lift and the wellhead/tree.")
+                    "Equinor-style cross-section — not to scale. Subsea "
+                    "VXT + wellhead at the mudline, telescoping casing "
+                    "strings with labelled shoes (size · mTVD · mMD), "
+                    "DHSV/TRSCSSV with control + balancing + electric "
+                    "lines, P/T gauge, production packer, middle-completion "
+                    "packer with disappearing plug, liner hanger, and the "
+                    "lower completion (perforated liner / gravel-pack "
+                    "screens / slotted liner) in open hole.")
             with colB:
                 st.markdown("**Design notes**")
                 # Contextual guidance based on selections
@@ -14145,13 +14191,40 @@ def concept_selector_section(default_start_date):
     """
     st.markdown("### 🌳 Concept Selector — hanging-garden batch builder")
     st.caption(
-        "Define the concept dimensions as columns of alternatives, tick the "
-        "options you want sweep-tested, hit **Run batch**. Every combination "
-        "is simulated against the current base case (sidebar inputs serve as "
-        "defaults); each option box is then coloured by the best NPV that "
-        "passes through it — red for the worst case, green for the best. "
-        "Inspired by the DG1 concept long-list / morphological matrix used "
-        "on the NCS.")
+        "Define concept dimensions as columns of alternatives. Each option "
+        "is its own standalone case (link a saved case / YAML, or patch the "
+        "base case). Tick the options you want, hit **Run** — each runs once "
+        "(no combinations), then options are coloured by NPV (red→green) and "
+        "compared on the bubble chart, qualitative matrix and "
+        "Design-to-Cost staircase. Inspired by the DG1 concept long-list "
+        "used on the NCS.")
+
+    with st.expander("❓ How to use the Concept Selector (quick guide)",
+                      expanded=False):
+        st.markdown(
+            "**1. Start** — load a **📋 template** (Subsurface / Drilling / "
+            "SURF / Topside) or **🔄 Reset to NCS default**, or **➕ Add "
+            "dimension** to build your own.\n\n"
+            "**2. Link cases** — in the *Dimension editor* below, each "
+            "option can link a saved case or uploaded YAML/JSON, or carry "
+            "lightweight `key: value` patches on top of the base case. "
+            "**Type freely, then click ✅ Apply edits** in that dimension "
+            "to commit (keeps editing fast).\n\n"
+            "**3. Tick** the options to run — the *Cases to run* counter "
+            "updates live.\n\n"
+            "**4. Run options** — ♻️ cache reuses unchanged cases; 🎲 "
+            "Monte-Carlo adds a P90/Mean/P10 band per case (with its own "
+            "progress bar).\n\n"
+            "**5. Run & read** — the hanging garden colours each option by "
+            "NPV; the **🎯 bubble chart** plots NPV vs CAPEX with a Pareto "
+            "frontier (★); the **🚦 qualitative matrix** scores HSE/risk/"
+            "robustness/operability with weights; the **🏆 combined "
+            "ranking** blends economics + qualitative; the **🪜 staircase** "
+            "ranks by CAPEX and flags the recommended concept.\n\n"
+            "**6. Save** — use the **💾 Study library** to save (with "
+            "version + date), load, duplicate or import studies, or "
+            "**🧾 download the nested YAML** audit trail. A full walkthrough "
+            "ships as `HELP.md` in the repo.")
 
     # ---- Initialise state ----
     if "concept_dimensions" not in st.session_state:
@@ -14488,54 +14561,68 @@ def concept_selector_section(default_start_date):
         "applied to the base case (e.g. `oil_price_bbl: 55`). Special "
         "keys: `_n_producers_override` (replicates/truncates the producers "
         "table to N wells), `_facility_capex_override_MM` (rescales the "
-        "facility CAPEX schedule to a new total).")
+        "facility CAPEX schedule to a new total). Click **Apply edits** "
+        "in each dimension to commit name/label/patch changes.")
+    # Assign a stable id to every dimension and option so widget keys
+    # don't shift when a middle item is deleted. Without this, Streamlit
+    # binds widget state to positional index; deleting dimension N makes
+    # all later widgets inherit the wrong stored text, so it looks like
+    # the LAST dimension was deleted. Keying by id fixes that.
+    import uuid as _uuid
+    for d in dimensions:
+        if "_id" not in d:
+            d["_id"] = _uuid.uuid4().hex[:8]
+        for o in d["options"]:
+            if "_id" not in o:
+                o["_id"] = _uuid.uuid4().hex[:8]
+
     dim_to_remove = None
     for di, d in enumerate(dimensions):
+        _did = d["_id"]
         with st.expander(f"📦  **{d['name']}** "
                           f"— {len(d['options'])} options, "
                           f"{len(selected.get(di, set()))} ticked",
                           expanded=False):
             ec1, ec2, ec3 = st.columns([3, 4, 1])
+            # Edit fields write to a draft keyed by id; committed on Apply.
             new_name = ec1.text_input(
                 "Dimension name", value=d["name"],
-                key=f"concept_dim_{di}_name")
+                key=f"concept_dim_{_did}_name")
             new_desc = ec2.text_input(
                 "Description (optional)", value=d.get("description", ""),
-                key=f"concept_dim_{di}_desc")
-            d["name"] = new_name
-            d["description"] = new_desc
-            if ec3.button("🗑️", key=f"concept_dim_{di}_del",
+                key=f"concept_dim_{_did}_desc")
+            if ec3.button("🗑️", key=f"concept_dim_{_did}_del",
                            help="Delete this entire dimension"):
                 dim_to_remove = di
             st.markdown("---")
             opt_to_remove = None
+            # Collect drafts; commit all at once on the Apply button.
+            _opt_drafts = []
             for oi, opt in enumerate(d["options"]):
+                _oid = opt["_id"]
                 oc1, oc2, oc3, oc4, oc5 = st.columns([0.6, 2, 3, 3, 0.6])
-                # Selection checkbox
+                # Selection checkbox — applied immediately (cheap, and it
+                # drives the live garden colours / case count).
                 is_sel = oi in selected.get(di, set())
                 new_sel = oc1.checkbox(
                     "✓", value=is_sel,
-                    key=f"concept_pick_{di}_{oi}",
+                    key=f"concept_pick_{_did}_{_oid}",
                     label_visibility="collapsed",
-                    help="Include this option in the batch sweep.")
+                    help="Include this option in the batch run.")
                 if new_sel and not is_sel:
                     selected.setdefault(di, set()).add(oi)
                 elif (not new_sel) and is_sel:
                     selected.setdefault(di, set()).discard(oi)
-                opt["label"] = oc2.text_input(
+                _draft_label = oc2.text_input(
                     "Label", value=opt["label"],
-                    key=f"concept_opt_{di}_{oi}_label",
+                    key=f"concept_opt_{_oid}_label",
                     label_visibility="collapsed")
-                opt["description"] = oc3.text_input(
+                _draft_desc = oc3.text_input(
                     "Description", value=opt.get("description", ""),
-                    key=f"concept_opt_{di}_{oi}_desc",
+                    key=f"concept_opt_{_oid}_desc",
                     label_visibility="collapsed",
                     placeholder="Short description")
-                # Case link — each option carries either a linked saved
-                # case (by filename) or an uploaded/loaded full payload.
-                # The status shows what's attached; the patches text box
-                # is still supported for power users as an override layer
-                # applied on top of the linked case.
+                # Case link status
                 _linked = opt.get("case_name")
                 _patch_n = len(opt.get("patches", {}))
                 _status = (f"📎 {_linked}" if _linked
@@ -14545,9 +14632,10 @@ def concept_selector_section(default_start_date):
                     f"<div style='padding-top:6px;font-size:12px;"
                     f"color:#555'>{_status}</div>",
                     unsafe_allow_html=True)
-                if oc5.button("✖", key=f"concept_opt_{di}_{oi}_del",
+                if oc5.button("✖", key=f"concept_opt_{_oid}_del",
                                help="Delete this option"):
                     opt_to_remove = oi
+                _opt_drafts.append((opt, _draft_label, _draft_desc))
                 # Per-option case linker (expander keeps the row compact)
                 with st.container():
                     le1, le2, le3 = st.columns([3, 3, 2])
@@ -14562,7 +14650,7 @@ def concept_selector_section(default_start_date):
                             if _cur in _case_opts else 0)
                     _pick = le1.selectbox(
                         "Link saved case", _case_opts, index=_idx,
-                        key=f"concept_opt_{di}_{oi}_caselink",
+                        key=f"concept_opt_{_oid}_caselink",
                         label_visibility="collapsed")
                     if _pick != "— none —":
                         if opt.get("case_name") != _pick:
@@ -14584,7 +14672,7 @@ def concept_selector_section(default_start_date):
                     _up = le2.file_uploader(
                         "or upload YAML/JSON",
                         type=["yaml", "yml", "json"],
-                        key=f"concept_opt_{di}_{oi}_upload",
+                        key=f"concept_opt_{_oid}_upload",
                         label_visibility="collapsed")
                     if _up is not None:
                         try:
@@ -14605,37 +14693,55 @@ def concept_selector_section(default_start_date):
                             opt["case_name"] = _up.name
                         except Exception:
                             pass
-                    # Patch override (optional, advanced)
+                    # Patch override (optional, advanced) — draft only,
+                    # committed on Apply.
                     cur_patch_str = ", ".join(
                         f"{k}: {v}"
                         for k, v in opt.get("patches", {}).items())
-                    new_patch_str = le3.text_input(
+                    _draft_patch_str = le3.text_input(
                         "Patches (optional)", value=cur_patch_str,
-                        key=f"concept_opt_{di}_{oi}_patches",
+                        key=f"concept_opt_{_oid}_patches",
                         label_visibility="collapsed",
                         placeholder="oil_price_bbl: 55",
                         help="Optional key:value overrides applied on top "
                              "of the linked case (or the base case if no "
                              "case is linked).")
-                    parsed = {}
-                    for pair in new_patch_str.split(","):
-                        if ":" not in pair:
-                            continue
-                        k, v = pair.split(":", 1)
-                        k, v = k.strip(), v.strip()
-                        if not k:
-                            continue
-                        try:
-                            v_typed = float(v)
-                            if v_typed.is_integer() and "." not in v:
-                                v_typed = int(v_typed)
-                        except ValueError:
-                            if v.lower() in ("true", "false"):
-                                v_typed = (v.lower() == "true")
-                            else:
-                                v_typed = v
-                        parsed[k] = v_typed
-                    opt["patches"] = parsed
+                    # store the patch draft alongside the label/desc draft
+                    _opt_drafts[-1] = (opt, _draft_label, _draft_desc,
+                                        _draft_patch_str)
+            # ---- Apply edits for this dimension ----
+            if st.button("✅ Apply edits", key=f"concept_dim_{_did}_apply",
+                          type="primary",
+                          help="Commit the name, labels, descriptions and "
+                               "patches you've typed above."):
+                d["name"] = new_name
+                d["description"] = new_desc
+                for _entry in _opt_drafts:
+                    _o, _lbl, _dsc = _entry[0], _entry[1], _entry[2]
+                    _o["label"] = _lbl
+                    _o["description"] = _dsc
+                    if len(_entry) > 3:
+                        _pstr = _entry[3]
+                        parsed = {}
+                        for pair in _pstr.split(","):
+                            if ":" not in pair:
+                                continue
+                            k, v = pair.split(":", 1)
+                            k, v = k.strip(), v.strip()
+                            if not k:
+                                continue
+                            try:
+                                v_typed = float(v)
+                                if v_typed.is_integer() and "." not in v:
+                                    v_typed = int(v_typed)
+                            except ValueError:
+                                if v.lower() in ("true", "false"):
+                                    v_typed = (v.lower() == "true")
+                                else:
+                                    v_typed = v
+                            parsed[k] = v_typed
+                        _o["patches"] = parsed
+                st.rerun()
             if opt_to_remove is not None:
                 d["options"].pop(opt_to_remove)
                 # Re-key selections
@@ -14647,10 +14753,11 @@ def concept_selector_section(default_start_date):
                         new_sel.add(oi - 1)
                 selected[di] = new_sel
                 st.rerun()
-            if st.button("➕ Add option", key=f"concept_opt_add_{di}"):
+            if st.button("➕ Add option", key=f"concept_opt_add_{_did}"):
                 d["options"].append({
                     "label": f"Option {chr(65 + len(d['options']))}",
-                    "description": "", "patches": {}})
+                    "description": "", "patches": {},
+                    "_id": _uuid.uuid4().hex[:8]})
                 selected.setdefault(di, set()).add(len(d["options"]) - 1)
                 st.rerun()
     if dim_to_remove is not None:
@@ -14787,6 +14894,7 @@ def concept_selector_section(default_start_date):
                        "run.")
             return
         progress = st.progress(0.0, text="Running cases…")
+        mc_progress = None   # nested MC bar, created lazily on first MC pass
         done = 0
         for dim_name, opt in run_items:
             label = opt["label"]
@@ -14843,9 +14951,13 @@ def concept_selector_section(default_start_date):
                     breakeven = kpis.get("breakeven_oil")
                     capex_disc_MM = kpis.get("capex_disc_MM")
                     co2_total_Mt = kpis.get("co2_total_Mt")
+                    npv_pretax_MM = kpis.get("npv_pretax_MM")
+                    capex_total_MM = kpis.get("capex_total_MM")
+                    resources_mmboe = kpis.get("resources_mmboe")
                 else:
                     npv_MM = cum_primary = rf = irr = breakeven = None
                     capex_disc_MM = co2_total_Mt = None
+                    npv_pretax_MM = capex_total_MM = resources_mmboe = None
                 # ---- Optional Monte-Carlo pass for this case ----
                 npv_p90 = npv_p10 = npv_mc_mean = None
                 if mc_iters > 0 and res.get("ok"):
@@ -14857,7 +14969,14 @@ def concept_selector_section(default_start_date):
                     _ov0 = float(_sc0.get("opex_var_oil",
                                            _sc0.get("opex_var_gas", 5.5)))
                     _cw0 = float(_sc0.get("capex_well", 120.0))
-                    for _ in range(int(mc_iters)):
+                    # Nested progress bar for the Monte-Carlo iterations of
+                    # THIS case (the outer bar tracks cases; this one tracks
+                    # the per-case MC draws so a long MC run shows life).
+                    if mc_progress is None:
+                        mc_progress = st.progress(
+                            0.0, text="Monte-Carlo…")
+                    _miter = int(mc_iters)
+                    for _k in range(_miter):
                         _trial = dict(case_payload)
                         _ts = dict(_sc0)
                         _ts["oil_price_bbl"] = _op0 * float(
@@ -14878,6 +14997,11 @@ def concept_selector_section(default_start_date):
                                 _npvs.append(_n)
                         except Exception:
                             pass
+                        if (_k % 5 == 0) or (_k == _miter - 1):
+                            mc_progress.progress(
+                                (_k + 1) / _miter,
+                                text=f"Monte-Carlo: {label} "
+                                     f"({_k + 1}/{_miter} draws)")
                     if _npvs:
                         _arr = _np.array(_npvs, dtype=float)
                         npv_p90 = float(_np.percentile(_arr, 10))
@@ -14888,11 +15012,14 @@ def concept_selector_section(default_start_date):
                     "dim": dim_name,
                     "label": label,
                     "npv_MM": npv_MM,
+                    "npv_pretax_MM": npv_pretax_MM,
                     "cum_primary": cum_primary,
                     "final_rf": rf,
                     "irr": irr,
                     "breakeven_oil": breakeven,
                     "capex_disc_MM": capex_disc_MM,
+                    "capex_total_MM": capex_total_MM,
+                    "resources_mmboe": resources_mmboe,
                     "co2_total_Mt": co2_total_Mt,
                     "npv_p90": npv_p90,
                     "npv_p10": npv_p10,
@@ -14907,9 +15034,11 @@ def concept_selector_section(default_start_date):
             except Exception as e:
                 results_new[key] = {
                     "name": name, "dim": dim_name, "label": label,
-                    "npv_MM": None, "cum_primary": None,
+                    "npv_MM": None, "npv_pretax_MM": None,
+                    "cum_primary": None,
                     "final_rf": None, "irr": None, "breakeven_oil": None,
-                    "capex_disc_MM": None, "co2_total_Mt": None,
+                    "capex_disc_MM": None, "capex_total_MM": None,
+                    "resources_mmboe": None, "co2_total_Mt": None,
                     "npv_p90": None, "npv_p10": None, "npv_mc_mean": None,
                     "picks": [(dim_name, label)],
                     "ok": False, "error": str(e),
@@ -14919,6 +15048,8 @@ def concept_selector_section(default_start_date):
                                text=f"Running cases… {done}/{total} "
                                     f"(cache hits: {cache_hits})")
         progress.empty()
+        if mc_progress is not None:
+            mc_progress.empty()
         st.session_state["concept_results"] = results_new
         st.success(f"Completed {done}/{total} cases "
                    f"({cache_hits} reused from cache).")
@@ -14933,23 +15064,32 @@ def concept_selector_section(default_start_date):
             row = {"Dimension": r.get("dim", key[0] if isinstance(
                        key, tuple) else ""),
                    "Option": r.get("label", key[1] if isinstance(
-                       key, tuple) and len(key) > 1 else ""),
-                   "Case": r.get("name", "")}
-            row["NPV ($MM)"] = (f"{r['npv_MM']:,.0f}"
-                                 if r.get("npv_MM") is not None else "—")
+                       key, tuple) and len(key) > 1 else "")}
+            row["NPV after-tax ($MM)"] = (
+                f"{r['npv_MM']:,.0f}"
+                if r.get("npv_MM") is not None else "—")
+            row["NPV pre-tax ($MM)"] = (
+                f"{r['npv_pretax_MM']:,.0f}"
+                if r.get("npv_pretax_MM") is not None else "—")
             row["IRR"] = (f"{r['irr']:.1%}"
                           if r.get("irr") is not None else "—")
-            row["Final RF"] = (f"{r['final_rf']:.1%}"
-                                if r.get("final_rf") is not None else "—")
+            row["Resources (MMboe)"] = (
+                f"{r['resources_mmboe']:,.1f}"
+                if r.get("resources_mmboe") is not None else "—")
+            row["CAPEX ($MM)"] = (
+                f"{r['capex_total_MM']:,.0f}"
+                if r.get("capex_total_MM") is not None else "—")
             row["BE oil ($/bbl)"] = (f"{r['breakeven_oil']:.1f}"
                                       if r.get("breakeven_oil") is not None
                                       else "—")
+            row["Final RF"] = (f"{r['final_rf']:.1%}"
+                                if r.get("final_rf") is not None else "—")
             row["Status"] = "✅" if r.get("ok") else "❌"
             rows.append(row)
         df_res = pd.DataFrame(rows)
-        # Sort by NPV descending if present
+        # Sort by after-tax NPV descending if present
         try:
-            df_res["_sort"] = df_res["NPV ($MM)"].str.replace(
+            df_res["_sort"] = df_res["NPV after-tax ($MM)"].str.replace(
                 "[,—]", "", regex=True)
             df_res["_sort"] = pd.to_numeric(df_res["_sort"], errors="coerce")
             df_res = df_res.sort_values(
@@ -15018,11 +15158,14 @@ def concept_selector_section(default_start_date):
                             "picks": {dn: lbl
                                        for dn, lbl in r.get("picks", [])},
                             "kpis": {
-                                "npv_MM": r.get("npv_MM"),
+                                "npv_after_tax_MM": r.get("npv_MM"),
+                                "npv_pre_tax_MM": r.get("npv_pretax_MM"),
                                 "irr": r.get("irr"),
                                 "final_rf": r.get("final_rf"),
+                                "resources_mmboe": r.get("resources_mmboe"),
                                 "breakeven_oil_usd_bbl": r.get(
                                     "breakeven_oil"),
+                                "capex_total_MM": r.get("capex_total_MM"),
                                 "capex_disc_MM": r.get("capex_disc_MM"),
                                 "co2_total_Mt": r.get("co2_total_Mt"),
                             },
@@ -15294,15 +15437,24 @@ def concept_selector_section(default_start_date):
                         hoverinfo="skip",
                     ), secondary_y=False)
 
-                # Breakeven labels next to each mean marker
+                # Breakeven labels — boxed beside each mean marker, like a
+                # callout on the reference chart (white box, dark border,
+                # bold $/bbl).
                 for r in chart_rows:
                     if r["breakeven_oil"] is not None:
                         fig_cc.add_annotation(
                             x=r["capex_disc_MM"], y=r["mean"],
-                            text=f"BE ${r['breakeven_oil']:.0f}",
-                            showarrow=False,
-                            xshift=14, yshift=-18,
-                            font=dict(size=9, color="#444"),
+                            text=f"<b>BE ${r['breakeven_oil']:.0f}/bbl</b>",
+                            showarrow=True,
+                            arrowhead=0, arrowwidth=1,
+                            arrowcolor="#888",
+                            ax=30, ay=-26,
+                            xanchor="left",
+                            font=dict(size=10, color="#1a1a1a"),
+                            bordercolor="#555",
+                            borderwidth=1.2,
+                            borderpad=4,
+                            bgcolor="rgba(255,255,255,0.92)",
                         )
 
                 # Emissions on the secondary axis as small blue squares
