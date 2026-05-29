@@ -13805,7 +13805,14 @@ def _apply_concept_patches(payload: dict, picks: list) -> dict:
                         # Renumber
                         pdf["name"] = [f"P-{i+1:02d}"
                                         for i in range(len(pdf))]
-                        p["tables"]["producers_df"] = pdf.to_dict("records")
+                        # IMPORTANT: write back in the SAME column-oriented
+                        # format the payload uses elsewhere (orient="list").
+                        # run_payload_case reads producers_df as a dict of
+                        # columns (pdata.get("name"), pdata["rig"][i]); a
+                        # row-oriented "records" list would raise
+                        # 'list' object has no attribute 'get'.
+                        p["tables"]["producers_df"] = pdf.to_dict(
+                            orient="list")
                 except Exception:
                     pass
             elif k.startswith("_facility_capex_override_MM"):
@@ -13825,7 +13832,7 @@ def _apply_concept_patches(payload: dict, picks: list) -> dict:
                             ratio = new_total / cur_total
                             fac["amount_MMUSD"] = (
                                 fac["amount_MMUSD"].astype(float) * ratio)
-                        p["tables"]["fac_df"] = fac.to_dict("records")
+                        p["tables"]["fac_df"] = fac.to_dict(orient="list")
                 except Exception:
                     pass
             else:
