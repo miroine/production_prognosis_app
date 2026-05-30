@@ -14838,9 +14838,29 @@ def concept_selector_section(default_start_date):
                         key=f"concept_opt_{_oid}_patches",
                         label_visibility="collapsed",
                         placeholder="oil_price_bbl: 55",
-                        help="Optional key:value overrides applied on top "
-                             "of the linked case (or the base case if no "
-                             "case is linked).")
+                        help="Optional key:value overrides. If NO case is "
+                             "linked, these modify the base case. If a case "
+                             "IS linked, they are IGNORED unless you tick "
+                             "'apply patches to linked case' below — a "
+                             "linked case runs exactly as saved by default.")
+                    # When a case is linked, let the user explicitly opt in
+                    # to applying the patches on top of it. Default OFF so a
+                    # linked case reproduces its Field-prognosis result
+                    # exactly.
+                    _apply_flag = opt.get("apply_patches_to_case", False)
+                    if _has_case := bool(opt.get("case_payload")):
+                        if opt.get("patches"):
+                            _apply_flag = st.checkbox(
+                                "↳ apply the patches above on top of the "
+                                "linked case (otherwise it runs as-is)",
+                                value=opt.get("apply_patches_to_case", False),
+                                key=f"concept_opt_{_oid}_applypatch")
+                            opt["apply_patches_to_case"] = _apply_flag
+                        st.caption(
+                            "📎 This option runs the linked case "
+                            + ("**with** the patches above."
+                               if _apply_flag else
+                               "**exactly as saved** (no modifications)."))
                     # store the patch draft alongside the label/desc draft
                     _opt_drafts[-1] = (opt, _draft_label, _draft_desc,
                                         _draft_patch_str)
@@ -15034,21 +15054,35 @@ def concept_selector_section(default_start_date):
         for dim_name, opt in run_items:
             label = opt["label"]
             name = f"{dim_name} — {label}"
-            # Resolve the case for this option: its linked case payload if
-            # present, else the base payload; then apply any patch
-            # overrides on top.
+            # Resolve the case for this option.
+            #
+            # RULE: a linked case (uploaded YAML or saved DB case) runs
+            # EXACTLY as-is — no patches, no modifications — so it
+            # reproduces the Field-prognosis result for that case bit for
+            # bit. Patches are only applied when the user explicitly opts
+            # in for that option (apply_patches_to_case=True), or when
+            # there is NO linked case (then patches modify the base case,
+            # which is the morphological-matrix use-case).
             import copy as _copy
-            if opt.get("case_payload"):
+            _has_case = bool(opt.get("case_payload"))
+            if _has_case:
                 case_payload = _copy.deepcopy(opt["case_payload"])
                 _case_source = f"linked: {opt.get('case_name', 'case')}"
             else:
                 case_payload = _copy.deepcopy(base_payload)
                 _case_source = "base case"
-            if opt.get("patches"):
+            # Apply patches only when (a) there's no linked case (patch the
+            # base), or (b) the user explicitly asked to patch the linked
+            # case for this option.
+            _apply_patches = bool(opt.get("patches")) and (
+                (not _has_case) or opt.get("apply_patches_to_case", False))
+            if _apply_patches:
                 case_payload = _apply_concept_patches(
                     case_payload,
                     [{"label": label, "patches": opt["patches"]}])
                 _case_source += f" + {len(opt['patches'])} patch(es)"
+            elif _has_case and opt.get("patches"):
+                _case_source += "  (patches ignored — linked case run as-is)"
             case_payload.setdefault("_meta", {})["name"] = name
             key = (dim_name, label)
 
