@@ -10556,6 +10556,8 @@ def collect_inputs_payload() -> dict:
         "economic_cutoff_mode_label", "economic_cutoff_persistence",
         "aq_ct_U", "aq_ct_diff",
         "well_pi_default", "min_bhp_default",
+        "retrograde_enabled", "retrograde_drop_fraction",
+        "fractional_flow_enabled",
     ]
     payload = {"scalar": {}, "tables": {}}
     for k in KEYS:
@@ -11534,6 +11536,20 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "gas_flare": float(scalar.get("gas_flare", 0.0)),
         "pvt": pvt, "aquifer": aquifer, "gas_cap": gas_cap,
         "cap_sched": cap_sched, "facility_capex": facility_capex,
+        # IPR / inflow defaults (needed when wells use ipr_mode) — these
+        # were missing in the batch path, so an IPR/gas-condensate case ran
+        # with different defaults than Field prognosis.
+        "well_pi": float(scalar.get("well_pi_default", 2.0)),
+        "min_bhp_psi": to_field(
+            float(scalar.get("min_bhp_default", 1500.0)), "pressure", units),
+        # Retrograde condensate dropout (gas-condensate fields)
+        "retrograde_enabled": bool(scalar.get("retrograde_enabled", False)),
+        "retrograde_drop_fraction": float(
+            scalar.get("retrograde_drop_fraction", 0.55)),
+        # Fractional-flow water modelling (oil fields)
+        "fractional_flow_enabled": bool(
+            scalar.get("fractional_flow_enabled", False)),
+        "ff_params": scalar.get("ff_params", {}) or {},
     }
 
     # Backward compat: old saves stored oil_price/gas_price/opex_var/tariffs
@@ -11751,6 +11767,21 @@ def _build_asm_for_scenario(meta: dict, fluid: str, strategy: str,
         gas_flare_fraction=meta["gas_flare"],
         reservoirs=reservoirs or [],
         well_links=well_links or [],
+        default_well_pi=meta.get("well_pi", 2.0),
+        default_min_bhp_psi=meta.get("min_bhp_psi", 1500.0),
+        retrograde_enabled=meta.get("retrograde_enabled", False),
+        retrograde_drop_fraction=meta.get(
+            "retrograde_drop_fraction", 0.55),
+        fractional_flow_enabled=meta.get("fractional_flow_enabled", False),
+        ff_swc=meta.get("ff_params", {}).get("swc", 0.20),
+        ff_sor=meta.get("ff_params", {}).get("sor", 0.25),
+        ff_krw_max=meta.get("ff_params", {}).get("krw_max", 0.30),
+        ff_kro_max=meta.get("ff_params", {}).get("kro_max", 0.90),
+        ff_nw=meta.get("ff_params", {}).get("nw", 3.0),
+        ff_no=meta.get("ff_params", {}).get("no", 2.0),
+        ff_mu_oil=meta.get("ff_params", {}).get("mu_oil", 1.5),
+        ff_mu_water=meta.get("ff_params", {}).get("mu_water", 0.4),
+        ff_sweep=meta.get("ff_params", {}).get("sweep", 0.70),
     )
 
 
