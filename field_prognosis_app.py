@@ -705,6 +705,7 @@ def decline_rate_multisegment(qi, segments, rel_months):
 def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = True):
     n = len(dates)
     primary = np.zeros(n); secondary = np.zeros(n); water = np.zeros(n); inj = np.zeros(n)
+    _seg_fell_back = False
     online_ts = pd.Timestamp(well.online_date)
     active = dates >= online_ts
     rel_months = ((dates.year - online_ts.year) * 12 + (dates.month - online_ts.month)).values
@@ -732,6 +733,12 @@ def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = T
             primary = np.where(active, rp, 0.0)
             secondary = np.where(active, rs, 0.0)
         else:
+            if well.decline_model == "Multi-segment" and not well.segments:
+                # A Multi-segment well with no segment profile attached —
+                # usually a case saved before segment-export existed, or a
+                # YAML missing its 'segments:' block. Flag it so the caller
+                # can warn (this is the classic live-vs-batch mismatch).
+                _seg_fell_back = True
             rp = decline_rate(well.qi_primary, well.di_annual, well.b_factor,
                               well.decline_model, t_y) * sf
             rs = decline_rate(well.qi_secondary, well.di_annual, well.b_factor,
@@ -769,7 +776,8 @@ def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = T
 
     return {"primary": primary, "secondary": secondary, "water": water,
             "inj": inj, "active": active,
-            "oil": oil_phase, "gas": gas_phase}
+            "oil": oil_phase, "gas": gas_phase,
+            "_seg_fell_back": _seg_fell_back}
 
 
 # =============================================================================
@@ -1124,6 +1132,10 @@ def run_simulation(wells, asm: FieldAssumptions):
     n_months = asm.forecast_years * MONTHS_PER_YEAR
     dates = pd.date_range(asm.start_date, periods=n_months, freq="MS")
 
+    # Track Multi-segment wells that have no segment profile attached, so
+    # we can warn the user (the profile silently falls back to single-Arps).
+    _missing_segments_wells = []
+
     producers = [w for w in wells if w.is_producer]
     injectors = [w for w in wells if not w.is_producer]
     n_p = len(producers); n_i = len(injectors)
@@ -1189,6 +1201,8 @@ def run_simulation(wells, asm: FieldAssumptions):
         p_mat[:, j] = prof["primary"]; s_mat[:, j] = prof["secondary"]
         w_mat[:, j] = prof["water"]; on_p[:, j] = prof["active"]
         oil_mat[:, j] = prof["oil"]; gas_mat[:, j] = prof["gas"]
+        if prof.get("_seg_fell_back"):
+            _missing_segments_wells.append(w.name)
     for j, w in enumerate(injectors):
         prof = well_monthly(w, dates, field_is_oil=is_oil)
         inj_mat[:, j] = prof["inj"]; on_i[:, j] = prof["active"]
@@ -1690,6 +1704,14 @@ def run_simulation(wells, asm: FieldAssumptions):
     # field has produced 100% of OOIP/OGIP, the rate is forced to zero. A
     # warning is recorded on the DataFrame so the UI can flag it.
     profile_warnings = []
+    if _missing_segments_wells:
+        _uniq = sorted(set(_missing_segments_wells))
+        profile_warnings.append(
+            "🧩 Multi-segment decline selected for "
+            f"{', '.join(_uniq)} but no segment profile was found — "
+            "these wells fell back to a single-curve Arps decline. If this "
+            "case came from a YAML/saved case, re-export it from this "
+            "version so the 'segments:' block is included, then reload.")
     primary_in_place = asm.ooip_oil if is_oil else asm.ogip_gas  # MMstb / Bscf
     if primary_in_place and primary_in_place > 0:
         cum_primary_running = np.cumsum(field_p * days) / 1e6
