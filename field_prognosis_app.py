@@ -9713,6 +9713,59 @@ def main():
                   f"{be['oil_price']:,.1f}",
                   help=_be_help)
 
+    # ---- Clean summary KPI table ----
+    # The metric cards above truncate large numbers ("$18..."), so repeat
+    # the headline economics in a compact, fully-readable two-column table.
+    try:
+        _npv_at = df_e["npv"].iloc[-1] / 1e6
+        # NPV before tax: discount the pre-tax cashflow (after-tax + tax)
+        _cf_at = df_e["cashflow"].values.astype(float)
+        _tax = (df_e["tax"].values.astype(float)
+                if "tax" in df_e.columns else 0.0 * _cf_at)
+        _rm = (1.0 + econ_r.discount_rate) ** (1/12.0) - 1.0
+        _disc = (1.0 + _rm) ** np.arange(len(_cf_at))
+        _npv_pretax = float(((_cf_at + _tax) / _disc).sum()) / 1e6
+        # Total undiscounted CAPEX
+        _capex = 0.0
+        for _c in ("capex_well", "capex_facility", "abandonment"):
+            if _c in df_e.columns:
+                _capex += float(df_e[_c].sum())
+        _capex /= 1e6
+        # Resources (MMboe)
+        _cum_oil = float(df["cum_oil"].iloc[-1]) if "cum_oil" in df.columns else 0.0
+        _cum_gas = float(df["cum_gas"].iloc[-1]) if "cum_gas" in df.columns else 0.0
+        _boe = _cum_oil + _cum_gas / 6.0
+        _irr_s = f"{irr:.1%}" if irr is not None else "—"
+        _be_s = (f"${be['oil_price']:,.1f}/bbl"
+                 if be.get("oil_price") is not None else "—")
+        _pb_s = f"{payback/12:.1f} yrs" if payback is not None else "—"
+        _tax_take = _npv_pretax - _npv_at
+        summary_tbl = pd.DataFrame({
+            "Metric": [
+                "NPV after-tax", "NPV pre-tax", "Fiscal take (NPV)",
+                "IRR", "Payback", "Breakeven oil",
+                "Total CAPEX (undisc.)", "Recoverable resources",
+                "Final recovery factor",
+            ],
+            "Value": [
+                f"${_npv_at:,.0f} MM",
+                f"${_npv_pretax:,.0f} MM",
+                f"${_tax_take:,.0f} MM",
+                _irr_s,
+                _pb_s,
+                _be_s,
+                f"${_capex:,.0f} MM",
+                f"{_boe:,.1f} MMboe",
+                f"{final_rf:.1%}",
+            ],
+        })
+        with st.expander("📊 Summary KPI table (full figures)",
+                          expanded=True):
+            st.dataframe(summary_tbl, use_container_width=True,
+                          hide_index=True)
+    except Exception as _e:
+        pass
+
     # NGL contribution (only show when yield > 0)
     ngl_yield_active = float(getattr(econ_r, "ngl_yield_bbl_per_mmscf", 0.0))
     if ngl_yield_active > 0 and "revenue_ngl" in df_e.columns:
@@ -10550,6 +10603,11 @@ def collect_inputs_payload() -> dict:
         "co2_scope3_enabled", "co2_scope3_factor_oil",
         "co2_scope3_factor_gas", "co2_scope3_price",
         "money_basis_label", "inflation_rate", "revenue_basis",
+        # NCS tax sliders — the widget keys are ncs_cit / ncs_spt /
+        # ncs_uplift (NOT *_rate); saving the *_rate names meant the
+        # user's NCS rates were never persisted. Save both the real keys
+        # and keep the *_rate aliases for backward-compatible loads.
+        "ncs_cit", "ncs_spt", "ncs_uplift",
         "ncs_cit_rate", "ncs_spt_rate", "ncs_uplift_rate",
         "ncs_depreciation_years", "ncs_uplift_years",
         "ngl_yield", "ngl_price", "ngl_opex", "ngl_shrink",
@@ -10557,7 +10615,11 @@ def collect_inputs_payload() -> dict:
         "aq_ct_U", "aq_ct_diff",
         "well_pi_default", "min_bhp_default",
         "retrograde_enabled", "retrograde_drop_fraction",
-        "fractional_flow_enabled",
+        "cgr_from_inplace",
+        # Fractional-flow (Buckley-Leverett) water-cut model parameters
+        "fractional_flow_enabled", "ff_enabled",
+        "ff_swc", "ff_sor", "ff_krw_max", "ff_kro_max",
+        "ff_nw", "ff_no", "ff_mu_oil", "ff_mu_water", "ff_sweep",
     ]
     payload = {"scalar": {}, "tables": {}}
     for k in KEYS:
@@ -10579,6 +10641,39 @@ def collect_inputs_payload() -> dict:
                     df[col] = df[col].apply(lambda x: x.isoformat()
                                             if isinstance(x, (date, datetime)) else x)
             payload["tables"][tbl_key] = df.to_dict(orient="list")
+
+    # ---- Multi-segment decline profiles (per producer) ----
+    # These live in session_state as separate per-well DataFrames keyed
+    # "segments_<wellname>" and are NOT part of producers_df. They were
+    # previously omitted from the payload entirely, so a Multi-segment
+    # well reloaded with decline_model="Multi-segment" but no segments,
+    # silently falling back to default decline — the main cause of the
+    # live-vs-batch mismatch. Dump every segment table here.
+    seg_store = {}
+    prod_names = []
+    try:
+        if "producers_df" in st.session_state:
+            prod_names = [str(n) for n in
+                          st.session_state["producers_df"].get("name", [])]
+    except Exception:
+        prod_names = []
+    for _key in list(st.session_state.keys()):
+        if not isinstance(_key, str) or not _key.startswith("segments_"):
+            continue
+        wname = _key[len("segments_"):]
+        try:
+            seg_df = st.session_state[_key]
+            if hasattr(seg_df, "to_dict"):
+                seg_store[wname] = seg_df.to_dict(orient="list")
+            elif isinstance(seg_df, list):
+                # already list-of-dicts
+                import pandas as _pd
+                seg_store[wname] = _pd.DataFrame(seg_df).to_dict(
+                    orient="list")
+        except Exception:
+            continue
+    if seg_store:
+        payload["segments"] = seg_store
     return payload
 
 
@@ -10663,6 +10758,29 @@ def restore_inputs_payload(payload: dict) -> None:
                     pass
 
         st.session_state[tbl_key] = df
+
+    # ---- Restore multi-segment decline profiles ----
+    # Push each saved "segments_<well>" table back into session_state so
+    # the Multi-segment decline editor and the engine see them again.
+    seg_store = payload.get("segments", {})
+    if isinstance(seg_store, dict):
+        for wname, seg_tbl in seg_store.items():
+            try:
+                if isinstance(seg_tbl, dict):
+                    seg_df = pd.DataFrame(seg_tbl)
+                elif isinstance(seg_tbl, list):
+                    seg_df = pd.DataFrame(seg_tbl)
+                else:
+                    continue
+                # coerce numeric columns
+                for c in ("months", "di", "b", "mult"):
+                    if c in seg_df.columns:
+                        seg_df[c] = pd.to_numeric(seg_df[c], errors="coerce")
+                if "model" in seg_df.columns:
+                    seg_df["model"] = seg_df["model"].astype(str)
+                st.session_state[f"segments_{wname}"] = seg_df
+            except Exception:
+                continue
 
     st.session_state["stale"] = True
     st.session_state["results"] = None
@@ -11369,6 +11487,37 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         rig_cursor["Rig-A"] = start_date
 
     wells = []
+    # Multi-segment decline profiles, keyed by well name. These were saved
+    # under payload["segments"]; convert each to the engine's list-of-dicts.
+    seg_payload = payload.get("segments", {}) or {}
+
+    def _segments_for(wname):
+        raw = seg_payload.get(str(wname))
+        if not raw:
+            return None
+        # raw may be dict-of-lists or list-of-row-dicts
+        rows = []
+        if isinstance(raw, dict):
+            cols = list(raw.keys())
+            nrows = len(raw.get(cols[0], [])) if cols else 0
+            for r in range(nrows):
+                rows.append({c: raw[c][r] for c in cols})
+        elif isinstance(raw, list):
+            rows = [dict(x) for x in raw if isinstance(x, dict)]
+        segs = []
+        for sr in rows:
+            try:
+                segs.append({
+                    "months": int(float(sr.get("months", 12))),
+                    "model": str(sr.get("model") or "Exponential"),
+                    "di": float(sr.get("di", 0.0) or 0.0),
+                    "b": float(sr.get("b", 0.5) or 0.0),
+                    "mult": float(sr.get("mult", 1.0) or 1.0),
+                })
+            except Exception:
+                continue
+        return segs or None
+
     # Producers
     pdata = tables.get("producers_df", {})
     if pdata:
@@ -11397,6 +11546,35 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                     wc_ramp_months=int(float(pdata["wc_ramp_months"][i])),
                     scale_factor=float(pdata.get("scale_factor", [1.0]*n)[i]),
                     uptime=float(pdata.get("uptime", [0.95]*n)[i]) if "uptime" in pdata else 0.95,
+                    # Multi-segment decline profile (was missing → wells
+                    # with decline_model="Multi-segment" lost their profile
+                    # on reload, the main live-vs-batch mismatch).
+                    segments=_segments_for(pdata["name"][i]),
+                    # IPR / inflow fields so an ipr_mode well reproduces
+                    # the live result.
+                    derive_qi_from_pi=bool(pdata.get(
+                        "derive_qi_from_pi", [False]*n)[i])
+                        if "derive_qi_from_pi" in pdata else False,
+                    well_pi_override=float(pdata.get(
+                        "well_pi_override", [0.0]*n)[i])
+                        if "well_pi_override" in pdata else 0.0,
+                    fluid=str(pdata.get("fluid", ["auto"]*n)[i])
+                        if "fluid" in pdata else "auto",
+                    ipr_mode=bool(pdata.get("ipr_mode", [False]*n)[i])
+                        if "ipr_mode" in pdata else False,
+                    wellhead_pressure_psi=to_field(float(pdata.get(
+                        "wellhead_pressure_psi", [200.0]*n)[i]),
+                        "pressure", units)
+                        if "wellhead_pressure_psi" in pdata else 200.0,
+                    tubing_depth_ft=to_field(float(pdata.get(
+                        "tubing_depth_ft", [8000.0]*n)[i]), "depth", units)
+                        if "tubing_depth_ft" in pdata else 8000.0,
+                    fluid_gradient_psi_per_ft=float(pdata.get(
+                        "fluid_gradient_psi_per_ft", [0.35]*n)[i])
+                        if "fluid_gradient_psi_per_ft" in pdata else 0.35,
+                    friction_psi_per_kbpd=float(pdata.get(
+                        "friction_psi_per_kbpd", [5.0]*n)[i])
+                        if "friction_psi_per_kbpd" in pdata else 5.0,
                 ))
                 rig_cursor[rig] = spud + timedelta(days=drill + compl)
             except Exception:

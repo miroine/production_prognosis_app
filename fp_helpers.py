@@ -2878,6 +2878,12 @@ def payload_to_yaml(payload: dict, meta: dict | None = None) -> str:
     }
     for tname, tbl in payload.get("tables", {}).items():
         out["tables"][tname] = _table_to_rows(tbl)
+    # Multi-segment decline profiles (per-well piecewise-Arps). Written as
+    # a mapping of well-name -> list-of-segment-rows so they round-trip.
+    seg = payload.get("segments")
+    if seg:
+        out["segments"] = {
+            str(w): _table_to_rows(tbl) for w, tbl in seg.items()}
     return yaml.safe_dump(out, sort_keys=False, default_flow_style=False,
                           allow_unicode=True)
 
@@ -2914,7 +2920,16 @@ def yaml_to_payload(yaml_text: str) -> tuple[dict, dict]:
     for tname, tbl in tables_in.items():
         rows = _table_to_rows(tbl)
         tables[tname] = _rows_to_dict_of_lists(rows)
-    return {"scalar": scalar, "tables": tables}, meta
+    result = {"scalar": scalar, "tables": tables}
+    # Multi-segment decline profiles
+    seg_in = doc.get("segments", {}) or {}
+    if isinstance(seg_in, dict) and seg_in:
+        segs = {}
+        for wname, tbl in seg_in.items():
+            rows = _table_to_rows(tbl)
+            segs[str(wname)] = _rows_to_dict_of_lists(rows)
+        result["segments"] = segs
+    return result, meta
 
 
 def validate_yaml_payload(payload: dict, meta: dict) -> list[str]:
