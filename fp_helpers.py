@@ -13,7 +13,7 @@ from __future__ import annotations
 # app and fp_helpers.py are out of sync (a common cause of AttributeError
 # when only one of the two files is redeployed). Bump this whenever the
 # public surface of fp_helpers changes.
-FP_HELPERS_VERSION = "4.4"
+FP_HELPERS_VERSION = "4.5"
 
 import io
 import json

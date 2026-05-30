@@ -9039,7 +9039,7 @@ def main():
     # If the app and fp_helpers.py are out of sync (e.g. only one file was
     # redeployed), new features crash with AttributeError mid-page. Detect
     # that here and show one clear banner.
-    _EXPECTED_FP_VERSION = "4.4"
+    _EXPECTED_FP_VERSION = "4.5"
     _fp_version = getattr(fh, "FP_HELPERS_VERSION", None)
     if _fp_version != _EXPECTED_FP_VERSION:
         _fp_desc = (f"v{_fp_version}" if _fp_version
@@ -10543,6 +10543,15 @@ def collect_inputs_payload() -> dict:
         "well_cost_mode", "rig_dayrate", "cmpl_dayrate",
         "well_tangibles", "well_intangibles_pct",
         "capex_contingency_pct",
+        # CO2 / carbon economics + money basis (so a saved case round-trips
+        # to identical economics in both the main app and the batch runner)
+        "co2_price", "co2_factor_gas_combust",
+        "co2_factor_flare_inefficiency", "co2_factor_oil_routine",
+        "co2_scope3_enabled", "co2_scope3_factor_oil",
+        "co2_scope3_factor_gas", "co2_scope3_price",
+        "money_basis_label", "inflation_rate", "revenue_basis",
+        "ncs_cit_rate", "ncs_spt_rate", "ncs_uplift_rate",
+        "ncs_depreciation_years", "ncs_uplift_years",
         "ngl_yield", "ngl_price", "ngl_opex", "ngl_shrink",
         "economic_cutoff_mode_label", "economic_cutoff_persistence",
         "aq_ct_U", "aq_ct_diff",
@@ -11489,7 +11498,16 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                 continue
     if not fac_rows:
         fac_rows = [{"date": pd.Timestamp(start_date), "amount_MMUSD": 0.0, "label": ""}]
-    facility_capex = CapexSchedule(df=pd.DataFrame(fac_rows))
+    # Apply the CAPEX contingency multiplier exactly as the main app does
+    # (the stored fac_df / well-cost inputs are PRE-contingency). Without
+    # this the Concept Selector under-counts CAPEX vs Field prognosis and
+    # the two give different NPVs for the same case.
+    _cont_mult = 1.0 + float(scalar.get("capex_contingency_pct", 25)) / 100.0
+    fac_df_cont = pd.DataFrame(fac_rows)
+    if "amount_MMUSD" in fac_df_cont.columns:
+        fac_df_cont["amount_MMUSD"] = (
+            fac_df_cont["amount_MMUSD"].astype(float) * _cont_mult)
+    facility_capex = CapexSchedule(df=fac_df_cont)
 
     aban_gas = float(scalar.get("aban_gas", 0.5))
     if units == "metric":
@@ -11562,19 +11580,20 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "gas_price": gas_price_f,
         "opex_var":  opex_var_f,
         "opex_fixed": float(scalar.get("opex_fixed", 20)) * 1e6,
-        "capex_per_well": float(scalar.get("capex_well", 15)),
+        "capex_per_well": float(scalar.get("capex_well", 15)) * _cont_mult,
         "discount_rate": float(scalar.get("disc", 0.10)),
         "tax_rate":      float(scalar.get("tax_rate", 0.30)),
         "royalty_rate":  float(scalar.get("royalty", 0.10)),
         "tariff_oil": tariff_oil_f,
         "tariff_gas": tariff_gas_f,
-        "abandonment_cost_MM": float(scalar.get("aban_cost", 80)),
+        "abandonment_cost_MM": float(scalar.get("aban_cost", 80)) * _cont_mult,
         "facility_capex": facility_capex,
         "ngl_yield_bbl_per_mmscf": float(scalar.get("ngl_yield", 0.0)),
         "ngl_price_bbl": float(scalar.get("ngl_price", 25.0)),
         "ngl_opex_bbl": float(scalar.get("ngl_opex", 5.0)),
         "ngl_shrinkage_pct": float(scalar.get("ngl_shrink", 0.0)),
         "rig_meta": rig_meta,
+        # ---- Fiscal regime ----
         "fiscal_regime": _regime,
         "ncs_cit_rate": float(scalar.get("ncs_cit_rate", 0.22)),
         "ncs_spt_rate": float(scalar.get("ncs_spt_rate", 0.718)),
@@ -11582,6 +11601,45 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "ncs_depreciation_years": float(
             scalar.get("ncs_depreciation_years", 6.0)),
         "ncs_uplift_years": float(scalar.get("ncs_uplift_years", 4.0)),
+        # PSC parameters (stored under short keys in the payload)
+        "psc_cost_recovery_ceiling": float(scalar.get("psc_cr_ceiling", 0.50)),
+        "psc_profit_oil_share_contractor": float(scalar.get("psc_pos", 0.40)),
+        "psc_govt_participation": float(scalar.get("psc_gov_part", 0.0)),
+        "psc_psc_tax_rate": float(scalar.get("psc_tax", 0.30)),
+        "psc_signature_bonus_MM": float(scalar.get("psc_sig_bonus", 0.0)),
+        # ---- Well cost model (rig-rate components carry contingency) ----
+        "well_cost_mode": str(scalar.get("well_cost_mode", "rig_rate")),
+        "rig_day_rate_kUSD": float(
+            scalar.get("rig_dayrate", 500.0)) * _cont_mult,
+        "completion_day_rate_kUSD": float(
+            scalar.get("cmpl_dayrate", 350.0)) * _cont_mult,
+        "well_tangibles_MM": float(
+            scalar.get("well_tangibles", 4.0)) * _cont_mult,
+        "well_intangibles_pct": float(
+            scalar.get("well_intangibles_pct", 0.10)),
+        # ---- Money basis ----
+        "money_basis": ("nominal"
+            if str(scalar.get("money_basis_label", "")).startswith("Nominal")
+            else "real"),
+        # The inflation widget stores a percent (e.g. 2.5); the engine
+        # wants a fraction. Divide by 100 if it looks like a percent.
+        "inflation_rate": (float(scalar.get("inflation_rate", 0.0)) / 100.0
+                            if float(scalar.get("inflation_rate", 0.0)) > 1.0
+                            else float(scalar.get("inflation_rate", 0.0))),
+        # ---- CO2 economics ----
+        "co2_price": float(scalar.get("co2_price", 0.0)),
+        "co2_factor_gas_combust": float(
+            scalar.get("co2_factor_gas_combust", 53.0)),
+        "co2_factor_flare_inefficiency": float(
+            scalar.get("co2_factor_flare_inefficiency", 0.02)),
+        "co2_factor_oil_routine": float(
+            scalar.get("co2_factor_oil_routine", 0.5)),
+        "co2_scope3_enabled": bool(scalar.get("co2_scope3_enabled", False)),
+        "co2_scope3_factor_oil": float(
+            scalar.get("co2_scope3_factor_oil", 430.0)),
+        "co2_scope3_factor_gas": float(
+            scalar.get("co2_scope3_factor_gas", 53.0)),
+        "co2_scope3_price": float(scalar.get("co2_scope3_price", 0.0)),
         "economic_cutoff_mode": ("economic"
             if str(scalar.get("economic_cutoff_mode_label", "")).startswith("Economic")
             else "horizon"),
