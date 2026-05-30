@@ -15040,12 +15040,15 @@ def concept_selector_section(default_start_date):
             import copy as _copy
             if opt.get("case_payload"):
                 case_payload = _copy.deepcopy(opt["case_payload"])
+                _case_source = f"linked: {opt.get('case_name', 'case')}"
             else:
                 case_payload = _copy.deepcopy(base_payload)
+                _case_source = "base case"
             if opt.get("patches"):
                 case_payload = _apply_concept_patches(
                     case_payload,
                     [{"label": label, "patches": opt["patches"]}])
+                _case_source += f" + {len(opt['patches'])} patch(es)"
             case_payload.setdefault("_meta", {})["name"] = name
             key = (dim_name, label)
 
@@ -15146,6 +15149,7 @@ def concept_selector_section(default_start_date):
                     "name": name,
                     "dim": dim_name,
                     "label": label,
+                    "source": _case_source,
                     "npv_MM": npv_MM,
                     "npv_pretax_MM": npv_pretax_MM,
                     "cum_primary": cum_primary,
@@ -15199,7 +15203,8 @@ def concept_selector_section(default_start_date):
             row = {"Dimension": r.get("dim", key[0] if isinstance(
                        key, tuple) else ""),
                    "Option": r.get("label", key[1] if isinstance(
-                       key, tuple) and len(key) > 1 else "")}
+                       key, tuple) and len(key) > 1 else ""),
+                   "Ran against": r.get("source", "—")}
             row["NPV after-tax ($MM)"] = (
                 f"{r['npv_MM']:,.0f}"
                 if r.get("npv_MM") is not None else "—")
