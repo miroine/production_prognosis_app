@@ -9753,10 +9753,14 @@ def main():
             if _c in df_e.columns:
                 _capex += float(df_e[_c].sum())
         _capex /= 1e6
-        # Resources (MMboe)
+        # Resources (MMboe): oil/condensate + gas/6 + NGL (bbl→boe 1:1)
         _cum_oil = float(df["cum_oil"].iloc[-1]) if "cum_oil" in df.columns else 0.0
         _cum_gas = float(df["cum_gas"].iloc[-1]) if "cum_gas" in df.columns else 0.0
-        _boe = _cum_oil + _cum_gas / 6.0
+        _ngl_mmbbl = 0.0
+        if "ngl_rate" in df_e.columns:
+            _ngl_mmbbl = float(
+                (df_e["ngl_rate"].values * DAYS_PER_MONTH).sum()) / 1e6
+        _boe = _cum_oil + _cum_gas / 6.0 + _ngl_mmbbl
         _irr_s = f"{irr:.1%}" if irr is not None else "—"
         _be_s = (f"${be['oil_price']:,.1f}/bbl"
                  if be.get("oil_price") is not None else "—")
@@ -11421,14 +11425,23 @@ def run_payload_case(payload: dict, default_start_date,
             pass
 
         # Total recoverable resources in oil-equivalent (MMboe):
-        # oil (MMstb) + gas converted at 6 Mscf/boe.
-        # cum_gas is in Bscf: 1 Bscf = 1e9 scf = 1e6 Mscf; at 6 Mscf/boe
-        # that's 1e6/6 boe = (1/6) MMboe. So MMboe_gas = cum_gas_Bscf / 6.
+        # oil/condensate (MMstb) + gas at 6 Mscf/boe + NGL (already in bbl,
+        # so 1:1 to boe). cum_gas is in Bscf: 1 Bscf = 1e6 Mscf; at
+        # 6 Mscf/boe that's (1/6) MMboe. NGL is a recoverable sales product
+        # and is counted toward total resources, matching the live summary.
         resources_mmboe = None
         try:
-            resources_mmboe = float(cum_oil) + float(cum_gas) / 6.0
+            _ngl_mmbbl = 0.0
+            if df_e_s is not None and "ngl_rate" in df_e_s.columns:
+                _ngl_mmbbl = float(
+                    (df_e_s["ngl_rate"].values * DAYS_PER_MONTH).sum()) / 1e6
+            resources_mmboe = (float(cum_oil) + float(cum_gas) / 6.0
+                               + _ngl_mmbbl)
         except Exception:
-            pass
+            try:
+                resources_mmboe = float(cum_oil) + float(cum_gas) / 6.0
+            except Exception:
+                pass
 
         res["kpis"] = {
             "npv_MM": npv_MM, "cum_oil_MMstb": cum_oil,
