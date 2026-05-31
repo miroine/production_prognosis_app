@@ -10671,11 +10671,22 @@ def collect_inputs_payload() -> dict:
                 payload["scalar"][k] = v.isoformat()
             else:
                 payload["scalar"][k] = v
+    # Under a Depletion strategy the live app passes an EMPTY injector
+    # frame downstream (injection wells are not drilled or costed), so the
+    # exported case must do the same — otherwise a reloaded/ batch run
+    # would drill & cost injectors the live screen never had, causing a
+    # well-CAPEX mismatch. Mirror the live behaviour exactly: export an
+    # empty injectors_df when not in Injection mode.
+    _export_strategy = str(st.session_state.get("strategy", "Depletion"))
     for tbl_key in ["rigs_df", "producers_df", "injectors_df",
                     "cap_df", "fac_df",
                     "reservoirs_df", "well_reservoir_df"]:
         if tbl_key in st.session_state:
             df = st.session_state[tbl_key].copy()
+            if tbl_key == "injectors_df" and _export_strategy != "Injection":
+                # Keep the column schema but no rows — identical to what the
+                # live engine sees under Depletion.
+                df = df.iloc[0:0]
             for col in df.columns:
                 if pd.api.types.is_datetime64_any_dtype(df[col]):
                     df[col] = df[col].dt.strftime("%Y-%m-%d")
