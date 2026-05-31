@@ -2832,9 +2832,14 @@ def is_abandonment_label(label: str) -> bool:
     use this to strip abandonment rows out of facility CAPEX so the two
     stay consistent and abandonment is counted exactly once.
     """
-    if not label:
+    if label is None:
         return False
-    s = str(label).lower()
+    try:
+        s = str(label).lower().strip()
+    except Exception:
+        return False
+    if not s or s in ("nan", "none"):
+        return False
     keywords = ("cessation", "p&a", "p & a", "abandon", "restoration",
                 "decommission", "plug and aband", "plug & aband")
     return any(k in s for k in keywords)

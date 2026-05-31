@@ -8172,10 +8172,18 @@ def economics_section(units, start_date):
         st.session_state.get("capex_contingency_pct", 25)) / 100.0
     fac_df_with_cont = fac_df.copy()
     # Strip abandonment/cessation/P&A rows — booked separately via aban_cost,
-    # so keeping them in facilities would double-count cessation.
-    if "label" in fac_df_with_cont.columns:
-        _mask = ~fac_df_with_cont["label"].apply(fh.is_abandonment_label)
-        fac_df_with_cont = fac_df_with_cont[_mask].reset_index(drop=True)
+    # so keeping them in facilities would double-count cessation. Guard
+    # against missing/empty tables and non-string labels (NaN, floats).
+    try:
+        if ("label" in fac_df_with_cont.columns
+                and len(fac_df_with_cont) > 0):
+            _keep = [not fh.is_abandonment_label(
+                        "" if _v is None else str(_v))
+                     for _v in fac_df_with_cont["label"].tolist()]
+            fac_df_with_cont = fac_df_with_cont[_keep].reset_index(drop=True)
+    except Exception:
+        # Never let CAPEX hygiene crash the run — fall back to the raw table.
+        fac_df_with_cont = fac_df.copy()
     if "amount_MMUSD" in fac_df_with_cont.columns:
         fac_df_with_cont["amount_MMUSD"] = (
             fac_df_with_cont["amount_MMUSD"].astype(float) * _cont_mult)
@@ -11721,8 +11729,11 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
     # Drop any abandonment/cessation/P&A rows from the facility schedule —
     # the engine books abandonment separately from aban_cost, so leaving
     # them here would double-count cessation. (Matches the live app.)
-    fac_rows = [r for r in fac_rows
-                if not fh.is_abandonment_label(r.get("label", ""))]
+    try:
+        fac_rows = [r for r in fac_rows
+                    if not fh.is_abandonment_label(r.get("label", ""))]
+    except Exception:
+        pass
     if not fac_rows:
         fac_rows = [{"date": pd.Timestamp(start_date), "amount_MMUSD": 0.0, "label": ""}]
     # Apply the CAPEX contingency multiplier exactly as the main app does
