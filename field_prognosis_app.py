@@ -15462,6 +15462,7 @@ def concept_selector_section(default_start_date):
                     _tax_MM = kpis.get("tax_MM")
                     _co2_cost_MM = kpis.get("co2_cost_MM")
                     _payback_yrs = kpis.get("payback_yrs")
+                    # Capture the monthly time-series profiles (production +
                     # cashflow) so the full study export can include per-month
                     # profiles for a thorough offline comparison. Stored
                     # compactly as lists keyed by column.
@@ -15489,6 +15490,7 @@ def concept_selector_section(default_start_date):
                             _profile = {"index": _date_idx, "columns": _prof_cols}
                     except Exception:
                         _profile = None
+                else:
                     npv_MM = cum_primary = rf = irr = breakeven = None
                     capex_disc_MM = co2_total_Mt = None
                     npv_pretax_MM = capex_total_MM = resources_mmboe = None
