@@ -10926,6 +10926,33 @@ def case_management_section():
                     "name": st.session_state.get("current_case_name", "Untitled case"),
                     "description": "",
                 }
+                # Stamp the current live results into the export so that a
+                # batch run can verify it reproduces them — this catches the
+                # common "stale YAML" trap where the file was exported at a
+                # different edit state than the live screen. If results are
+                # stale (inputs changed since last run), skip the stamp.
+                if (st.session_state.get("results") is not None
+                        and not st.session_state.get("stale", True)):
+                    try:
+                        _R = st.session_state["results"]
+                        _dfR = _R["df"]; _dfE = _R["df_e"]
+                        _econR = _R.get("econ")
+                        _capex = sum(
+                            float(_dfE[c].sum())
+                            for c in ("capex_well", "capex_facility",
+                                      "abandonment")
+                            if c in _dfE.columns) / 1e6
+                        cur_meta["expected_results"] = {
+                            "npv_after_tax_MM": round(
+                                float(_dfE["npv"].iloc[-1]) / 1e6, 1),
+                            "final_rf": round(float(
+                                _dfR["recovery_factor"].iloc[-1]), 4),
+                            "capex_total_MM": round(_capex, 1),
+                            "stamped_at": datetime.utcnow().isoformat(
+                                timespec="seconds"),
+                        }
+                    except Exception:
+                        pass
                 yaml_text = fh.payload_to_yaml(cur_payload, cur_meta)
                 st.download_button(
                     "⬇️ Export current case as YAML",
@@ -15111,6 +15138,11 @@ def concept_selector_section(default_start_date):
                                 _pl, _meta_in = fh.yaml_to_payload(_raw)
                             opt["case_payload"] = _pl
                             opt["case_name"] = _up.name
+                            # Capture the exported "expected results" stamp
+                            # (if present) so we can verify the batch run
+                            # reproduces the live numbers and flag stale files.
+                            opt["expected_results"] = (
+                                _meta_in or {}).get("expected_results")
                         except Exception as _e:
                             st.warning(f"Could not parse {_up.name}: {_e}")
                     # Patch override (optional, advanced) — draft only,
@@ -15418,12 +15450,41 @@ def concept_selector_section(default_start_date):
                     _opex_MM = kpis.get("opex_MM")
                     _tax_MM = kpis.get("tax_MM")
                     _co2_cost_MM = kpis.get("co2_cost_MM")
-                else:
+                    _payback_yrs = kpis.get("payback_yrs")
+                    # cashflow) so the full study export can include per-month
+                    # profiles for a thorough offline comparison. Stored
+                    # compactly as lists keyed by column.
+                    _profile = None
+                    try:
+                        _dfp = res.get("df"); _dfpe = res.get("df_e")
+                        if _dfp is not None and len(_dfp) > 0:
+                            _prof_cols = {}
+                            _date_idx = (list(_dfp.index.astype(str))
+                                         if _dfp.index is not None else None)
+                            for _c in ("primary_rate", "secondary_rate",
+                                       "water_rate", "oil_rate", "gas_rate",
+                                       "cum_oil", "cum_gas",
+                                       "recovery_factor"):
+                                if _c in _dfp.columns:
+                                    _prof_cols[_c] = [float(x) for x in _dfp[_c].values]
+                            if _dfpe is not None and len(_dfpe) > 0:
+                                for _c in ("revenue", "opex", "tax",
+                                           "co2_cost", "capex_well",
+                                           "capex_facility", "abandonment",
+                                           "cashflow", "npv",
+                                           "ngl_rate"):
+                                    if _c in _dfpe.columns:
+                                        _prof_cols[_c] = [float(x) for x in _dfpe[_c].values]
+                            _profile = {"index": _date_idx, "columns": _prof_cols}
+                    except Exception:
+                        _profile = None
                     npv_MM = cum_primary = rf = irr = breakeven = None
                     capex_disc_MM = co2_total_Mt = None
                     npv_pretax_MM = capex_total_MM = resources_mmboe = None
                     _capex_well_MM = _capex_fac_MM = _capex_aban_MM = None
                     _revenue_MM = _opex_MM = _tax_MM = _co2_cost_MM = None
+                    _payback_yrs = None
+                    _profile = None
                 # ---- Optional Monte-Carlo pass for this case ----
                 npv_p90 = npv_p10 = npv_mc_mean = None
                 if mc_iters > 0 and res.get("ok"):
@@ -15473,12 +15534,35 @@ def concept_selector_section(default_start_date):
                         npv_p90 = float(_np.percentile(_arr, 10))
                         npv_p10 = float(_np.percentile(_arr, 90))
                         npv_mc_mean = float(_np.mean(_arr))
+                        _mc_draws = [float(x) for x in _arr]
+                    else:
+                        _mc_draws = None
+                else:
+                    _mc_draws = None
+                # Verify against the exported "expected results" stamp, if
+                # the linked YAML carried one. This catches stale exports:
+                # if the batch reproduces the stamped live numbers, the file
+                # is current; if not, the YAML was exported at a different
+                # edit state than the live screen.
+                _exp = opt.get("expected_results") if _has_case else None
+                _verify = None
+                if isinstance(_exp, dict):
+                    try:
+                        _checks = []
+                        if _exp.get("npv_after_tax_MM") is not None and npv_MM is not None:
+                            _checks.append(abs(npv_MM - _exp["npv_after_tax_MM"]) <= max(1.0, 0.01*abs(_exp["npv_after_tax_MM"])))
+                        if _exp.get("final_rf") is not None and rf is not None:
+                            _checks.append(abs(rf - _exp["final_rf"]) <= 0.005)
+                        if _exp.get("capex_total_MM") is not None and capex_total_MM is not None:
+                            _checks.append(abs(capex_total_MM - _exp["capex_total_MM"]) <= max(1.0, 0.01*abs(_exp["capex_total_MM"])))
+                        if _checks:
+                            _verify = "✓ matches live export" if all(_checks) else "⚠ differs from live export (stale YAML?)"
+                    except Exception:
+                        _verify = None
+                if _verify:
+                    _case_source = _case_source + f"  · {_verify}"
+
                 rec_payload = {
-                    "name": name,
-                    "dim": dim_name,
-                    "label": label,
-                    "source": _case_source,
-                    "npv_MM": npv_MM,
                     "npv_pretax_MM": npv_pretax_MM,
                     "cum_primary": cum_primary,
                     "final_rf": rf,
@@ -15493,11 +15577,14 @@ def concept_selector_section(default_start_date):
                     "opex_MM": _opex_MM,
                     "tax_MM": _tax_MM,
                     "co2_cost_MM": _co2_cost_MM,
+                    "payback_yrs": _payback_yrs,
                     "resources_mmboe": resources_mmboe,
                     "co2_total_Mt": co2_total_Mt,
                     "npv_p90": npv_p90,
                     "npv_p10": npv_p10,
                     "npv_mc_mean": npv_mc_mean,
+                    "mc_draws": _mc_draws,
+                    "profile": _profile,
                     "picks": [(dim_name, label)],
                     "ok": res.get("ok", False),
                     "error": res.get("error"),
@@ -15596,13 +15683,143 @@ def concept_selector_section(default_start_date):
         except Exception:
             pass
         st.dataframe(df_res, use_container_width=True, hide_index=True)
-        # ---- Downloads: CSV (flat) + nested YAML (full audit trail) ----
-        dl1, dl2 = st.columns(2)
+        # ---- Downloads: CSV (flat) + nested YAML + full Excel workbook ----
+        dl1, dl2, dl3, dl4 = st.columns(4)
         csv = df_res.to_csv(index=False).encode("utf-8")
         dl1.download_button(
             "📥 Download results (CSV)", data=csv,
             file_name="concept_batch_results.csv", mime="text/csv",
             use_container_width=True)
+
+        # ---- Comprehensive multi-sheet Excel workbook ----
+        # One workbook holding EVERYTHING for an offline, like-for-like
+        # comparison across all swept cases: a KPI summary, full monthly
+        # production + cost/cashflow profiles per case, a cost-breakdown
+        # sheet, and (if Monte-Carlo was run) the per-draw NPV distribution
+        # with percentiles.
+        try:
+            import io as _io
+            from openpyxl import Workbook as _WB
+            from openpyxl.styles import Font as _Font, PatternFill as _Fill
+            _res_sorted = sorted(
+                results.values(),
+                key=lambda x: (x.get("npv_MM")
+                               if x.get("npv_MM") is not None else -9e18),
+                reverse=True)
+            wb = _WB()
+            # ---- Sheet 1: KPI summary ----
+            ws = wb.active; ws.title = "Summary"
+            _hdr = ["Dimension", "Option", "Ran against",
+                    "NPV after-tax ($MM)", "NPV pre-tax ($MM)", "IRR",
+                    "Resources (MMboe)", "CAPEX total ($MM)",
+                    "  Wells ($MM)", "  Facilities ($MM)",
+                    "  Abandonment ($MM)", "Revenue ($MM)", "OPEX ($MM)",
+                    "Tax ($MM)", "CO2 cost ($MM)", "BE oil ($/bbl)",
+                    "Final RF", "CO2 (Mt)", "Payback (yrs)",
+                    "NPV P90 ($MM)", "NPV Mean ($MM)", "NPV P10 ($MM)",
+                    "Status"]
+            ws.append(_hdr)
+            for _c in ws[1]:
+                _c.font = _Font(bold=True, color="FFFFFF")
+                _c.fill = _Fill("solid", start_color="1F4E78")
+            for r in _res_sorted:
+                _picks = dict(r.get("picks", []))
+                _dn = r.get("dim", ""); _lbl = r.get("label", "")
+                ws.append([
+                    _dn, _lbl, r.get("source", ""),
+                    r.get("npv_MM"), r.get("npv_pretax_MM"), r.get("irr"),
+                    r.get("resources_mmboe"), r.get("capex_total_MM"),
+                    r.get("capex_well_MM"), r.get("capex_facility_MM"),
+                    r.get("capex_abandonment_MM"), r.get("revenue_MM"),
+                    r.get("opex_MM"), r.get("tax_MM"), r.get("co2_cost_MM"),
+                    r.get("breakeven_oil"), r.get("final_rf"),
+                    r.get("co2_total_Mt"), r.get("payback_yrs"),
+                    r.get("npv_p90"), r.get("npv_mc_mean"), r.get("npv_p10"),
+                    "OK" if r.get("ok") else "ERROR",
+                ])
+            for _col in ws.columns:
+                _w = max((len(str(c.value)) if c.value is not None else 0)
+                         for c in _col)
+                ws.column_dimensions[_col[0].column_letter].width = min(
+                    max(_w + 2, 10), 40)
+
+            # ---- Per-case profile sheets ----
+            def _safe_sheet(nm, used):
+                s = "".join(ch for ch in str(nm)
+                            if ch not in "[]:*?/\\")[:28] or "case"
+                base = s; i = 2
+                while s in used:
+                    s = f"{base[:25]}_{i}"; i += 1
+                used.add(s); return s
+            _used = {"Summary"}
+            _have_profiles = False
+            for r in _res_sorted:
+                prof = r.get("profile")
+                if not prof or not prof.get("columns"):
+                    continue
+                _have_profiles = True
+                snm = _safe_sheet((r.get("label") or r.get("name") or "case"),
+                                  _used)
+                wsp = wb.create_sheet(snm)
+                cols = prof["columns"]
+                colnames = list(cols.keys())
+                idx = prof.get("index")
+                header = (["month"] if idx else []) + colnames
+                wsp.append(header)
+                for _c in wsp[1]:
+                    _c.font = _Font(bold=True)
+                n = len(next(iter(cols.values()))) if cols else 0
+                for i in range(n):
+                    row = ([idx[i]] if idx else []) + [
+                        cols[cn][i] for cn in colnames]
+                    wsp.append(row)
+
+            # ---- Monte-Carlo distribution sheet ----
+            _mc_any = any(r.get("mc_draws") for r in _res_sorted)
+            if _mc_any:
+                wsm = wb.create_sheet("MonteCarlo")
+                # one column of draws per case + a percentile summary block
+                labels = [r.get("label", f"case{i}")
+                          for i, r in enumerate(_res_sorted)
+                          if r.get("mc_draws")]
+                draws = [r.get("mc_draws") for r in _res_sorted
+                         if r.get("mc_draws")]
+                wsm.append(["Draw #"] + labels)
+                for _c in wsm[1]:
+                    _c.font = _Font(bold=True)
+                _maxn = max((len(d) for d in draws), default=0)
+                for i in range(_maxn):
+                    wsm.append([i + 1] + [
+                        (d[i] if i < len(d) else None) for d in draws])
+                # percentile summary
+                wsm.append([])
+                import numpy as _np2
+                wsm.append(["P90 (downside)"] + [
+                    float(_np2.percentile(d, 10)) for d in draws])
+                wsm.append(["Mean"] + [float(_np2.mean(d)) for d in draws])
+                wsm.append(["P10 (upside)"] + [
+                    float(_np2.percentile(d, 90)) for d in draws])
+                for _c in (wsm[wsm.max_row], wsm[wsm.max_row - 1],
+                           wsm[wsm.max_row - 2]):
+                    for _cc in _c:
+                        _cc.font = _Font(bold=True)
+
+            _buf = _io.BytesIO()
+            wb.save(_buf)
+            dl2.download_button(
+                "📊 Download full workbook (Excel)",
+                data=_buf.getvalue(),
+                file_name="concept_batch_full.xlsx",
+                mime=("application/vnd.openxmlformats-officedocument."
+                      "spreadsheetml.sheet"),
+                use_container_width=True,
+                help="Everything for offline comparison: KPI summary, full "
+                     "monthly production + cost/cashflow profiles per case"
+                     + (", and the Monte-Carlo NPV distribution"
+                        if _mc_any else "")
+                     + ". One sheet per case.")
+        except Exception as _xe:
+            dl2.caption(f"Excel export unavailable: {_xe}")
 
         # Build a nested, human-readable YAML capturing the WHOLE study:
         # the matrix definition (dimensions + options + their patches),
@@ -15655,18 +15872,47 @@ def concept_selector_section(default_start_date):
                             "name": r.get("name"),
                             "picks": {dn: lbl
                                        for dn, lbl in r.get("picks", [])},
+                            "ran_against": r.get("source"),
                             "kpis": {
                                 "npv_after_tax_MM": r.get("npv_MM"),
                                 "npv_pre_tax_MM": r.get("npv_pretax_MM"),
+                                "fiscal_take_MM": (
+                                    (r.get("npv_pretax_MM") - r.get("npv_MM"))
+                                    if (r.get("npv_pretax_MM") is not None
+                                        and r.get("npv_MM") is not None)
+                                    else None),
                                 "irr": r.get("irr"),
                                 "final_rf": r.get("final_rf"),
+                                "payback_yrs": r.get("payback_yrs"),
                                 "resources_mmboe": r.get("resources_mmboe"),
                                 "breakeven_oil_usd_bbl": r.get(
                                     "breakeven_oil"),
-                                "capex_total_MM": r.get("capex_total_MM"),
-                                "capex_disc_MM": r.get("capex_disc_MM"),
                                 "co2_total_Mt": r.get("co2_total_Mt"),
                             },
+                            "cost_summary_MM": {
+                                "capex_total": r.get("capex_total_MM"),
+                                "capex_disc": r.get("capex_disc_MM"),
+                                "capex_wells": r.get("capex_well_MM"),
+                                "capex_facilities": r.get(
+                                    "capex_facility_MM"),
+                                "capex_abandonment": r.get(
+                                    "capex_abandonment_MM"),
+                                "revenue": r.get("revenue_MM"),
+                                "opex": r.get("opex_MM"),
+                                "tax": r.get("tax_MM"),
+                                "co2_cost": r.get("co2_cost_MM"),
+                            },
+                            "uncertainty": ({
+                                "npv_p90_MM": r.get("npv_p90"),
+                                "npv_mean_MM": r.get("npv_mc_mean"),
+                                "npv_p10_MM": r.get("npv_p10"),
+                                "mc_draws_MM": r.get("mc_draws"),
+                            } if (r.get("npv_p90") is not None
+                                  or r.get("mc_draws")) else None),
+                            # Full monthly time-series — production +
+                            # cost/cashflow profiles, the same data the Excel
+                            # workbook holds, so JSON consumers get parity.
+                            "monthly_profile": r.get("profile"),
                             "ok": r.get("ok", False),
                             "error": r.get("error"),
                         }
@@ -15682,7 +15928,7 @@ def concept_selector_section(default_start_date):
             yaml_bytes = _yaml.safe_dump(
                 export_doc, sort_keys=False, allow_unicode=True,
                 default_flow_style=False).encode("utf-8")
-            dl2.download_button(
+            dl3.download_button(
                 "🧾 Download study (nested YAML)", data=yaml_bytes,
                 file_name="concept_study.yaml",
                 mime="application/x-yaml",
@@ -15690,9 +15936,30 @@ def concept_selector_section(default_start_date):
                 help="Full audit trail — the concept matrix (every "
                      "dimension, option and its patch), which options "
                      "were swept, the base-case source, a UTC "
-                     "timestamp, and every combination's picks + KPIs. "
-                     "Re-loadable as a base case and ideal for version "
-                     "tracking in git.")
+                     "timestamp, and every combination's picks + KPIs, "
+                     "cost summary, uncertainty and full monthly "
+                     "profiles. Re-loadable as a base case and ideal for "
+                     "version tracking in git.")
+            # Same complete payload as JSON — identical content to the
+            # nested YAML and the Excel workbook (production + cost
+            # profiles, cost summary, Monte-Carlo), for API/programmatic
+            # consumers.
+            try:
+                import json as _json
+                json_bytes = _json.dumps(
+                    export_doc, indent=2, default=str).encode("utf-8")
+                dl4.download_button(
+                    "🗂 Download study (JSON)", data=json_bytes,
+                    file_name="concept_study.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    help="Identical content to the nested YAML and the "
+                         "Excel workbook — full KPIs, cost summary, "
+                         "uncertainty (Monte-Carlo draws) and complete "
+                         "monthly production + cost/cashflow profiles for "
+                         "every case.")
+            except Exception as _je:
+                dl4.caption(f"JSON export unavailable: {_je}")
         except Exception as _e:
             dl2.info(f"YAML export unavailable: {_e}")
         # Errors expander
