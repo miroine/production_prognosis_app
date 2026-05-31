@@ -9760,12 +9760,11 @@ def main():
         _rm = (1.0 + econ_r.discount_rate) ** (1/12.0) - 1.0
         _disc = (1.0 + _rm) ** np.arange(len(_cf_at))
         _npv_pretax = float(((_cf_at + _tax) / _disc).sum()) / 1e6
-        # Total undiscounted CAPEX
-        _capex = 0.0
-        for _c in ("capex_well", "capex_facility", "abandonment"):
-            if _c in df_e.columns:
-                _capex += float(df_e[_c].sum())
-        _capex /= 1e6
+        # Total undiscounted CAPEX + component breakdown
+        _capex_well = float(df_e["capex_well"].sum())/1e6 if "capex_well" in df_e.columns else 0.0
+        _capex_fac = float(df_e["capex_facility"].sum())/1e6 if "capex_facility" in df_e.columns else 0.0
+        _capex_aban = float(df_e["abandonment"].sum())/1e6 if "abandonment" in df_e.columns else 0.0
+        _capex = _capex_well + _capex_fac + _capex_aban
         # Resources (MMboe): oil/condensate + gas/6 + NGL (bbl→boe 1:1)
         _cum_oil = float(df["cum_oil"].iloc[-1]) if "cum_oil" in df.columns else 0.0
         _cum_gas = float(df["cum_gas"].iloc[-1]) if "cum_gas" in df.columns else 0.0
@@ -9783,8 +9782,9 @@ def main():
             "Metric": [
                 "NPV after-tax", "NPV pre-tax", "Fiscal take (NPV)",
                 "IRR", "Payback", "Breakeven oil",
-                "Total CAPEX (undisc.)", "Recoverable resources",
-                "Final recovery factor",
+                "Total CAPEX (undisc.)",
+                "  ↳ Wells", "  ↳ Facilities", "  ↳ Abandonment",
+                "Recoverable resources", "Final recovery factor",
             ],
             "Value": [
                 f"${_npv_at:,.0f} MM",
@@ -9794,6 +9794,9 @@ def main():
                 _pb_s,
                 _be_s,
                 f"${_capex:,.0f} MM",
+                f"${_capex_well:,.0f} MM",
+                f"${_capex_fac:,.0f} MM",
+                f"${_capex_aban:,.0f} MM",
                 f"{_boe:,.1f} MMboe",
                 f"{final_rf:.1%}",
             ],
@@ -11456,6 +11459,21 @@ def run_payload_case(payload: dict, default_start_date,
             except Exception:
                 pass
 
+        # CAPEX breakdown so the user can see exactly where the total
+        # comes from (wells / facilities / abandonment) and reconcile it
+        # against Field prognosis without guesswork.
+        capex_well_MM = capex_fac_MM = capex_aban_MM = None
+        try:
+            if df_e_s is not None:
+                if "capex_well" in df_e_s.columns:
+                    capex_well_MM = float(df_e_s["capex_well"].sum()) / 1e6
+                if "capex_facility" in df_e_s.columns:
+                    capex_fac_MM = float(df_e_s["capex_facility"].sum()) / 1e6
+                if "abandonment" in df_e_s.columns:
+                    capex_aban_MM = float(df_e_s["abandonment"].sum()) / 1e6
+        except Exception:
+            pass
+
         res["kpis"] = {
             "npv_MM": npv_MM, "cum_oil_MMstb": cum_oil,
             "cum_gas_Bscf": cum_gas, "final_rf": final_rf,
@@ -11463,6 +11481,9 @@ def run_payload_case(payload: dict, default_start_date,
             "breakeven_oil": be_oil,
             "capex_disc_MM": capex_disc_MM,
             "capex_total_MM": capex_total_MM,
+            "capex_well_MM": capex_well_MM,
+            "capex_facility_MM": capex_fac_MM,
+            "capex_abandonment_MM": capex_aban_MM,
             "co2_total_Mt": co2_total_Mt,
             "irr": irr,
             "npv_pretax_MM": npv_pretax_MM,
