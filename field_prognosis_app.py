@@ -11463,6 +11463,8 @@ def run_payload_case(payload: dict, default_start_date,
         # comes from (wells / facilities / abandonment) and reconcile it
         # against Field prognosis without guesswork.
         capex_well_MM = capex_fac_MM = capex_aban_MM = None
+        revenue_MM = opex_MM = tax_MM = co2_cost_MM = None
+        revenue_oil_MM = revenue_gas_MM = revenue_ngl_MM = None
         try:
             if df_e_s is not None:
                 if "capex_well" in df_e_s.columns:
@@ -11471,6 +11473,19 @@ def run_payload_case(payload: dict, default_start_date,
                     capex_fac_MM = float(df_e_s["capex_facility"].sum()) / 1e6
                 if "abandonment" in df_e_s.columns:
                     capex_aban_MM = float(df_e_s["abandonment"].sum()) / 1e6
+                # Lifetime totals (undiscounted) for revenue/opex/tax so the
+                # batch table can be reconciled line-by-line with Field
+                # prognosis.
+                def _sum(col):
+                    return (float(df_e_s[col].sum()) / 1e6
+                            if col in df_e_s.columns else None)
+                revenue_MM = _sum("revenue")
+                revenue_oil_MM = _sum("revenue_oil")
+                revenue_gas_MM = _sum("revenue_gas")
+                revenue_ngl_MM = _sum("revenue_ngl")
+                opex_MM = _sum("opex")
+                tax_MM = _sum("tax")
+                co2_cost_MM = _sum("co2_cost")
         except Exception:
             pass
 
@@ -11484,6 +11499,13 @@ def run_payload_case(payload: dict, default_start_date,
             "capex_well_MM": capex_well_MM,
             "capex_facility_MM": capex_fac_MM,
             "capex_abandonment_MM": capex_aban_MM,
+            "revenue_MM": revenue_MM,
+            "revenue_oil_MM": revenue_oil_MM,
+            "revenue_gas_MM": revenue_gas_MM,
+            "revenue_ngl_MM": revenue_ngl_MM,
+            "opex_MM": opex_MM,
+            "tax_MM": tax_MM,
+            "co2_cost_MM": co2_cost_MM,
             "co2_total_Mt": co2_total_Mt,
             "irr": irr,
             "npv_pretax_MM": npv_pretax_MM,
@@ -11649,9 +11671,15 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
             except Exception:
                 continue
 
-    # Injectors
+    # Injectors — but ONLY when the field is in an injection strategy.
+    # The live app passes an empty injectors frame downstream under
+    # "Depletion", so injector wells (and their drilling CAPEX) are not
+    # built. The batch path must do the same, otherwise a Depletion case
+    # with injectors listed in the YAML over-counts well CAPEX vs Field
+    # prognosis (the live-vs-batch well-cost mismatch).
+    _strategy = str(payload.get("scalar", {}).get("strategy", "Depletion"))
     idata = tables.get("injectors_df", {})
-    if idata:
+    if idata and _strategy == "Injection":
         n = len(idata.get("name", []))
         for i in range(n):
             try:
@@ -15383,10 +15411,19 @@ def concept_selector_section(default_start_date):
                     npv_pretax_MM = kpis.get("npv_pretax_MM")
                     capex_total_MM = kpis.get("capex_total_MM")
                     resources_mmboe = kpis.get("resources_mmboe")
+                    _capex_well_MM = kpis.get("capex_well_MM")
+                    _capex_fac_MM = kpis.get("capex_facility_MM")
+                    _capex_aban_MM = kpis.get("capex_abandonment_MM")
+                    _revenue_MM = kpis.get("revenue_MM")
+                    _opex_MM = kpis.get("opex_MM")
+                    _tax_MM = kpis.get("tax_MM")
+                    _co2_cost_MM = kpis.get("co2_cost_MM")
                 else:
                     npv_MM = cum_primary = rf = irr = breakeven = None
                     capex_disc_MM = co2_total_Mt = None
                     npv_pretax_MM = capex_total_MM = resources_mmboe = None
+                    _capex_well_MM = _capex_fac_MM = _capex_aban_MM = None
+                    _revenue_MM = _opex_MM = _tax_MM = _co2_cost_MM = None
                 # ---- Optional Monte-Carlo pass for this case ----
                 npv_p90 = npv_p10 = npv_mc_mean = None
                 if mc_iters > 0 and res.get("ok"):
@@ -15449,6 +15486,13 @@ def concept_selector_section(default_start_date):
                     "breakeven_oil": breakeven,
                     "capex_disc_MM": capex_disc_MM,
                     "capex_total_MM": capex_total_MM,
+                    "capex_well_MM": _capex_well_MM,
+                    "capex_facility_MM": _capex_fac_MM,
+                    "capex_abandonment_MM": _capex_aban_MM,
+                    "revenue_MM": _revenue_MM,
+                    "opex_MM": _opex_MM,
+                    "tax_MM": _tax_MM,
+                    "co2_cost_MM": _co2_cost_MM,
                     "resources_mmboe": resources_mmboe,
                     "co2_total_Mt": co2_total_Mt,
                     "npv_p90": npv_p90,
@@ -15510,6 +15554,29 @@ def concept_selector_section(default_start_date):
             row["CAPEX ($MM)"] = (
                 f"{r['capex_total_MM']:,.0f}"
                 if r.get("capex_total_MM") is not None else "—")
+            # CAPEX component breakdown + full economics, so the batch
+            # table reconciles line-by-line with Field prognosis.
+            row["  ↳ Wells ($MM)"] = (
+                f"{r['capex_well_MM']:,.0f}"
+                if r.get("capex_well_MM") is not None else "—")
+            row["  ↳ Facilities ($MM)"] = (
+                f"{r['capex_facility_MM']:,.0f}"
+                if r.get("capex_facility_MM") is not None else "—")
+            row["  ↳ Abandonment ($MM)"] = (
+                f"{r['capex_abandonment_MM']:,.0f}"
+                if r.get("capex_abandonment_MM") is not None else "—")
+            row["Revenue ($MM)"] = (
+                f"{r['revenue_MM']:,.0f}"
+                if r.get("revenue_MM") is not None else "—")
+            row["OPEX ($MM)"] = (
+                f"{r['opex_MM']:,.0f}"
+                if r.get("opex_MM") is not None else "—")
+            row["Tax ($MM)"] = (
+                f"{r['tax_MM']:,.0f}"
+                if r.get("tax_MM") is not None else "—")
+            row["CO₂ cost ($MM)"] = (
+                f"{r['co2_cost_MM']:,.0f}"
+                if r.get("co2_cost_MM") is not None else "—")
             row["BE oil ($/bbl)"] = (f"{r['breakeven_oil']:.1f}"
                                       if r.get("breakeven_oil") is not None
                                       else "—")
