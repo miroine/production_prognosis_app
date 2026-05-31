@@ -2822,6 +2822,24 @@ def _rows_to_dict_of_lists(rows: list[dict]) -> dict:
     return {c: [r.get(c) for r in rows] for c in cols}
 
 
+def is_abandonment_label(label: str) -> bool:
+    """True if a facility-CAPEX line item is really an abandonment / P&A /
+    cessation / restoration cost.
+
+    Such a row, if left in the facility schedule, would be double-counted
+    against the dedicated abandonment cost (aban_cost) which the engine
+    books separately at cessation. Both the live app and the batch runner
+    use this to strip abandonment rows out of facility CAPEX so the two
+    stay consistent and abandonment is counted exactly once.
+    """
+    if not label:
+        return False
+    s = str(label).lower()
+    keywords = ("cessation", "p&a", "p & a", "abandon", "restoration",
+                "decommission", "plug and aband", "plug & aband")
+    return any(k in s for k in keywords)
+
+
 def normalize_payload_tables(payload: dict) -> dict:
     """Ensure every table in a payload is in the canonical column-oriented
     dict-of-lists form that run_payload_case expects.

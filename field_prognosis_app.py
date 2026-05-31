@@ -8171,6 +8171,11 @@ def economics_section(units, start_date):
     _cont_mult = 1.0 + float(
         st.session_state.get("capex_contingency_pct", 25)) / 100.0
     fac_df_with_cont = fac_df.copy()
+    # Strip abandonment/cessation/P&A rows — booked separately via aban_cost,
+    # so keeping them in facilities would double-count cessation.
+    if "label" in fac_df_with_cont.columns:
+        _mask = ~fac_df_with_cont["label"].apply(fh.is_abandonment_label)
+        fac_df_with_cont = fac_df_with_cont[_mask].reset_index(drop=True)
     if "amount_MMUSD" in fac_df_with_cont.columns:
         fac_df_with_cont["amount_MMUSD"] = (
             fac_df_with_cont["amount_MMUSD"].astype(float) * _cont_mult)
@@ -11711,6 +11716,13 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                 })
             except Exception:
                 continue
+    if not fac_rows:
+        fac_rows = [{"date": pd.Timestamp(start_date), "amount_MMUSD": 0.0, "label": ""}]
+    # Drop any abandonment/cessation/P&A rows from the facility schedule —
+    # the engine books abandonment separately from aban_cost, so leaving
+    # them here would double-count cessation. (Matches the live app.)
+    fac_rows = [r for r in fac_rows
+                if not fh.is_abandonment_label(r.get("label", ""))]
     if not fac_rows:
         fac_rows = [{"date": pd.Timestamp(start_date), "amount_MMUSD": 0.0, "label": ""}]
     # Apply the CAPEX contingency multiplier exactly as the main app does
