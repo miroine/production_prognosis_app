@@ -7667,11 +7667,36 @@ def economics_section(units, start_date):
 
             if st.button("⚙️ Generate CAPEX schedule from this concept",
                           key="dc_generate", type="primary"):
-                st.session_state.fac_df = pd.DataFrame(concept["capex_rows"])
+                _rows = concept["capex_rows"]
+                # Phase the facility CAPEX against a realistic project
+                # schedule (long-lead → fabrication → installation → hook-up
+                # → first oil) so spend lands BEFORE first oil on the phase
+                # that incurs it — not all dumped at first oil. We anchor the
+                # schedule so that first oil = the field's production start.
+                try:
+                    _durs = fh.default_schedule_durations(dc_spec)
+                    _total_mo = sum(_durs.values())
+                    _fo = pd.Timestamp(dc_spec.get("start_date")
+                                       or st.session_state.get("start_date"))
+                    # Back-calculate the FEED start so that first oil ≈ the
+                    # production start date.
+                    _feed_start = (_fo - pd.Timedelta(
+                        days=int(_total_mo * 30.4375))).date()
+                    _sched = fh.build_project_schedule(
+                        dc_spec, _feed_start, _durs)
+                    _rows = fh.phase_capex_against_schedule(_rows, _sched)
+                    _phased = True
+                except Exception:
+                    _phased = False
+                st.session_state.fac_df = pd.DataFrame(_rows)
                 mark_stale()
-                st.success(f"Generated {len(concept['capex_rows'])} CAPEX "
-                           f"line(s) from the '{concept_type}' concept. "
-                           "Edit the table below to fine-tune.")
+                _msg = (f"Generated {len(_rows)} CAPEX line(s) from the "
+                        f"'{concept_type}' concept.")
+                if _phased:
+                    _msg += (" Spend is phased across the project schedule "
+                             "(long-lead → fabrication → installation → "
+                             "hook-up), all before first oil.")
+                st.success(_msg + " Edit the table below to fine-tune.")
                 st.rerun()
 
             # ---- Concept-decision sensitivity ----

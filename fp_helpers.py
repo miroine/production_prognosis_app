@@ -5980,6 +5980,128 @@ def build_project_schedule(spec: dict, feed_start, durations: dict,
     }
 
 
+def phase_capex_against_schedule(capex_rows: list, sched: dict) -> list:
+    """Re-date facility CAPEX rows so they fall on the realistic project
+    phase that incurs them, instead of all landing at first oil.
+
+    Maps each cost line (by its label) to a schedule phase and assigns a
+    representative spend date *within* that phase:
+
+      - Long-lead    : templates, manifolds, trees, HIPPS, MPFM, SCM,
+                        risers, pipe/umbilical procurement, boosting,
+                        gas-lift kit, hydrate package, long-lead milestones
+      - Fabrication   : topside-weight modifications, fabrication milestones
+      - Installation  : flowline lay, umbilical lay, riser-bases, jumpers,
+                        SSIV, architecture (PLEM/manifold install), tie-in
+                        spool, export line, install/pipelay scopes
+      - Hookup & comm.: manpower, hook-up, commissioning, heating
+                        commissioning
+      - Cessation/P&A : left at its own (end-of-life) date, untouched
+
+    Costs are placed at a sensible point in the phase (procurement early in
+    long-lead; installation spends spread across the offshore campaign),
+    always BEFORE first oil — which is the end of hook-up.
+
+    If `sched` is missing/empty the rows are returned unchanged.
+    """
+    if not sched or not sched.get("phases"):
+        return capex_rows
+    import pandas as _pd
+
+    # Build {phase_name: (start, end)} from the schedule.
+    ph = {p["phase"]: (_pd.Timestamp(p["start"]), _pd.Timestamp(p["end"]))
+          for p in sched["phases"]}
+
+    def _at(phase_name, frac):
+        """A date `frac` of the way through the named phase."""
+        if phase_name not in ph:
+            return None
+        s, e = ph[phase_name]
+        return s + (e - s) * float(frac)
+
+    # Keyword → (phase, fraction-through-phase). First match wins; order
+    # matters (more specific keywords first).
+    rules = [
+        # Hook-up & commissioning
+        ("manpower",            ("Hookup & comm.", 0.5)),
+        ("hook-up",             ("Hookup & comm.", 0.4)),
+        ("hookup",              ("Hookup & comm.", 0.4)),
+        ("commission",          ("Hookup & comm.", 0.7)),
+        ("heating commission",  ("Hookup & comm.", 0.6)),
+        # Installation / offshore campaign
+        ("install",             ("Installation", 0.5)),
+        ("pipelay",             ("Installation", 0.4)),
+        ("flowline",            ("Installation", 0.45)),
+        ("infield flowline",    ("Installation", 0.45)),
+        ("insulation",          ("Installation", 0.45)),
+        ("umbilical",           ("Installation", 0.5)),
+        ("riser base",          ("Installation", 0.35)),
+        ("frb",                 ("Installation", 0.35)),
+        ("jumper",              ("Installation", 0.6)),
+        ("ssiv",                ("Installation", 0.4)),
+        ("isolation valve",     ("Installation", 0.4)),
+        ("tie-in",              ("Installation", 0.7)),
+        ("spool",               ("Installation", 0.7)),
+        ("plem",                ("Installation", 0.5)),
+        ("inline-tee",          ("Installation", 0.5)),
+        ("manifold (cluster",   ("Installation", 0.4)),
+        ("central production manifold", ("Installation", 0.4)),
+        ("export",              ("Installation", 0.55)),
+        # Fabrication
+        ("topside mod",         ("Fabrication", 0.6)),
+        ("topside weight",      ("Fabrication", 0.6)),
+        ("fabrication",         ("Fabrication", 0.5)),
+        ("modification",        ("Fabrication", 0.6)),
+        # Long-lead procurement (structures, trees, hardware, pipe stock)
+        ("template",            ("Long-lead", 0.4)),
+        ("manifold",            ("Long-lead", 0.4)),
+        ("tree",                ("Long-lead", 0.5)),
+        ("xt",                  ("Long-lead", 0.5)),
+        ("hipps",               ("Long-lead", 0.5)),
+        ("mpfm",                ("Long-lead", 0.5)),
+        ("multiphase",          ("Long-lead", 0.5)),
+        ("scm",                 ("Long-lead", 0.5)),
+        ("control module",      ("Long-lead", 0.5)),
+        ("riser",               ("Long-lead", 0.6)),
+        ("boosting",            ("Long-lead", 0.6)),
+        ("gas lift",            ("Long-lead", 0.6)),
+        ("hydrate",             ("Long-lead", 0.5)),
+        ("meg",                 ("Long-lead", 0.5)),
+        ("host",                ("Long-lead", 0.3)),
+        ("platform",            ("Long-lead", 0.3)),
+        ("topsides",            ("Long-lead", 0.4)),
+    ]
+
+    def _is_cessation(label):
+        return is_abandonment_label(label)
+
+    fo = _pd.Timestamp(sched["first_oil_date"])
+    out = []
+    for r in capex_rows:
+        row = dict(r)
+        label = str(row.get("label", ""))
+        if _is_cessation(label):
+            out.append(row)  # leave end-of-life spend alone
+            continue
+        lab = label.lower()
+        placed = None
+        for kw, (phase, frac) in rules:
+            if kw in lab:
+                placed = _at(phase, frac)
+                break
+        if placed is None:
+            # Fallback: anything unrecognised is procurement-like — put it
+            # mid long-lead, or just before first oil if no long-lead phase.
+            placed = _at("Long-lead", 0.5) or (fo - _pd.Timedelta(days=180))
+        # Never let a facility spend land after first oil (it's pre-production
+        # capital by definition); clamp to ~1 month before first oil.
+        if placed is not None and placed > fo:
+            placed = fo - _pd.Timedelta(days=30)
+        row["date"] = placed.date() if hasattr(placed, "date") else placed
+        out.append(row)
+    return out
+
+
 # =============================================================================
 # Documentation catalogue + live unit-conversion checks
 # =============================================================================
