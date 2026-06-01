@@ -188,6 +188,32 @@ def df_to_display_units(df: "pd.DataFrame", fluid_system: str, units: str) -> "p
     return out
 
 
+def df_to_display_units_values(df: "pd.DataFrame", fluid_system: str,
+                                units: str) -> "pd.DataFrame":
+    """Convert rate/volume/pressure columns from field units to the user's
+    display units WITHOUT renaming the headers — for places that need the
+    converted values but must keep the plain column names (KPIs, profiles,
+    charts). No-op (returns a copy) when units == 'field'.
+    """
+    out = df.copy()
+    if units == "field":
+        return out
+    primary = ("oil_rate"
+               if FLUID_SYSTEMS[fluid_system]["primary"] == "oil"
+               else "gas_rate")
+    secondary = "gas_rate" if primary == "oil_rate" else "oil_rate"
+    col_map = dict(_DF_COLUMN_KINDS)
+    col_map["primary_rate"] = primary
+    col_map["secondary_rate"] = secondary
+    for col, kind in col_map.items():
+        if col in out.columns and kind:
+            try:
+                out[col] = from_field(out[col].astype(float), kind, units)
+            except Exception:
+                pass
+    return out
+
+
 def df_e_to_display_units(df_e: "pd.DataFrame", fluid_system: str,
                             units: str) -> "pd.DataFrame":
     """Same as df_to_display_units but for the economics dataframe.
@@ -2799,6 +2825,7 @@ DEFAULT_MC_DRIVERS: dict = {
     "Decline rate":    {"on": True,  "low": 0.80, "high": 1.30, "dist": "truncnormal", "per_well": True},
     "Variable OPEX":   {"on": True,  "low": 0.80, "high": 1.30, "dist": "triangular"},
     "Well CAPEX":      {"on": True,  "low": 0.85, "high": 1.25, "dist": "triangular"},
+    "Facility CAPEX":  {"on": True,  "low": 0.80, "high": 1.35, "dist": "triangular"},
     "Initial pressure":{"on": False, "low": 0.90, "high": 1.10, "dist": "truncnormal"},
     "Discount rate":   {"on": False, "low": 0.80, "high": 1.20, "dist": "uniform"},
 }
@@ -3011,6 +3038,25 @@ def run_monte_carlo(wells, asm, econ, n_realizations: int,
         if "Gas price" in factors:    econ_r.gas_price *= factors["Gas price"]
         if "Variable OPEX" in factors: econ_r.opex_var *= factors["Variable OPEX"]
         if "Well CAPEX" in factors:   econ_r.capex_per_well *= factors["Well CAPEX"]
+        if "Facility CAPEX" in factors and factors["Facility CAPEX"] != 1.0:
+            # Scale the facility CAPEX schedule (development rows only — leave
+            # cessation/P&A, which is governed by abandonment_cost). This makes
+            # facility CAPEX a first-class uncertainty in the NPV distribution.
+            try:
+                _fac_df = econ_r.facility_capex.df
+                if _fac_df is not None and "amount_MMUSD" in _fac_df.columns:
+                    _f = float(factors["Facility CAPEX"])
+                    if "label" in _fac_df.columns:
+                        _keep = ~_fac_df["label"].apply(
+                            lambda x: fh.is_abandonment_label(
+                                "" if x is None else str(x)))
+                        _fac_df.loc[_keep, "amount_MMUSD"] = (
+                            _fac_df.loc[_keep, "amount_MMUSD"].astype(float) * _f)
+                    else:
+                        _fac_df["amount_MMUSD"] = (
+                            _fac_df["amount_MMUSD"].astype(float) * _f)
+            except Exception:
+                pass
         if "Discount rate" in factors: econ_r.discount_rate *= factors["Discount rate"]
 
         if "OOIP" in factors:         asm_r.ooip_oil *= factors["OOIP"]
@@ -7961,6 +8007,90 @@ def economics_section(units, start_date):
             st.plotly_chart(fh.apply_plot_template(fig_g),
                             use_container_width=True)
 
+            # ---- Yearly CAPEX phasing chart -----------------------------
+            # Show how the facility CAPEX (from the current fac_df) is spread
+            # across calendar years against this schedule, so the user can
+            # see the annual cash-out profile and confirm it precedes first
+            # oil. Uses whatever is currently in fac_df (which the Generate
+            # button phases against the schedule).
+            try:
+                _fac = st.session_state.get("fac_df")
+                if _fac is not None and len(_fac) > 0 and \
+                        "date" in _fac.columns and "amount_MMUSD" in _fac.columns:
+                    _fc = _fac.copy()
+                    _fc["year"] = pd.to_datetime(
+                        _fc["date"], errors="coerce").dt.year
+                    _fc = _fc.dropna(subset=["year"])
+                    _fc["amount_MMUSD"] = pd.to_numeric(
+                        _fc["amount_MMUSD"], errors="coerce").fillna(0.0)
+                    # Split cessation out so it doesn't dwarf the dev CAPEX
+                    _fc["is_cessation"] = _fc["label"].apply(
+                        fh.is_abandonment_label)
+                    dev = (_fc[~_fc["is_cessation"]]
+                           .groupby("year")["amount_MMUSD"].sum())
+                    ces = (_fc[_fc["is_cessation"]]
+                           .groupby("year")["amount_MMUSD"].sum())
+                    if len(dev) > 0 or len(ces) > 0:
+                        all_years = sorted(set(dev.index) | set(ces.index))
+                        fo_year = pd.Timestamp(sched["first_oil_date"]).year
+                        fig_cap = go.Figure()
+                        fig_cap.add_trace(go.Bar(
+                            x=all_years,
+                            y=[float(dev.get(y, 0.0)) for y in all_years],
+                            name="Development CAPEX",
+                            marker_color="#5b8def"))
+                        if ces.sum() > 0:
+                            fig_cap.add_trace(go.Bar(
+                                x=all_years,
+                                y=[float(ces.get(y, 0.0)) for y in all_years],
+                                name="Cessation / P&A",
+                                marker_color="#d65a5a"))
+                        # cumulative line
+                        _cum, _run = [], 0.0
+                        for y in all_years:
+                            _run += float(dev.get(y, 0.0)) + float(ces.get(y, 0.0))
+                            _cum.append(_run)
+                        fig_cap.add_trace(go.Scatter(
+                            x=all_years, y=_cum, name="Cumulative",
+                            mode="lines+markers", yaxis="y2",
+                            line=dict(color="#2ca02c", width=2)))
+                        fh.safe_vline(
+                            fig_cap, fo_year,
+                            label=f"First oil {fo_year}",
+                            color="#2ca02c", width=2, dash="dot",
+                            label_position="top", label_font_size=10,
+                            label_color="#2ca02c")
+                        fig_cap.update_layout(
+                            title="Facility CAPEX phasing by year ($MM)",
+                            barmode="stack", height=340,
+                            xaxis_title="Year",
+                            yaxis_title="Annual CAPEX ($MM)",
+                            yaxis2=dict(title="Cumulative ($MM)",
+                                        overlaying="y", side="right",
+                                        showgrid=False),
+                            margin=dict(t=60, b=40, l=10, r=10),
+                            legend=dict(orientation="h", y=-0.2),
+                            plot_bgcolor="rgba(245,247,250,0.6)")
+                        st.plotly_chart(fh.apply_plot_template(fig_cap),
+                                        use_container_width=True)
+                        st.caption(
+                            "Annual facility CAPEX from the cost schedule "
+                            "below, phased against the project timeline. "
+                            "Development spend should fall in the years "
+                            "before first oil; cessation sits at end of life.")
+                        # Stash for Excel export (yearly CAPEX phasing sheet)
+                        st.session_state["_capex_phasing_by_year"] = {
+                            "years": [int(y) for y in all_years],
+                            "development_MM": [float(dev.get(y, 0.0))
+                                                for y in all_years],
+                            "cessation_MM": [float(ces.get(y, 0.0))
+                                              for y in all_years],
+                            "cumulative_MM": _cum,
+                            "first_oil_year": int(fo_year),
+                        }
+            except Exception as _ce:
+                st.caption(f"(CAPEX phasing chart unavailable: {_ce})")
+
             # Milestone table
             ms_col, w_col = st.columns([1, 1])
             with ms_col:
@@ -8268,6 +8398,62 @@ def economics_section(units, start_date):
 # =============================================================================
 # Plotting
 # =============================================================================
+def _plot_production_yearly(df, fluid, units):
+    """Annual production profile: per-year average rates (bars) plus annual
+    produced volumes. The reporting view used for reserves/AOP summaries."""
+    f = lambda v, k: from_field(v, k, units)
+    oil_label = ulabel("oil_rate", units)
+    gas_label = ulabel("gas_rate", units)
+    oilv_label = ulabel("oil_vol", units)
+    gasv_label = ulabel("gas_vol", units)
+    C = fh.EQ_COLORS
+    d = df.copy()
+    d["year"] = pd.to_datetime(d["date"]).dt.year
+    # Average rate per year (mean of monthly rates) and annual volume
+    # (rate × days). DAYS_PER_MONTH is the engine month length.
+    agg = {}
+    for col in ("oil_rate", "gas_rate", "water_rate"):
+        if col in d.columns:
+            agg[col] = d.groupby("year")[col].mean()
+    # Annual produced volume from monthly rate × month length, summed by year
+    vol = {}
+    for col, volkind, scale in (("oil_rate", "oil_vol", 1e6),
+                                 ("gas_rate", "gas_vol", 1e9)):
+        if col in d.columns:
+            mvol = d[col].values * DAYS_PER_MONTH
+            tmp = pd.DataFrame({"year": d["year"].values, "v": mvol})
+            vol[volkind] = tmp.groupby("year")["v"].sum() / scale
+    years = sorted(d["year"].unique())
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    if "oil_rate" in agg and agg["oil_rate"].max() > 0:
+        fig.add_trace(go.Bar(
+            x=years, y=[f(agg["oil_rate"].get(y, 0), "oil_rate") for y in years],
+            name=f"Oil avg rate ({oil_label})",
+            marker_color=C["oil"]), secondary_y=False)
+    if "water_rate" in agg and agg["water_rate"].max() > 0:
+        fig.add_trace(go.Bar(
+            x=years, y=[f(agg["water_rate"].get(y, 0), "water_rate") for y in years],
+            name=f"Water avg rate ({oil_label})",
+            marker_color=C["water"]), secondary_y=False)
+    if "gas_rate" in agg and agg["gas_rate"].max() > 0:
+        fig.add_trace(go.Scatter(
+            x=years, y=[f(agg["gas_rate"].get(y, 0), "gas_rate") for y in years],
+            name=f"Gas avg rate ({gas_label})",
+            mode="lines+markers", line=dict(color=C["gas"], width=2.5)),
+            secondary_y=True)
+    fig.update_layout(
+        title="Annual production profile (average rates)",
+        barmode="group", hovermode="x unified", height=460,
+        legend=dict(orientation="h", y=-0.18),
+        xaxis_title="Year")
+    fig.update_yaxes(title_text=f"Oil & water avg rate ({oil_label})",
+                     secondary_y=False, showgrid=True)
+    fig.update_yaxes(title_text=f"Gas avg rate ({gas_label})",
+                     secondary_y=True, showgrid=False)
+    return fh.apply_plot_template(fig)
+
+
 def plot_production(df, fluid, units):
     """Phase-explicit production rates: oil, gas, water on dual axes."""
     f = lambda v, k: from_field(v, k, units)
@@ -9863,7 +10049,25 @@ def main():
     ])
 
     with tabs[0]:
-        st.plotly_chart(plot_production(df, fluid, units), use_container_width=True)
+        _prof_gran = st.radio(
+            "Profile granularity", ["Monthly", "Yearly"],
+            horizontal=True, key="prod_profile_gran",
+            help="Monthly shows the full-resolution forecast. Yearly "
+                 "aggregates to calendar-year averages (rates) and "
+                 "end-of-year cumulatives — the view used in annual "
+                 "reserves/production reporting.")
+        if _prof_gran == "Yearly":
+            try:
+                st.plotly_chart(
+                    _plot_production_yearly(df, fluid, units),
+                    use_container_width=True)
+            except Exception as _ye:
+                st.warning(f"Yearly view unavailable: {_ye}")
+                st.plotly_chart(plot_production(df, fluid, units),
+                                use_container_width=True)
+        else:
+            st.plotly_chart(plot_production(df, fluid, units),
+                            use_container_width=True)
         choke_fig = go.Figure()
         choke_fig.add_trace(go.Scatter(x=df["date"], y=df["choke_factor"],
                                         line=dict(color="#7f7f7f")))
@@ -10331,6 +10535,49 @@ def main():
                     fac_df_export = econ_r.facility_capex.df
                     if fac_df_export is not None and len(fac_df_export) > 0:
                         _safe_to_excel(fac_df_export, "Facility CAPEX", wr)
+                    # ---- Plot-backing data sheets (so every chart in the app
+                    # can be rebuilt in Excel) ------------------------------
+                    # Yearly production aggregation (the data behind the
+                    # annual production-profile chart).
+                    try:
+                        _dy = df.copy()
+                        _dy["year"] = pd.to_datetime(_dy["date"]).dt.year
+                        _rows_y = []
+                        for _yr, _g in _dy.groupby("year"):
+                            _row = {"year": int(_yr)}
+                            for _c, _k in (("oil_rate", "oil_rate"),
+                                           ("gas_rate", "gas_rate"),
+                                           ("water_rate", "water_rate")):
+                                if _c in _g.columns:
+                                    _row[f"avg_{_c}"] = from_field(
+                                        float(_g[_c].mean()), _k, units)
+                            if "oil_rate" in _g.columns:
+                                _row["annual_oil_vol"] = from_field(
+                                    float((_g["oil_rate"] * DAYS_PER_MONTH).sum())
+                                    / 1e6, "oil_vol", units)
+                            if "gas_rate" in _g.columns:
+                                _row["annual_gas_vol"] = from_field(
+                                    float((_g["gas_rate"] * DAYS_PER_MONTH).sum())
+                                    / 1e9, "gas_vol", units)
+                            _rows_y.append(_row)
+                        if _rows_y:
+                            _safe_to_excel(pd.DataFrame(_rows_y),
+                                           "Production (yearly)", wr)
+                    except Exception:
+                        pass
+                    # CAPEX phasing by year (data behind the phasing chart),
+                    # stashed by the schedule section when it rendered.
+                    try:
+                        _cp = st.session_state.get("_capex_phasing_by_year")
+                        if _cp and _cp.get("years"):
+                            _safe_to_excel(pd.DataFrame({
+                                "year": _cp["years"],
+                                "development_CAPEX_MM": _cp["development_MM"],
+                                "cessation_CAPEX_MM": _cp["cessation_MM"],
+                                "cumulative_CAPEX_MM": _cp["cumulative_MM"],
+                            }), "CAPEX phasing", wr)
+                    except Exception:
+                        pass
                 buf.seek(0)
                 xlsx_ready = True
             except Exception as exc:
@@ -11427,14 +11674,36 @@ def run_payload_case(payload: dict, default_start_date,
         df_s, _, _ = run_simulation(wells_s, asm_s)
         df_e_s = compute_economics(df_s, is_oil_s, econ_s, wells_s)
 
-        # KPIs
+        # The engine works in field units internally. Convert the production
+        # rates/volumes to the CASE's display units so the batch reports and
+        # profiles match the chosen unit system (metric → Sm³/d, kSm³/d, etc.)
+        # instead of silently showing field units. Money columns are USD and
+        # pass through unchanged. We keep df_s for any field-unit needs and
+        # build a display-unit view for KPIs + exported profiles.
+        try:
+            df_disp = df_to_display_units_values(df_s, case_fluid, case_units)
+        except Exception:
+            df_disp = df_s
+        # Primary/secondary rate unit labels for this case (for the export).
+        _primary_kind = ("oil_rate"
+                         if FLUID_SYSTEMS[case_fluid]["primary"] == "oil"
+                         else "gas_rate")
+        _rate_unit = ulabel(_primary_kind, case_units)
+        _oilvol_unit = ulabel("oil_vol", case_units)
+        _gasvol_unit = ulabel("gas_vol", case_units)
         npv_MM = float(df_e_s["npv"].iloc[-1]) / 1e6 if "npv" in df_e_s.columns else 0.0
+        # cum_oil / cum_gas stay in FIELD volume units (MMstb / Bscf) — the
+        # resources/BOE math below depends on that. Display-unit cumulatives
+        # for reporting are provided separately as cum_oil_disp / cum_gas_disp.
         cum_oil = float(df_s["cum_oil"].iloc[-1]) if "cum_oil" in df_s.columns else 0.0
         cum_gas = float(df_s["cum_gas"].iloc[-1]) if "cum_gas" in df_s.columns else 0.0
+        cum_oil_disp = float(df_disp["cum_oil"].iloc[-1]) if "cum_oil" in df_disp.columns else cum_oil
+        cum_gas_disp = float(df_disp["cum_gas"].iloc[-1]) if "cum_gas" in df_disp.columns else cum_gas
         final_rf = float(df_s["recovery_factor"].iloc[-1]) \
             if "recovery_factor" in df_s.columns else 0.0
-        peak_rate = float(df_s["primary_rate"].max()) \
-            if "primary_rate" in df_s.columns else 0.0
+        # Peak rate in the case's DISPLAY units (Sm³/d etc. for metric).
+        peak_rate = float(df_disp["primary_rate"].max()) \
+            if "primary_rate" in df_disp.columns else 0.0
         payback_yrs = None
         if "cum_cashflow" in df_e_s.columns:
             cumv = df_e_s["cum_cashflow"].values
@@ -11594,9 +11863,20 @@ def run_payload_case(payload: dict, default_start_date,
             "irr": irr,
             "npv_pretax_MM": npv_pretax_MM,
             "resources_mmboe": resources_mmboe,
+            # Display-unit reporting values + their unit labels, so the batch
+            # table and exports show the case's chosen unit system.
+            "cum_oil_disp": cum_oil_disp,
+            "cum_gas_disp": cum_gas_disp,
+            "peak_rate_unit": _rate_unit,
+            "cum_oil_unit": _oilvol_unit,
+            "cum_gas_unit": _gasvol_unit,
+            "units": case_units,
         }
         res["df"] = df_s
         res["df_e"] = df_e_s
+        res["df_disp"] = df_disp
+        res["units"] = case_units
+        res["fluid"] = case_fluid
         res["ok"] = True
     except Exception as e:
         res["error"] = f"{type(e).__name__}: {e}"
@@ -12217,12 +12497,34 @@ def sensitivity_section(df_base, df_e_base, wells, asm, econ, units, fluid):
             return asm0, econ0, new_wells
         return _m
 
+    def _scale_facility_capex(_unused, factor):
+        def _m(asm0, econ0, wells0):
+            new_econ = deepcopy(econ0)
+            try:
+                _fdf = new_econ.facility_capex.df
+                if _fdf is not None and "amount_MMUSD" in _fdf.columns:
+                    if "label" in _fdf.columns:
+                        _keep = ~_fdf["label"].apply(
+                            lambda x: fh.is_abandonment_label(
+                                "" if x is None else str(x)))
+                        _fdf.loc[_keep, "amount_MMUSD"] = (
+                            _fdf.loc[_keep, "amount_MMUSD"].astype(float)
+                            * factor)
+                    else:
+                        _fdf["amount_MMUSD"] = (
+                            _fdf["amount_MMUSD"].astype(float) * factor)
+            except Exception:
+                pass
+            return asm0, new_econ, wells0
+        return _m
+
     drivers = [
         ("Oil price",       _scale_econ("oil_price", 1.0)),
         ("Gas price",       _scale_econ("gas_price", 1.0)),
         ("Variable OPEX",   _scale_econ("opex_var", 1.0)),
         ("Fixed OPEX",      _scale_econ("opex_fixed", 1.0)),
         ("Well CAPEX",      _scale_econ("capex_per_well", 1.0)),
+        ("Facility CAPEX",  _scale_facility_capex(None, 1.0)),
         ("OOIP",            _scale_inplace("ooip_oil", 1.0)),
         ("OGIP",            _scale_inplace("ogip_gas", 1.0)),
         ("Initial pressure", _scale_pvt("p_init_psi", 1.0)),
@@ -12305,6 +12607,7 @@ def sensitivity_section(df_base, df_e_base, wells, asm, econ, units, fluid):
                 "Variable OPEX":     _scale_econ("opex_var", fac),
                 "Fixed OPEX":        _scale_econ("opex_fixed", fac),
                 "Well CAPEX":        _scale_econ("capex_per_well", fac),
+                "Facility CAPEX":    _scale_facility_capex(None, fac),
                 "OOIP":              _scale_inplace("ooip_oil", fac),
                 "OGIP":              _scale_inplace("ogip_gas", fac),
                 "Initial pressure":  _scale_pvt("p_init_psi", fac),
@@ -15522,7 +15825,8 @@ def concept_selector_section(default_start_date):
                     # compactly as lists keyed by column.
                     _profile = None
                     try:
-                        _dfp = res.get("df"); _dfpe = res.get("df_e")
+                        _dfp = res.get("df_disp") or res.get("df")
+                        _dfpe = res.get("df_e")
                         if _dfp is not None and len(_dfp) > 0:
                             _prof_cols = {}
                             _date_idx = (list(_dfp.index.astype(str))
@@ -15563,6 +15867,16 @@ def concept_selector_section(default_start_date):
                     _ov0 = float(_sc0.get("opex_var_oil",
                                            _sc0.get("opex_var_gas", 5.5)))
                     _cw0 = float(_sc0.get("capex_well", 120.0))
+                    # Base facility CAPEX rows (development only) for scaling.
+                    _fac0 = None
+                    try:
+                        _ft = case_payload.get("tables", {}).get("fac_df")
+                        if _ft and "amount_MMUSD" in _ft:
+                            _fac0 = list(_ft["amount_MMUSD"])
+                            _fac_labels = _ft.get("label",
+                                                   [""] * len(_fac0))
+                    except Exception:
+                        _fac0 = None
                     # Nested progress bar for the Monte-Carlo iterations of
                     # THIS case (the outer bar tracks cases; this one tracks
                     # the per-case MC draws so a long MC run shows life).
@@ -15581,6 +15895,27 @@ def concept_selector_section(default_start_date):
                         _ts["capex_well"] = _cw0 * float(
                             _rng.lognormal(0, 0.20))
                         _trial["scalar"] = _ts
+                        # Facility CAPEX uncertainty — scale development rows
+                        # of fac_df by a lognormal factor (±~20%), leaving
+                        # cessation/P&A untouched.
+                        if _fac0 is not None:
+                            _ffac = float(_rng.lognormal(0, 0.18))
+                            _tbl = dict(case_payload.get("tables", {}))
+                            _newfac = dict(_tbl.get("fac_df", {}))
+                            _scaled = []
+                            for _i, _v in enumerate(_fac0):
+                                _lbl = (_fac_labels[_i]
+                                        if _i < len(_fac_labels) else "")
+                                try:
+                                    _isc = fh.is_abandonment_label(
+                                        "" if _lbl is None else str(_lbl))
+                                except Exception:
+                                    _isc = False
+                                _scaled.append(float(_v) if _isc
+                                               else float(_v) * _ffac)
+                            _newfac["amount_MMUSD"] = _scaled
+                            _tbl["fac_df"] = _newfac
+                            _trial["tables"] = _tbl
                         try:
                             _r = run_payload_case(
                                 _trial, default_start_date,
