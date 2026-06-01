@@ -10662,6 +10662,23 @@ def collect_inputs_payload() -> dict:
         "fractional_flow_enabled", "ff_enabled",
         "ff_swc", "ff_sor", "ff_krw_max", "ff_kro_max",
         "ff_nw", "ff_no", "ff_mu_oil", "ff_mu_water", "ff_sweep",
+        # ---- SURF / facility design-concept inputs (the "dc_*" widgets on
+        # the Facilities & cost screen). These drive the facility CAPEX
+        # schedule (templates, flowlines, risers, umbilicals, export line,
+        # ancillaries, installation method, topside mod, HPHT/HIPPS, MPFM).
+        # Saving them lets a loaded case restore the full SURF configuration
+        # automatically instead of reverting to defaults.
+        "dc_template_type", "dc_template_layout", "dc_use_template_detail",
+        "dc_field_architecture", "dc_hydrate_mgmt", "dc_riser_type",
+        "dc_n_boosting", "dc_flowline_km", "dc_flowline_diam",
+        "dc_flowline_insulation", "dc_flowline_material", "dc_insulated_km",
+        "dc_umbilical_km", "dc_export_km", "dc_export_diam",
+        "dc_n_riser_bases", "dc_n_ssiv", "dc_n_jumpers", "dc_n_scm",
+        "dc_n_risers", "dc_flowline_install", "dc_tiein_method",
+        "dc_topside_tonnes", "dc_topside_rate_k", "dc_manhour_rate",
+        "dc_manhours", "dc_gas_lift", "dc_n_gas_lift_wells",
+        "dc_heating_type", "dc_heated_km", "dc_hpht_choice",
+        "dc_hipps", "dc_n_hipps", "dc_mpfm", "dc_n_mpfm",
     ]
     payload = {"scalar": {}, "tables": {}}
     for k in KEYS:
@@ -10743,7 +10760,11 @@ def restore_inputs_payload(payload: dict) -> None:
                 v = date.fromisoformat(v)
             except Exception:
                 pass
-        st.session_state[k] = v
+        try:
+            st.session_state[k] = v
+        except Exception:
+            # Never let a single odd key abort the whole case load.
+            pass
 
     # Numeric columns per table (used to coerce after load)
     NUMERIC_COLS = {
