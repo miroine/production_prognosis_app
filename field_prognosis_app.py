@@ -15326,6 +15326,14 @@ def concept_selector_section(default_start_date):
              "patched payload. On the next Run, combinations whose "
              "inputs haven't changed are reused instead of recomputed — "
              "big speed-up when you tweak one dimension and re-sweep.")
+    if use_cache:
+        if ro1.button("🗑 Clear cache",
+                      key="concept_clear_cache",
+                      help="Forget all cached combination results and "
+                           "recompute everything on the next Run. Use this "
+                           "if results look wrong or after upgrading the app."):
+            st.session_state["concept_combo_cache"] = {}
+            st.success("Cache cleared — next Run recomputes all combinations.")
     mc_per_concept = ro2.checkbox(
         "🎲 Probabilistic (Monte-Carlo P90/Mean/P10 per combo)",
         value=False, key="concept_mc",
@@ -15603,7 +15611,11 @@ def concept_selector_section(default_start_date):
                     "error": res.get("error"),
                 }
                 results_new[key] = rec_payload
-                if use_cache:
+                # Only cache genuinely successful results — never poison the
+                # cache with a failed/None run (otherwise a transient error
+                # would be remembered and replayed on every later batch).
+                if use_cache and rec_payload.get("ok") and (
+                        rec_payload.get("npv_MM") is not None):
                     combo_cache[_cache_key] = dict(rec_payload)
             except Exception as e:
                 results_new[key] = {
