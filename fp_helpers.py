@@ -2907,6 +2907,13 @@ def payload_to_yaml(payload: dict, meta: dict | None = None) -> str:
     if seg:
         out["segments"] = {
             str(w): _table_to_rows(tbl) for w, tbl in seg.items()}
+    # Imported user / Eclipse production profiles — stored as
+    # {well: {"index": [...], "columns": {col: [...]}}}. These round-trip
+    # directly as nested mappings of lists so the case reproduces the exact
+    # imported rate history without the original file.
+    up = payload.get("user_profiles")
+    if up:
+        out["user_profiles"] = up
     return yaml.safe_dump(out, sort_keys=False, default_flow_style=False,
                           allow_unicode=True)
 
@@ -2952,6 +2959,15 @@ def yaml_to_payload(yaml_text: str) -> tuple[dict, dict]:
             rows = _table_to_rows(tbl)
             segs[str(wname)] = _rows_to_dict_of_lists(rows)
         result["segments"] = segs
+    # Imported user / Eclipse production profiles
+    up_in = doc.get("user_profiles", {}) or {}
+    if isinstance(up_in, dict) and up_in:
+        ups = {}
+        for wname, val in up_in.items():
+            if isinstance(val, dict) and val.get("columns"):
+                ups[str(wname)] = val
+        if ups:
+            result["user_profiles"] = ups
     return result, meta
 
 
@@ -3590,7 +3606,52 @@ def benchmark_concept_cost(grand_total_MMUSD: float,
     }
 
 
-def build_well_completion_svg(spec: dict) -> str:
+def stea_investment_category(label: str) -> str:
+    """Classify a facility/concept CAPEX line label into the STEA investment
+    profile row it belongs to, so the STEA export can split facility CAPEX
+    across the proper buckets (Subsea / Topside / Substructure / Transport /
+    Onshore) instead of dumping everything into one row.
+
+    Returns one of the STEA investment-row names. Defaults to
+    'Subsea production system' for unrecognised subsea-scope items.
+    """
+    s = (label or "").lower()
+    # Cessation handled separately upstream.
+    if any(k in s for k in ("cessation", "p&a", "abandon", "decommission",
+                            "restoration")):
+        return "Cessation - Offshore facilities"
+    # Study / pre-sanction lines (these map to dedicated STEA rows).
+    if "feed" in s:
+        return "FEED studies (DG2-DG3)"
+    if "feasibility" in s or "conceptual" in s or "concept stud" in s:
+        return "Feasibility & conceptual studies"
+    if ("other studies" in s or "g&g" in s or "g&a" in s
+            or "seismic" in s or "country office" in s):
+        return "Other studies"
+    # Transport / export system
+    if any(k in s for k in ("export pipeline", "export line", "transport",
+                            "loading buoy", "tie-in spool", "spool",
+                            "pipeline to shore", "trunkline")):
+        return "Transport system"
+    # Onshore scope (power-from-shore, onshore CPF, onshore terminal)
+    if any(k in s for k in ("onshore", "power from shore", "power-from-shore",
+                            "cpf", "terminal")):
+        return "Onshore (Power from shore)"
+    # Topside scope (platform topsides, processing modules, modifications,
+    # MEG/methanol topside packages, heating packages mounted topside)
+    if any(k in s for k in ("topside", "topsides", "processing", "module",
+                            "modification", "meg reclamation", "methanol",
+                            "host facility")):
+        return "Topside"
+    # Substructure / hull / jacket
+    if any(k in s for k in ("substructure", "jacket", "hull", "fpso",
+                            "floater", "spar", "tlp", "semi", "fixed platform",
+                            "gbs", "steel structure")):
+        return "Substructure"
+    # Subsea production system (templates, manifolds, trees, flowlines,
+    # umbilicals, risers, controls, boosting, metering, PLEM, jumpers)
+    # — everything else in the subsea scope.
+    return "Subsea production system"
     """Equinor-style well + completion cross-section schematic.
 
     Draws a subsea well from sea surface through the mudline to TD with a
@@ -3653,34 +3714,58 @@ def build_well_completion_svg(spec: dict) -> str:
     res_bot_y = d2y(res_top + res_thick)
     td_y = d2y(td)
 
+    # Trajectory archetypes differ visibly:
+    #  Vertical   — straight down, no lateral offset.
+    #  Deviated   — kicks off deep, builds to a moderate (~45-55°) tangent
+    #               and continues slanted through the reservoir.
+    #  Horizontal — kicks off above the reservoir, builds to ~90° at the
+    #               reservoir TOP, then runs a FLAT lateral along the
+    #               reservoir interval (constant depth, increasing x).
+    is_horizontal = (well_type == "Horizontal")
     if well_type == "Vertical":
         kop_y = res_top_y - 40
         build_dx = 0.0
-        end_x = cx0
-    elif well_type == "Horizontal":
-        kop_y = d2y(res_top * 0.55)
-        build_dx = 230.0
-        end_x = cx0 + build_dx
-    else:  # Deviated (default — matches the reference)
+    elif is_horizontal:
+        # Kick off well above the reservoir so the build to 90° completes
+        # right at the reservoir top; the lateral then runs flat.
+        kop_y = d2y(max(res_top * 0.45, 50))
+        build_dx = 150.0          # horizontal offset gained during the build
+        lateral_len = 250.0       # flat lateral length (px) along reservoir
+    else:  # Deviated
         kop_y = d2y(res_top * 0.62)
-        build_dx = 200.0
-        end_x = cx0 + build_dx
+        build_dx = 210.0
+    end_x = cx0 + build_dx + (lateral_len if is_horizontal else 0.0)
 
-    # Spine waypoints (vertical -> curved build -> tangent to TD).
+    # Spine waypoints. For vertical/deviated the spine is depth-parametrised
+    # (x as a function of canvas-y). For horizontal we finish the build at the
+    # reservoir top then hold depth, so below res_top_y the x keeps growing
+    # along the flat lateral while y stays ~constant.
     def spine_point(frac_y):
-        """Given a target canvas y, return the spine x at that depth."""
+        """Given a target canvas y, return the spine x at that depth.
+
+        For horizontal wells, once we reach the reservoir top the trajectory
+        is (nearly) flat, so callers that step in y will all map to ~res_top
+        depth; the lateral itself is drawn explicitly by the completion code
+        using `lateral_path()` below.
+        """
         if frac_y <= kop_y:
             return cx0
-        # build over a zone of ~ (res_top_y - kop_y)
         build_end_y = res_top_y
         if frac_y >= build_end_y:
-            # tangent section — linear continuation
-            t = 1.0
-        else:
-            t = (frac_y - kop_y) / max(1.0, (build_end_y - kop_y))
-            # ease-in curve for a smooth bend
-            t = t * t * (3 - 2 * t)
+            return cx0 + build_dx          # tangent / start of lateral
+        t = (frac_y - kop_y) / max(1.0, (build_end_y - kop_y))
+        t = t * t * (3 - 2 * t)            # smootherstep bend
         return cx0 + build_dx * t
+
+    def lateral_path():
+        """Return the flat horizontal lateral as a list of (x, y) points at
+        reservoir depth. Empty for non-horizontal wells."""
+        if not is_horizontal:
+            return []
+        x_start = cx0 + build_dx
+        y_lat = res_top_y + (res_bot_y - res_top_y) * 0.45  # mid-reservoir
+        n = 24
+        return [(x_start + lateral_len * k / n, y_lat) for k in range(n + 1)]
 
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
              f'height="{H}" viewBox="0 0 {W} {H}" '
@@ -3788,11 +3873,24 @@ def build_well_completion_svg(spec: dict) -> str:
     oh_hw = casing_hw[-1] - 3
     steps = 26
     oh_left, oh_right = [], []
-    for s in range(steps + 1):
-        yy = last_shoe_y + (td_y - last_shoe_y) * s / steps
-        sx = spine_point(yy)
-        oh_left.append((sx - oh_hw, yy))
-        oh_right.append((sx + oh_hw, yy))
+    if is_horizontal:
+        # Build down to the reservoir top, then turn and run flat along the
+        # lateral. Walls are offset perpendicular: vertical part left/right,
+        # flat part top/bottom.
+        for s in range(steps + 1):
+            yy = last_shoe_y + (res_top_y - last_shoe_y) * s / steps
+            sx = spine_point(yy)
+            oh_left.append((sx - oh_hw, yy))
+            oh_right.append((sx + oh_hw, yy))
+        for (lx, ly) in lateral_path():
+            oh_left.append((lx, ly - oh_hw))
+            oh_right.append((lx, ly + oh_hw))
+    else:
+        for s in range(steps + 1):
+            yy = last_shoe_y + (td_y - last_shoe_y) * s / steps
+            sx = spine_point(yy)
+            oh_left.append((sx - oh_hw, yy))
+            oh_right.append((sx + oh_hw, yy))
     # ragged open-hole walls
     def ragged(pts, sign):
         d = f"M {pts[0][0]:.1f} {pts[0][1]:.1f} "
@@ -3913,26 +4011,45 @@ def build_well_completion_svg(spec: dict) -> str:
     # ---- Lower completion across the reservoir ----
     comp_steps = 22
     comp_pts = []
-    for s in range(comp_steps + 1):
-        yy = res_top_y + (td_y - res_top_y) * s / comp_steps
-        sx = spine_point(yy)
-        comp_pts.append((sx, yy))
+    if is_horizontal:
+        # The completion runs along the FLAT lateral at reservoir depth.
+        _lat = lateral_path()
+        if _lat:
+            comp_pts = list(_lat)
+            # vertical orientation of perforations/screens differs for a
+            # horizontal lateral — they point up/down rather than left/right.
+        else:
+            comp_pts = [(spine_point(res_top_y), res_top_y)]
+    else:
+        for s in range(comp_steps + 1):
+            yy = res_top_y + (td_y - res_top_y) * s / comp_steps
+            sx = spine_point(yy)
+            comp_pts.append((sx, yy))
     cl = completion.lower()
     if "open hole" in cl:
         parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
                      f'font-size="10" fill="#7a4">Open-hole completion</text>')
     elif "perforated" in cl or "cased" in cl:
-        # cemented & perforated liner — red perforation marks both sides
+        # cemented & perforated liner — perforation marks. For a horizontal
+        # lateral the perfs point up/down; for vertical/deviated, left/right.
         for (sx, yy) in comp_pts[1:-1]:
-            parts.append(f'<path d="M {sx-oh_hw:.0f} {yy:.0f} '
-                         f'l -10 -3 l 2 6 Z" fill="#d62728"/>')
-            parts.append(f'<path d="M {sx+oh_hw:.0f} {yy:.0f} '
-                         f'l 10 -3 l -2 6 Z" fill="#d62728"/>')
-        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2:.0f}" '
+            if is_horizontal:
+                parts.append(f'<path d="M {sx:.0f} {yy-oh_hw:.0f} '
+                             f'l -3 -10 l 6 2 Z" fill="#d62728"/>')
+                parts.append(f'<path d="M {sx:.0f} {yy+oh_hw:.0f} '
+                             f'l -3 10 l 6 -2 Z" fill="#d62728"/>')
+            else:
+                parts.append(f'<path d="M {sx-oh_hw:.0f} {yy:.0f} '
+                             f'l -10 -3 l 2 6 Z" fill="#d62728"/>')
+                parts.append(f'<path d="M {sx+oh_hw:.0f} {yy:.0f} '
+                             f'l 10 -3 l -2 6 Z" fill="#d62728"/>')
+        _lbl_y = (comp_pts[0][1] - 22) if is_horizontal else (res_top_y+td_y)/2
+        parts.append(f'<text x="{W-200}" y="{_lbl_y:.0f}" '
                      f'font-size="10" fill="#222" font-weight="600">'
                      f'7" cemented &amp; perforated liner</text>')
-        parts.append(f'<text x="{W-200}" y="{(res_top_y+td_y)/2+14:.0f}" '
-                     f'font-size="9" fill="#555">in 8½" open hole</text>')
+        parts.append(f'<text x="{W-200}" y="{_lbl_y+14:.0f}" '
+                     f'font-size="9" fill="#555">'
+                     f'{"horizontal lateral" if is_horizontal else "in 8½ open hole"}</text>')
     elif "gravel" in cl or "screens" in cl:
         # gravel-packed screens — hatched wide screen + gravel stipple
         scr_pts_l = [(sx-oh_hw-5, yy) for sx, yy in comp_pts]

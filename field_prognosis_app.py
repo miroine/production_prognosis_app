@@ -5119,6 +5119,16 @@ def well_section(units, fluid, start_date):
                                     f"exact name match, using "
                                     f"'{first_key}'.")
                         user_profiles[wname] = chosen
+                        # Persist so the profile survives reruns and can be
+                        # written to / restored from the saved case (YAML).
+                        try:
+                            st.session_state[f"user_profile_{wname}"] = {
+                                "index": [str(x) for x in chosen.index],
+                                "columns": {c: [float(v) for v in chosen[c].values]
+                                            for c in chosen.columns},
+                            }
+                        except Exception:
+                            pass
                         src = ("Eclipse export" if parsed["source"]
                                == "eclipse" else "CSV")
                         st.success(
@@ -5133,6 +5143,25 @@ def well_section(units, fluid, start_date):
                             st.warning(w)
                     except Exception as e:
                         st.error(f"{wname}: could not import — {e}")
+                elif f is None:
+                    # No fresh upload this run — fall back to a previously
+                    # imported profile stored in the case (so a reloaded YAML
+                    # reproduces the user/Eclipse profile without re-uploading).
+                    _stored = st.session_state.get(f"user_profile_{wname}")
+                    if _stored and _stored.get("columns"):
+                        try:
+                            _idx = _stored.get("index")
+                            _df = pd.DataFrame(_stored["columns"])
+                            if _idx is not None and len(_idx) == len(_df):
+                                _df.index = pd.to_datetime(_idx,
+                                                            errors="coerce")
+                            user_profiles[wname] = _df
+                            st.info(
+                                f"{wname}: using saved imported profile "
+                                f"({len(_df)} months). Upload a file above to "
+                                f"replace it.")
+                        except Exception:
+                            pass
 
     # ---- Multi-segment decline editor ----
     def _f(v, default=0.0):
@@ -6466,6 +6495,54 @@ def economics_section(units, start_date):
         aban_cost = c3.number_input(f"Abandonment cost ({cost_unit('MM')})",
                                     value=80.0,
                                     key="aban_cost", on_change=mark_stale)
+
+    # ---- Study / pre-sanction costs (Feasibility → Concept → FEED) ----
+    # These are real pre-FEED and FEED expenditures incurred BEFORE first
+    # production. They are booked in the years leading up to production start
+    # and flow through the economics (and the STEA 'Cost profiles' studies
+    # rows + 'FEED studies (DG2-DG3)' investment row).
+    with st.expander("📚 Study & pre-sanction costs (Feasibility → FEED)",
+                     expanded=False):
+        st.caption(
+            "Pre-sanction study spend incurred before first production. "
+            "Feasibility & concept (DG1→DG2) and FEED (DG2→DG3) are entered "
+            "separately so they map to the right STEA rows. Spend is phased "
+            "across the years before production start.")
+        sc1, sc2, sc3 = st.columns(3)
+        study_feas = sc1.number_input(
+            f"Feasibility & concept studies ({cost_unit('MM')})",
+            min_value=0.0, value=0.0, step=1.0,
+            key="study_feasibility", on_change=mark_stale,
+            help="Pre-FEED studies up to concept select (DG1→DG2): "
+                 "feasibility, concept screening, early studies. STEA row "
+                 "'Feasibility & conceptual studies'.")
+        study_feed = sc2.number_input(
+            f"FEED studies DG2→DG3 ({cost_unit('MM')})",
+            min_value=0.0, value=0.0, step=1.0,
+            key="study_feed", on_change=mark_stale,
+            help="Front-end engineering & design between concept select and "
+                 "sanction (DG2→DG3). STEA investment row "
+                 "'FEED studies (DG2-DG3)'.")
+        study_other = sc3.number_input(
+            f"Other studies / G&G & admin ({cost_unit('MM')})",
+            min_value=0.0, value=0.0, step=1.0,
+            key="study_other", on_change=mark_stale,
+            help="Other pre-sanction studies, G&G and admin, seismic "
+                 "reprocessing, country office. STEA row 'Other studies'.")
+        study_years = st.slider(
+            "Years before production start to phase study spend over",
+            1, 8, 4, 1, key="study_phase_years", on_change=mark_stale,
+            help="Study and FEED spend is spread evenly across this many "
+                 "years immediately before first production. E.g. 4 → spend "
+                 "booked in each of the 4 years before start-up.")
+        _tot_study = (cost_input_to_usd(study_feas)
+                      + cost_input_to_usd(study_feed)
+                      + cost_input_to_usd(study_other))
+        if _tot_study and _tot_study > 0:
+            st.caption(f"Total pre-sanction study spend: "
+                       f"${_tot_study:,.0f} MM "
+                       f"(phased over {study_years} yr before first "
+                       f"production).")
 
     # ---- Economic limit / cessation timing ----
     st.markdown("**Cessation timing**")
@@ -8720,6 +8797,53 @@ def economics_section(units, start_date):
     # Abandonment is a CAPEX-like spend at the end of life and carries
     # similar estimating bias — apply the same contingency multiplier.
     aban_cost_with_cont = float(aban_cost) * _cont_mult
+
+    # ---- Study / pre-sanction costs → dated CAPEX rows --------------------
+    # Phase feasibility/concept, FEED and other-study spend evenly across the
+    # `study_phase_years` immediately BEFORE production start. We add them as
+    # labelled rows to the facility schedule so they flow through NPV and get
+    # classified into the right STEA rows (the labels are matched by the STEA
+    # exporter). Contingency is NOT applied to studies (they are actuals /
+    # firm commitments, not estimate-biased build scope).
+    try:
+        _study_feas = float(st.session_state.get("study_feasibility", 0.0) or 0)
+        _study_feed = float(st.session_state.get("study_feed", 0.0) or 0)
+        _study_other = float(st.session_state.get("study_other", 0.0) or 0)
+        _study_yrs = int(st.session_state.get("study_phase_years", 4) or 4)
+        _study_items = [
+            (_study_feas, "Feasibility & conceptual studies"),
+            (_study_feed, "FEED studies (DG2-DG3)"),
+            (_study_other, "Other studies / G&G and admin"),
+        ]
+        _study_rows = []
+        if any(v > 0 for v, _ in _study_items) and _study_yrs > 0:
+            from datetime import timedelta as _tdelta
+            _start_ts = pd.Timestamp(start_date)
+            for _amt, _lbl in _study_items:
+                if _amt <= 0:
+                    continue
+                _per_yr = _amt / _study_yrs
+                for _k in range(_study_yrs):
+                    # year (start - (k+1)) ... spend mid-year
+                    _yr_offset = _study_yrs - _k     # 1..study_yrs before start
+                    _spend_date = _start_ts - _tdelta(days=int(365 * _yr_offset)) \
+                        + _tdelta(days=180)
+                    _study_rows.append({
+                        "date": _spend_date.date()
+                        if hasattr(_spend_date, "date") else _spend_date,
+                        "amount_MMUSD": round(_per_yr, 3),
+                        "label": _lbl,
+                    })
+        if _study_rows:
+            _study_df = pd.DataFrame(_study_rows)
+            if (fac_df_with_cont is not None
+                    and "amount_MMUSD" in fac_df_with_cont.columns):
+                fac_df_with_cont = pd.concat(
+                    [fac_df_with_cont, _study_df], ignore_index=True)
+            else:
+                fac_df_with_cont = _study_df
+    except Exception:
+        pass
 
     # ---- Cost-input currency conversion -----------------------------------
     # If the user is entering costs in NOK, convert every COST field to USD
@@ -11008,6 +11132,28 @@ def main():
                                    file_name="field_prognosis.xlsx",
                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                                    use_container_width=True)
+            # --- STEA export (single case) ---
+            try:
+                _case_name = str(st.session_state.get(
+                    "case_name", "Field case") or "Field case")
+                _stea_bytes = build_stea_workbook([{
+                    "name": _case_name, "df": df, "df_e": df_e,
+                    "fluid": fluid, "units": units,
+                    "fac_df": (econ_r.facility_capex.df
+                               if econ_r.facility_capex is not None
+                               else None)}])
+                st.download_button(
+                    "📤 Export to STEA (.xlsx)", data=_stea_bytes,
+                    file_name="field_prognosis_STEA.xlsx",
+                    mime=("application/vnd.openxmlformats-officedocument."
+                          "spreadsheetml.sheet"),
+                    use_container_width=True,
+                    help="STEA-format workbook matching the Atlantis STEA "
+                         "input template: production, cost and investment "
+                         "profiles by calendar year. Production in "
+                         "MSm³/GSm³/MTPA, costs in MNOK.")
+            except Exception as _se:
+                st.caption(f"STEA export unavailable: {_se}")
 
         # --- JSON-API export ---
         with ex2:
@@ -11372,6 +11518,8 @@ def collect_inputs_payload() -> dict:
         "dc_heating_type", "dc_heated_km", "dc_hpht_choice",
         "dc_hipps", "dc_n_hipps", "dc_mpfm", "dc_n_mpfm",
         "dc_days_per_well", "dc_meters_per_well",
+        "study_feasibility", "study_feed", "study_other",
+        "study_phase_years",
         # Cost-input currency (input side — converts NOK costs to USD)
         "cost_input_currency", "usd_to_nok",
     ]
@@ -11439,6 +11587,20 @@ def collect_inputs_payload() -> dict:
             continue
     if seg_store:
         payload["segments"] = seg_store
+
+    # Imported user / Eclipse production profiles — stored in session_state
+    # as "user_profile_<well>" dicts. Persist so a reloaded case reproduces
+    # them without re-uploading the source file.
+    prof_store = {}
+    for _key in list(st.session_state.keys()):
+        if not isinstance(_key, str) or not _key.startswith("user_profile_"):
+            continue
+        wname = _key[len("user_profile_"):]
+        val = st.session_state[_key]
+        if isinstance(val, dict) and val.get("columns"):
+            prof_store[wname] = val
+    if prof_store:
+        payload["user_profiles"] = prof_store
     return payload
 
 
@@ -11550,6 +11712,14 @@ def restore_inputs_payload(payload: dict) -> None:
                 st.session_state[f"segments_{wname}"] = seg_df
             except Exception:
                 continue
+
+    # Restore imported user / Eclipse profiles
+    for wname, val in (payload.get("user_profiles", {}) or {}).items():
+        try:
+            if isinstance(val, dict) and val.get("columns"):
+                st.session_state[f"user_profile_{wname}"] = val
+        except Exception:
+            continue
 
     st.session_state["stale"] = True
     st.session_state["results"] = None
@@ -12058,6 +12228,407 @@ def generate_pdf_report(case_name, df, per_well_df, df_e, wells, asm, econ,
     except Exception as e:
         st.error(f"PDF generation error: {e}")
         return None
+
+
+def _stea_annual_from_profile(profile, fluid, units, rate=10.5):
+    """STEA annual aggregation from a stored batch `profile` dict
+    {index:[dates], columns:{col:[...]}}. Production columns here are already
+    in the case's DISPLAY units; cost columns are USD/month. We convert
+    production to STEA metric annual volumes and costs to MNOK.
+
+    Because the stored profile is display-unit, we convert to metric only if
+    the case was in field units; metric cases are already in Sm³-based rates.
+    """
+    import pandas as _pd
+    out = {}
+    if not profile or not profile.get("columns"):
+        return out, None, None
+    idx = profile.get("index") or []
+    cols = profile["columns"]
+    try:
+        dates = _pd.to_datetime(idx, errors="coerce")
+    except Exception:
+        return out, None, None
+    df = _pd.DataFrame(cols)
+    if len(df) != len(dates):
+        return out, None, None
+    df["year"] = dates.year
+    # Drop rows whose date could not be parsed (NaT → NaN year).
+    df = df[df["year"].notna()].copy()
+    if df.empty:
+        return out, None, None
+    df["year"] = df["year"].astype(int)
+
+    is_metric = (units == "metric")
+    # Conversion of a per-day rate to annual metric volume.
+    #  metric oil rate is Sm³/d → MSm³/yr: *DAYS_PER_MONTH /1e6 (monthly sum)
+    #  field  oil rate is stb/d → MSm³/yr: /6.2898 *DAYS_PER_MONTH /1e6
+    #  metric gas rate is Sm³/d → GSm³/yr: *DAYS_PER_MONTH /1e9  (if Sm3/d)
+    #     but display gas rate for metric is kSm³/d in some unit sets; the
+    #     profile stores the engine display column. We assume Sm³/d-equivalent
+    #     volumes via the same factor used in plots.
+    def _oil_annual(series):
+        v = series.astype(float) * DAYS_PER_MONTH
+        if not is_metric:
+            v = v / 6.2898
+        return (v / 1e6)
+    def _gas_annual(series):
+        v = series.astype(float) * DAYS_PER_MONTH
+        if not is_metric:
+            v = v * 1000.0 / 35.3147
+        return (v / 1e9)
+
+    def _sum_year(col, conv):
+        s = {}
+        if col in df.columns:
+            for y, g in df.groupby("year"):
+                s[int(y)] = float(conv(g[col]).sum())
+        return s
+
+    oil_col = "oil_rate" if "oil_rate" in df.columns else "primary_rate"
+    gas_col = "gas_rate" if "gas_rate" in df.columns else "secondary_rate"
+    is_cond = fluid and "ondensate" in str(fluid)
+    if is_cond:
+        out["Condensate production"] = _sum_year(oil_col, _oil_annual)
+    else:
+        out["Oil production"] = _sum_year(oil_col, _oil_annual)
+    out["Rich gas production"] = _sum_year(gas_col, _gas_annual)
+    out["Net sales gas"] = dict(out.get("Rich gas production", {}))
+
+    def _cost_year(col):
+        s = {}
+        if col in df.columns:
+            for y, g in df.groupby("year"):
+                s[int(y)] = float(g[col].astype(float).sum()) / 1e6 * rate
+        return s
+    out["Offshore facilities operations"] = _cost_year("opex")
+    out["Subsea production system"] = _cost_year("capex_facility")
+    out["Oil producer"] = _cost_year("capex_well")
+    out["Cessation - Development wells"] = _cost_year("abandonment")
+
+    years = sorted(int(y) for y in df["year"].unique())
+    return out, (years[0] if years else None), (years[-1] if years else None)
+
+
+def _stea_annual_from_case(df, df_e, fluid, units, base_year=None,
+                            fac_df=None):
+    """Aggregate one case's monthly engine output into STEA annual line-item
+    profiles. Returns (dict label->{year:value}, first_year, last_year).
+
+    Units follow the STEA template (always metric, regardless of the case's
+    display units):
+        Oil / condensate     MSm³/yr   (million Sm³ per year)
+        Rich gas / sales gas GSm³/yr   (billion Sm³ per year)
+        NGL                  MTPA      (million tonnes per annum)
+        Costs                MNOK      (million NOK — Real)
+        CO2                  MTPA
+    Production is converted from engine field units (stb/d, Mscf/d) to metric
+    annual volumes. Costs are converted USD→NOK at the case's saved rate (or
+    10.5 default) because the STEA template is NOK-denominated.
+    """
+    import pandas as _pd
+    import numpy as _np
+    out = {}
+    if df is None or "date" not in getattr(df, "columns", []):
+        return out, None, None
+    d = df.copy()
+    d["year"] = _pd.to_datetime(d["date"]).dt.year
+
+    # --- unit factors ---
+    # Field → metric volume:
+    #   oil:  stb → Sm³ : / 6.2898 ; then bbl/yr → MSm³/yr : / 1e6
+    #   gas:  Mscf → Sm³: * 1000 / 35.3147 ; GSm³/yr : / 1e9
+    # Monthly volume = rate (per day) * DAYS_PER_MONTH.
+    def _oil_MSm3(rate_stbd):
+        return rate_stbd * DAYS_PER_MONTH / 6.2898 / 1e6
+    def _gas_GSm3(rate_mscfd):
+        return rate_mscfd * DAYS_PER_MONTH * 1000.0 / 35.3147 / 1e9
+    def _ngl_MTPA(rate_bbld):
+        # NGL bbl/d → tonnes/yr → MTPA. ~0.55 t/bbl typical NGL; STEA uses
+        # mass. Use 0.118 t/bbl? NGL density ~ 0.55 t/m³, 1 bbl = 0.159 m³ →
+        # 0.0875 t/bbl. Annual: * 365.25 / 1e6.
+        return rate_bbld * 0.0875 * 365.25 / 1e6
+
+    years = sorted(int(y) for y in d["year"].unique())
+    if not years:
+        return out, None, None
+
+    def _annual_sum(col, conv):
+        s = {}
+        if col in d.columns:
+            for y, g in d.groupby("year"):
+                s[int(y)] = float(conv(g[col].astype(float)).sum())
+        return s
+
+    # Production profiles
+    out["Oil production"] = _annual_sum("oil_rate", _oil_MSm3)
+    out["Rich gas production"] = _annual_sum("gas_rate", _gas_GSm3)
+    if "ngl_rate" in (df_e.columns if df_e is not None else []):
+        de = df_e.copy(); de["year"] = _pd.to_datetime(de["date"]).dt.year \
+            if "date" in de.columns else d["year"].values
+        s = {}
+        for y, g in de.groupby("year"):
+            s[int(y)] = float(_ngl_MTPA(g["ngl_rate"].astype(float)).sum())
+        out["NGL Production"] = s
+    if fluid and "ondensate" in str(fluid):
+        out["Condensate production"] = _annual_sum("oil_rate", _oil_MSm3)
+        out["Oil production"] = {}
+    out["Net sales gas"] = dict(out.get("Rich gas production", {}))
+
+    # Cost & investment profiles (USD→NOK). df_e money cols are USD/month.
+    rate = 10.5
+    try:
+        import streamlit as _st
+        rate = float(_st.session_state.get("usd_to_nok", 10.5)) or 10.5
+    except Exception:
+        pass
+
+    def _annual_cost_MNOK(col):
+        s = {}
+        if df_e is not None and col in df_e.columns:
+            de = df_e.copy()
+            de["year"] = (_pd.to_datetime(de["date"]).dt.year
+                          if "date" in de.columns else d["year"].values)
+            for y, g in de.groupby("year"):
+                usd = float(g[col].astype(float).sum())
+                s[int(y)] = usd / 1e6 * rate   # USD → MUSD → MNOK
+        return s
+
+    # OPEX → Offshore facilities operations; well CAPEX → producers;
+    # abandonment → cessation (development wells).
+    out["Offshore facilities operations"] = _annual_cost_MNOK("opex")
+    out["Oil producer"] = _annual_cost_MNOK("capex_well")
+    out["Cessation - Development wells"] = _annual_cost_MNOK("abandonment")
+
+    # Facility CAPEX — split across STEA investment rows by classifying each
+    # labelled facility-cost line into its STEA category and dating it to the
+    # spend year. If no labelled fac_df is supplied, fall back to lumping the
+    # engine's total facility CAPEX into 'Subsea production system'.
+    fac_split = {}
+    if fac_df is not None and len(fac_df) > 0 \
+            and "amount_MMUSD" in getattr(fac_df, "columns", []):
+        try:
+            fd = fac_df.copy()
+            fd["year"] = _pd.to_datetime(fd["date"], errors="coerce").dt.year
+            for _, row in fd.iterrows():
+                yr = row.get("year")
+                if _pd.isna(yr):
+                    continue
+                lbl = str(row.get("label", "") or "")
+                amt = float(row.get("amount_MMUSD", 0) or 0.0)
+                if amt == 0:
+                    continue
+                cat = fh.stea_investment_category(lbl)
+                # cessation rows are handled by the abandonment series above;
+                # skip them here to avoid double counting.
+                if cat == "Cessation - Offshore facilities":
+                    continue
+                fac_split.setdefault(cat, {})
+                fac_split[cat][int(yr)] = (
+                    fac_split[cat].get(int(yr), 0.0) + amt * rate)
+        except Exception:
+            fac_split = {}
+    if fac_split:
+        for cat, series in fac_split.items():
+            out[cat] = series
+    else:
+        out["Subsea production system"] = _annual_cost_MNOK("capex_facility")
+    if "co2_tonnes" in (df_e.columns if df_e is not None else []):
+        de = df_e.copy()
+        de["year"] = (_pd.to_datetime(de["date"]).dt.year
+                      if "date" in de.columns else d["year"].values)
+        s = {}
+        for y, g in de.groupby("year"):
+            s[int(y)] = float(g["co2_tonnes"].astype(float).sum()) / 1e6
+        out["Co2 Emissions"] = s
+
+    return out, years[0], years[-1]
+
+
+# STEA workbook line-item template: (row_label, units, is_section_header)
+_STEA_TEMPLATE = [
+    ("Production profiles", "", True),
+    ("Oil production", "MSm³/yr", False),
+    ("Additional Oil production", "MSm³/yr", False),
+    ("Rich gas production", "GSm³/yr", False),
+    ("Additional rich gas production", "GSm³/yr", False),
+    ("NGL Production", "MTPA", False),
+    ("Condensate production", "MSm³/yr", False),
+    ("Fuel, flaring and losses", "GWh", False),
+    ("Deferred oil production", "MSm³/yr", False),
+    ("Deferred gas production", "GSm³/yr", False),
+    ("Net sales gas", "GSm³/yr", False),
+    ("Imported gas", "GSm³/yr", False),
+    ("Cost profiles", "", True),
+    ("Feasibility & conceptual studies", "Real MNOK'25", False),
+    ("Other studies", "Real MNOK'25", False),
+    ("Historic cost", "Real MNOK'25", False),
+    ("Well intervention", "Real MNOK'25", False),
+    ("Offshore facilities operations", "Real MNOK'25", False),
+    ("Onshore related OPEX", "Real MNOK'25", False),
+    ("Additional OPEX ", "Real MNOK'25", False),
+    ("Cessation - Development wells", "Real MNOK'25", False),
+    ("Cessation - Offshore facilities", "Real MNOK'25", False),
+    ("Seismic acquisition and processing", "Real MNOK'25", False),
+    ("Country office", "Real MNOK'25", False),
+    ("G&G and admin", "Real MNOK'25", False),
+    ("Project specific drilling cost", "Real MNOK'25", False),
+    ("Imported electricity", "GWh", False),
+    ("Co2 Emissions", "MTPA", False),
+    ("Investment profiles", "", True),
+    ("FEED studies (DG2-DG3)", "Real MNOK'25", False),
+    ("Subsea production system", "Real MNOK'25", False),
+    ("Topside", "Real MNOK'25", False),
+    ("Substructure", "Real MNOK'25", False),
+    ("Transport system", "Real MNOK'25", False),
+    ("Onshore (Power from shore)", "Real MNOK'25", False),
+    ("CAPEX - Onshore facilites", "Real MNOK'25", False),
+    ("Rig upgrade - development wells", "Real MNOK'25", False),
+    ("Rig mob/demob - development wells", "Real MNOK'25", False),
+    ("Oil producer", "Real MNOK'25", False),
+    ("Water injector", "Real MNOK'25", False),
+    ("Gas producer", "Real MNOK'25", False),
+    ("Gas injector", "Real MNOK'25", False),
+]
+
+
+def build_stea_workbook(cases):
+    """Build a STEA-format Excel workbook (one sheet per case) matching the
+    Atlantis STEA input template: line items as rows grouped into Production /
+    Cost / Investment sections, calendar years as columns (Name | Price name |
+    Units | Sum | <years…>).
+
+    `cases` = list of dicts: {name, df, df_e, fluid, units}. Returns bytes.
+    """
+    import io as _io
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    hdr_fill = PatternFill("solid", fgColor="1F3864")
+    hdr_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    sec_fill = PatternFill("solid", fgColor="D9E1F2")
+    sec_font = Font(bold=True, name="Arial", size=10)
+    base_font = Font(name="Arial", size=10)
+
+    # Determine the global year span across all cases for a consistent grid.
+    annuals = []
+    gmin = gmax = None
+    _rate = 10.5
+    try:
+        import streamlit as _st
+        _rate = float(_st.session_state.get("usd_to_nok", 10.5)) or 10.5
+    except Exception:
+        pass
+    for c in cases:
+        if c.get("df") is not None:
+            a, y0, y1 = _stea_annual_from_case(
+                c.get("df"), c.get("df_e"), c.get("fluid"), c.get("units"),
+                fac_df=c.get("fac_df"))
+        elif c.get("stea") is not None:
+            # Field-unit production + USD costs → reconstruct df/df_e and use
+            # the canonical (field-unit) aggregator for exact units.
+            import pandas as _pd
+            _blk = c["stea"]
+            _idx = _blk.get("index") or []
+            _cols = _blk.get("columns") or {}
+            try:
+                _dfr = _pd.DataFrame(_cols)
+                _dfr["date"] = _pd.to_datetime(_idx, errors="coerce")
+                _facdf = None
+                _fb = c.get("fac_df")
+                if _fb and _fb.get("amount_MMUSD"):
+                    _facdf = _pd.DataFrame({
+                        "date": _pd.to_datetime(_fb.get("date"),
+                                                errors="coerce"),
+                        "amount_MMUSD": _fb.get("amount_MMUSD"),
+                        "label": _fb.get("label",
+                                         [""] * len(_fb["amount_MMUSD"])),
+                    })
+                a, y0, y1 = _stea_annual_from_case(
+                    _dfr, _dfr, c.get("fluid"), "field", fac_df=_facdf)
+            except Exception:
+                a, y0, y1 = {}, None, None
+        elif c.get("profile") is not None:
+            a, y0, y1 = _stea_annual_from_profile(
+                c.get("profile"), c.get("fluid"), c.get("units"), _rate)
+        else:
+            a, y0, y1 = {}, None, None
+        annuals.append((c, a))
+        if y0 is not None:
+            gmin = y0 if gmin is None else min(gmin, y0)
+            gmax = y1 if gmax is None else max(gmax, y1)
+    if gmin is None:
+        gmin, gmax = 2023, 2050
+    # STEA convention: year header column starts at col 7 (G) = 2023; data is
+    # placed at the column matching its calendar year. Keep that anchor.
+    anchor_year, anchor_col = 2023, 7
+    if gmin < anchor_year:
+        anchor_year = gmin
+
+    for c, annual in annuals:
+        title = str(c.get("name", "case"))[:31]
+        ws = wb.create_sheet(title=title or "case")
+        # Header row
+        ws.cell(row=1, column=2, value="Name")
+        ws.cell(row=1, column=3, value="Price name")
+        ws.cell(row=1, column=4, value="Units")
+        ws.cell(row=1, column=5, value="Sum")
+        for col in (2, 3, 4, 5):
+            cell = ws.cell(row=1, column=col)
+            cell.fill = hdr_fill; cell.font = hdr_font
+        # Year headers
+        for yr in range(anchor_year, gmax + 1):
+            ccol = anchor_col + (yr - anchor_year)
+            cell = ws.cell(row=1, column=ccol, value=yr)
+            cell.fill = hdr_fill; cell.font = hdr_font
+            cell.number_format = "0"
+        last_col = anchor_col + (gmax - anchor_year)
+
+        r = 2
+        for label, unit, is_section in _STEA_TEMPLATE:
+            if is_section:
+                cell = ws.cell(row=r, column=2, value=label)
+                cell.font = sec_font
+                for col in range(2, last_col + 1):
+                    ws.cell(row=r, column=col).fill = sec_fill
+                r += 1
+                continue
+            ws.cell(row=r, column=2, value=label).font = base_font
+            if unit:
+                ws.cell(row=r, column=4, value=unit).font = base_font
+            series = annual.get(label, {})
+            if series:
+                # Sum column (E)
+                first_data = anchor_col
+                last_data = last_col
+                ws.cell(row=r, column=5,
+                        value=f"=SUM({get_column_letter(first_data)}{r}:"
+                              f"{get_column_letter(last_data)}{r})")
+                ws.cell(row=r, column=5).font = base_font
+                ws.cell(row=r, column=5).number_format = "#,##0.000"
+                for yr, val in series.items():
+                    ccol = anchor_col + (int(yr) - anchor_year)
+                    if ccol < 2:
+                        continue
+                    cc = ws.cell(row=r, column=ccol, value=round(val, 6))
+                    cc.font = base_font
+                    cc.number_format = "#,##0.000"
+            r += 1
+
+        ws.column_dimensions["B"].width = 34
+        ws.column_dimensions["C"].width = 12
+        ws.column_dimensions["D"].width = 14
+        ws.column_dimensions["E"].width = 12
+        for cc in range(anchor_col, last_col + 1):
+            ws.column_dimensions[get_column_letter(cc)].width = 10
+        ws.freeze_panes = ws.cell(row=2, column=anchor_col)
+
+    buf = _io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
 
 
 def run_payload_case(payload: dict, default_start_date,
@@ -16252,8 +16823,12 @@ def concept_selector_section(default_start_date):
                         _dfpe = res.get("df_e")
                         if _dfp is not None and len(_dfp) > 0:
                             _prof_cols = {}
-                            _date_idx = (list(_dfp.index.astype(str))
-                                         if _dfp.index is not None else None)
+                            if "date" in _dfp.columns:
+                                _date_idx = [str(x) for x in _dfp["date"].values]
+                            elif _dfp.index is not None:
+                                _date_idx = list(_dfp.index.astype(str))
+                            else:
+                                _date_idx = None
                             for _c in ("primary_rate", "secondary_rate",
                                        "water_rate", "oil_rate", "gas_rate",
                                        "cum_oil", "cum_gas",
@@ -16269,6 +16844,66 @@ def concept_selector_section(default_start_date):
                                     if _c in _dfpe.columns:
                                         _prof_cols[_c] = [float(x) for x in _dfpe[_c].values]
                             _profile = {"index": _date_idx, "columns": _prof_cols}
+                            # Field-unit production + USD cost columns for the
+                            # STEA export, so its unit conversion is exact and
+                            # independent of the display-unit profile above.
+                            try:
+                                _dff = res.get("df")
+                                _dffe = res.get("df_e")
+                                _stea_cols = {}
+                                _stea_idx = None
+                                if _dff is not None and len(_dff) > 0:
+                                    if "date" in _dff.columns:
+                                        _stea_idx = [str(x) for x in
+                                                     _dff["date"].values]
+                                    for _c in ("oil_rate", "gas_rate"):
+                                        if _c in _dff.columns:
+                                            _stea_cols[_c] = [
+                                                float(x) for x in
+                                                _dff[_c].values]
+                                if _dffe is not None and len(_dffe) > 0:
+                                    for _c in ("opex", "capex_well",
+                                               "capex_facility",
+                                               "abandonment", "ngl_rate",
+                                               "co2_tonnes"):
+                                        if _c in _dffe.columns:
+                                            _stea_cols[_c] = [
+                                                float(x) for x in
+                                                _dffe[_c].values]
+                                if _stea_cols:
+                                    _profile["stea"] = {
+                                        "index": _stea_idx or _date_idx,
+                                        "columns": _stea_cols}
+                                # Facility schedule (labelled) for STEA cost
+                                # splitting — store as parallel lists.
+                                try:
+                                    _fres = res.get("econ")
+                                    _facd = None
+                                    if _fres is not None and getattr(
+                                            _fres, "facility_capex", None):
+                                        _facd = _fres.facility_capex.df
+                                    if _facd is None:
+                                        _facd = (case_payload.get("tables", {})
+                                                 .get("fac_df"))
+                                        if _facd is not None:
+                                            import pandas as _pdx
+                                            _facd = _pdx.DataFrame(_facd)
+                                    if (_facd is not None and len(_facd) > 0
+                                            and "amount_MMUSD"
+                                            in _facd.columns):
+                                        _profile["fac_df"] = {
+                                            "date": [str(x) for x in
+                                                     _facd["date"].values],
+                                            "amount_MMUSD": [float(x) for x in
+                                                _facd["amount_MMUSD"].values],
+                                            "label": [str(x) for x in
+                                                _facd.get("label",
+                                                [""] * len(_facd))],
+                                        }
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
                     except Exception:
                         _profile = None
                 else:
@@ -16410,6 +17045,8 @@ def concept_selector_section(default_start_date):
                     "npv_mc_mean": npv_mc_mean,
                     "mc_draws": _mc_draws,
                     "profile": _profile,
+                    "fluid": res.get("fluid"),
+                    "units": res.get("units"),
                     "picks": [(dim_name, label)],
                     "ok": res.get("ok", False),
                     "error": res.get("error"),
@@ -16641,6 +17278,38 @@ def concept_selector_section(default_start_date):
             "📥 Download results (CSV)", data=csv,
             file_name="concept_batch_results.csv", mime="text/csv",
             use_container_width=True)
+
+        # ---- STEA export (all swept cases, one sheet each) ----
+        try:
+            _stea_cases = []
+            for _k, _r in results.items():
+                if not _r.get("ok") or _r.get("profile") is None:
+                    continue
+                _picks = _r.get("picks") or []
+                _nm = _r.get("name")
+                if not _nm and _picks:
+                    _nm = "; ".join(f"{d}={l}" for d, l in _picks)
+                _nm = (_nm or "case")[:31]
+                _stea_cases.append({
+                    "name": _nm, "stea": _r.get("profile", {}).get("stea"),
+                    "fac_df": _r.get("profile", {}).get("fac_df"),
+                    "profile": _r.get("profile"),
+                    "fluid": _r.get("fluid", fluid),
+                    "units": _r.get("units", "metric")})
+            if _stea_cases:
+                _stea_bytes = build_stea_workbook(_stea_cases)
+                dl2.download_button(
+                    "📤 Export to STEA (all cases)", data=_stea_bytes,
+                    file_name="concept_cases_STEA.xlsx",
+                    mime=("application/vnd.openxmlformats-officedocument."
+                          "spreadsheetml.sheet"),
+                    use_container_width=True,
+                    help="STEA-format workbook (one sheet per case): "
+                         "production, cost and investment profiles by year, "
+                         "matching the Atlantis STEA input template. Costs in "
+                         "MNOK, production in MSm³/GSm³/MTPA.")
+        except Exception as _se:
+            dl2.caption(f"STEA export unavailable: {_se}")
 
         # ---- Comprehensive multi-sheet Excel workbook ----
         # One workbook holding EVERYTHING for an offline, like-for-like
