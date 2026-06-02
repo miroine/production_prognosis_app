@@ -101,6 +101,29 @@ def ulabel(kind, units):
     return UNIT_LABELS[units][kind]
 
 
+def cost_unit(kind="MM"):
+    """Return the cost-unit label string matching the chosen cost-input
+    currency, so input widgets read 'MNOK' / 'NOK/bbl' / 'kNOK' when the
+    user is entering costs in NOK, and the USD equivalents otherwise.
+
+    kind: 'MM' (millions), 'MM/yr', '/bbl', 'k' (thousands/day rate),
+          '/Mscf', '/MMBtu'.
+    """
+    import streamlit as _st
+    nok = _st.session_state.get("cost_input_currency", "USD") == "NOK"
+    table = {
+        "MM":      ("MNOK", "$MM"),
+        "MM/yr":   ("MNOK/yr", "$MM/yr"),
+        "/bbl":    ("NOK/bbl", "$/bbl"),
+        "k":       ("kNOK", "$k"),
+        "/Mscf":   ("NOK/Mscf", "$/Mscf"),
+        "/MMBtu":  ("NOK/MMBtu", "$/MMBtu"),
+        "/Sm3":    ("NOK/Sm³", "$/Sm³"),
+    }
+    pair = table.get(kind, ("NOK", "$"))
+    return pair[0] if nok else pair[1]
+
+
 def cost_input_to_usd(value, _session=None):
     """Convert a cost INPUT to USD for the engine. If the user is entering
     costs in NOK (cost_input_currency == 'NOK'), divide by the NOK→USD rate;
@@ -6270,16 +6293,16 @@ def economics_section(units, start_date):
         _opex_key = f"opex_var_{_opex_phase}"
         if _econ_is_oil:
             opex_var_bbl = c3.number_input(
-                "Var. OPEX ($/bbl)", value=5.5,
+                f"Var. OPEX ({cost_unit('/bbl')})", value=5.5,
                 key=_opex_key, on_change=mark_stale,
                 help="Variable operating cost per barrel of primary fluid "
                      "(oil) produced. Default $5.5/bbl reflects a mid-size NCS "
                      "offshore development; small / late-life fields run "
-                     "higher ($10-20/bbl), very large fields lower. Industry-"
-                     "standard regardless of unit system.")
+                     "higher ($10-20/bbl), very large fields lower. Enter in "
+                     "your chosen cost-input currency.")
         else:
             opex_var_bbl = c3.number_input(
-                "Var. OPEX ($/Mscf)", value=0.9,
+                f"Var. OPEX ({cost_unit('/Mscf')})", value=0.9,
                 key=_opex_key, on_change=mark_stale,
                 help="Variable operating cost per Mscf of primary fluid (gas) "
                      "produced. Default $0.9/Mscf reflects an NCS gas / gas-"
@@ -6287,7 +6310,8 @@ def economics_section(units, start_date):
                      "engine charges variable OPEX against the gas rate "
                      "(Mscf/d), so this must be a $/Mscf figure — typically "
                      "$0.5-2.0/Mscf, NOT an oil $/bbl number.")
-        opex_fixed = c4.number_input("Fixed OPEX ($MM/yr)", value=20.0,
+        opex_fixed = c4.number_input(f"Fixed OPEX ({cost_unit('MM/yr')})",
+                                     value=20.0,
                                      key="opex_fixed", on_change=mark_stale)
 
     # Convert always-$/bbl and always-$/MMBtu to engine-internal $/bbl, $/Mscf
@@ -6357,16 +6381,19 @@ def economics_section(units, start_date):
         if well_cost_mode == "rig_rate":
             rc1, rc2, rc3, rc4 = st.columns(4)
             rig_day_rate_kUSD = rc1.number_input(
-                "Rig dayrate ($k/day)", value=500.0, min_value=0.0, step=10.0,
+                f"Rig dayrate ({cost_unit('k')}/day)", value=500.0,
+                min_value=0.0, step=10.0,
                 key="rig_dayrate", on_change=mark_stale,
                 help="Drilling-rig spread cost per day. Typical ranges: $50-150k/d (land), "
                      "$150-350k/d (jackup), $400-700k/d (semi/drillship).")
             completion_day_rate_kUSD = rc2.number_input(
-                "Completion dayrate ($k/day)", value=350.0, min_value=0.0, step=10.0,
+                f"Completion dayrate ({cost_unit('k')}/day)", value=350.0,
+                min_value=0.0, step=10.0,
                 key="cmpl_dayrate", on_change=mark_stale,
                 help="Completion spread (frac fleet, wireline, mob). Typically 60–80% of the rig dayrate.")
             well_tangibles_MM = rc3.number_input(
-                "Tangibles ($MM/well)", value=4.0, min_value=0.0, step=0.5,
+                f"Tangibles ({cost_unit('MM')}/well)", value=4.0,
+                min_value=0.0, step=0.5,
                 key="well_tangibles", on_change=mark_stale,
                 help="Casing, tubing, tree, wellhead, line pipe.")
             well_intangibles_pct = rc4.slider(
@@ -6400,7 +6427,7 @@ def economics_section(units, start_date):
             # render has a value when the user has never touched the widget.
             if "capex_well" not in st.session_state:
                 st.session_state["capex_well"] = 15.0
-            capex_well = st.number_input("CAPEX per well ($MM)",
+            capex_well = st.number_input(f"CAPEX per well ({cost_unit('MM')})",
                                           key="capex_well", on_change=mark_stale,
                                           min_value=0.0, step=1.0,
                                           help="Spent at the well's spud date. "
@@ -6436,7 +6463,8 @@ def economics_section(units, start_date):
             "Gas tariff ($/MMBtu)", value=0.3,
             key="tariff_gas_mmbtu", on_change=mark_stale,
             help="Gas transport / processing tariff per MMBtu.")
-        aban_cost = c3.number_input("Abandonment cost ($MM)", value=80.0,
+        aban_cost = c3.number_input(f"Abandonment cost ({cost_unit('MM')})",
+                                    value=80.0,
                                     key="aban_cost", on_change=mark_stale)
 
     # ---- Economic limit / cessation timing ----
@@ -6516,6 +6544,12 @@ def economics_section(units, start_date):
     if cost_input_currency == "NOK":
         cur_col2.caption(f"1 USD = {nok_to_usd_rate:.1f} NOK — "
                          f"costs entered as NOK ÷ {nok_to_usd_rate:.1f}")
+        st.info(f"💱 **Cost inputs are in NOK.** All cost fields below "
+                f"(CAPEX, OPEX, day-rates, tangibles, facility schedule) "
+                f"are read as **MNOK / NOK** and converted to USD at "
+                f"{nok_to_usd_rate:.1f} NOK/USD for the calculation. "
+                f"Oil/gas prices stay in USD. **All results are shown in "
+                f"USD.**")
 
     # ---- Fiscal regime (Tax/Royalty / PSC / NCS) ----
     st.markdown("**Fiscal regime**")
@@ -7199,7 +7233,7 @@ def economics_section(units, start_date):
                  "weight (tonnes) and the cost rate per tonne. Set to 0 to "
                  "use the default lumped tie-in modification cost.")
         topside_mod_rate_per_tonne_kUSD = tm2.number_input(
-            "Cost rate ($k per installed tonne)", min_value=0.0,
+            f"Cost rate ({cost_unit('k')} per installed tonne)", min_value=0.0,
             value=60.0, step=5.0, key="dc_topside_rate_k",
             help="Fully-loaded $/tonne for offshore brownfield mods. "
                  "Screening default $60k/tonne; high-spec mods can run "
@@ -7213,10 +7247,12 @@ def economics_section(units, start_date):
                  "if already covered by the topside weight or installation "
                  "rows). Useful when you have a manhour estimate from a "
                  "pre-FEED study.")
+        _mh_cur = "NOK/hr" if st.session_state.get(
+            "cost_input_currency", "USD") == "NOK" else "$/hr"
         offshore_manhour_rate_usd = st.number_input(
-            "Manhour rate ($/hr)", min_value=0.0, value=220.0, step=10.0,
+            f"Manhour rate ({_mh_cur})", min_value=0.0, value=220.0, step=10.0,
             key="dc_manhour_rate",
-            help="Fully-loaded $/hr for offshore manhours (engineering + "
+            help="Fully-loaded rate per offshore manhour (engineering + "
                  "offshore execution blended). Screening default $220/hr.")
 
         st.markdown("**Artificial lift & flow assurance**")
@@ -8211,7 +8247,8 @@ def economics_section(units, start_date):
         st.session_state.fac_df, num_rows="dynamic", use_container_width=True,
         column_config={
             "date": st.column_config.DateColumn("Spend date"),
-            "amount_MMUSD": st.column_config.NumberColumn("Amount ($MM)", min_value=0.0),
+            "amount_MMUSD": st.column_config.NumberColumn(
+                f"Amount ({cost_unit('MM')})", min_value=0.0),
             "label": st.column_config.TextColumn("Description"),
         },
         key="fac_editor",
