@@ -101,6 +101,30 @@ def ulabel(kind, units):
     return UNIT_LABELS[units][kind]
 
 
+def cost_input_to_usd(value, _session=None):
+    """Convert a cost INPUT to USD for the engine. If the user is entering
+    costs in NOK (cost_input_currency == 'NOK'), divide by the NOK→USD rate;
+    otherwise pass through unchanged. Used at the point each cost widget is
+    read so the engine always works in USD and all results display in USD.
+
+    `value` may be a single number or anything float()-able; None passes
+    through.
+    """
+    import streamlit as _st
+    if value is None:
+        return None
+    cur = _st.session_state.get("cost_input_currency", "USD")
+    if cur != "NOK":
+        return value
+    rate = float(_st.session_state.get("usd_to_nok", 10.5))
+    if rate <= 0:
+        return value
+    try:
+        return float(value) / rate
+    except (TypeError, ValueError):
+        return value
+
+
 # Map of df columns → unit kind. Used for converting the engine output
 # (always field units) to the user's display units in the Data tab and
 # in Excel exports. Columns NOT listed here are passed through unchanged.
@@ -6470,6 +6494,29 @@ def economics_section(units, start_date):
                  "economies; 5-10% may be appropriate for high-inflation "
                  "environments.") / 100.0
 
+    # ---- Cost-input currency (input side — costs can be entered in NOK and
+    # the engine converts them to USD for the calculation; all RESULTS are
+    # always displayed in USD). NCS costs are typically quoted in NOK, so
+    # this lets you enter MNOK figures directly. ----
+    cur_col1, cur_col2 = st.columns([2, 1])
+    cost_input_currency = cur_col1.radio(
+        "Cost input currency", ["USD", "NOK"],
+        horizontal=True, key="cost_input_currency",
+        help="The currency you ENTER costs in (CAPEX, OPEX, day-rates, "
+             "tangibles, facility schedule). Selecting NOK lets you type "
+             "MNOK figures; the engine converts them to USD using the rate "
+             "at right before computing. All RESULTS (NPV, breakeven, etc.) "
+             "are always shown in USD.")
+    nok_to_usd_rate = cur_col2.number_input(
+        "NOK→USD rate", min_value=1.0, max_value=30.0,
+        value=float(st.session_state.get("usd_to_nok", 10.5)),
+        step=0.1, key="usd_to_nok",
+        help="NOK per 1 USD (≈10-11 recently). Cost inputs in NOK are "
+             "divided by this to get USD for the engine.")
+    if cost_input_currency == "NOK":
+        cur_col2.caption(f"1 USD = {nok_to_usd_rate:.1f} NOK — "
+                         f"costs entered as NOK ÷ {nok_to_usd_rate:.1f}")
+
     # ---- Fiscal regime (Tax/Royalty / PSC / NCS) ----
     st.markdown("**Fiscal regime**")
     regime = st.radio(
@@ -8350,17 +8397,44 @@ def economics_section(units, start_date):
     # similar estimating bias — apply the same contingency multiplier.
     aban_cost_with_cont = float(aban_cost) * _cont_mult
 
+    # ---- Cost-input currency conversion -----------------------------------
+    # If the user is entering costs in NOK, convert every COST field to USD
+    # here so the engine always computes in USD and all results display in
+    # USD. Revenue-side prices (oil/gas/NGL) and tariffs are left as-is —
+    # those are conventionally quoted in USD. The facility CAPEX schedule is
+    # converted row-by-row.
+    _c = cost_input_to_usd
+    opex_var_usd = _c(opex_var)
+    opex_fixed_usd = _c(opex_fixed)
+    capex_well_usd = _c(capex_well_with_cont)
+    aban_cost_usd = _c(aban_cost_with_cont)
+    rig_dr_usd = _c(rig_day_rate_with_cont)
+    cmpl_dr_usd = _c(cmpl_day_rate_with_cont)
+    well_tang_usd = _c(well_tangibles_with_cont)
+    fac_df_usd = fac_df_with_cont
+    try:
+        if (st.session_state.get("cost_input_currency", "USD") == "NOK"
+                and fac_df_with_cont is not None
+                and "amount_MMUSD" in fac_df_with_cont.columns):
+            fac_df_usd = fac_df_with_cont.copy()
+            _rate = float(st.session_state.get("usd_to_nok", 10.5))
+            if _rate > 0:
+                fac_df_usd["amount_MMUSD"] = (
+                    fac_df_usd["amount_MMUSD"].astype(float) / _rate)
+    except Exception:
+        fac_df_usd = fac_df_with_cont
+
     return EconInputs(
         oil_price=oil_price,        # already in $/bbl (engine-internal)
         gas_price=gas_price,        # already in $/Mscf (engine-internal)
-        opex_var=opex_var,           # already in $/bbl
-        opex_fixed=opex_fixed * 1e6,
-        capex_per_well=capex_well_with_cont,
+        opex_var=opex_var_usd,       # $/bbl (NOK→USD if cost input is NOK)
+        opex_fixed=opex_fixed_usd * 1e6,
+        capex_per_well=capex_well_usd,
         discount_rate=disc, tax_rate=tax, royalty_rate=royalty,
         tariff_oil=tariff_oil_bbl,    # will be set below from $/bbl input
         tariff_gas=tariff_gas_mmbtu * MMBTU_PER_MCF,  # $/MMBtu → $/Mscf
-        abandonment_cost_MM=aban_cost_with_cont,
-        facility_capex=CapexSchedule(df=fac_df_with_cont),
+        abandonment_cost_MM=aban_cost_usd,
+        facility_capex=CapexSchedule(df=fac_df_usd),
         co2_price=co2_price,
         co2_factor_gas_combust=co2_factor_gas_combust,
         co2_factor_flare_inefficiency=co2_factor_flare_ineff,
@@ -8381,9 +8455,9 @@ def economics_section(units, start_date):
         money_basis=money_basis_for_engine,
         inflation_rate=inflation_rate,
         well_cost_mode=well_cost_mode,
-        rig_day_rate_kUSD=rig_day_rate_with_cont,
-        completion_day_rate_kUSD=cmpl_day_rate_with_cont,
-        well_tangibles_MM=well_tangibles_with_cont,
+        rig_day_rate_kUSD=rig_dr_usd,
+        completion_day_rate_kUSD=cmpl_dr_usd,
+        well_tangibles_MM=well_tang_usd,
         well_intangibles_pct=well_intangibles_pct,
         ngl_yield_bbl_per_mmscf=ngl_yield,
         ngl_price_bbl=ngl_price,
@@ -8437,19 +8511,41 @@ def _plot_production_yearly(df, fluid, units):
             name=f"Water avg rate ({oil_label})",
             marker_color=C["water"]), secondary_y=False)
     if "gas_rate" in agg and agg["gas_rate"].max() > 0:
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Bar(
             x=years, y=[f(agg["gas_rate"].get(y, 0), "gas_rate") for y in years],
             name=f"Gas avg rate ({gas_label})",
-            mode="lines+markers", line=dict(color=C["gas"], width=2.5)),
+            marker_color=C["gas"]), secondary_y=False)
+    # Cumulative production overlay (the dashed line in corporate
+    # production-profile charts) — cumulative oil on the secondary axis.
+    if "oil_rate" in d.columns:
+        _cum_oil_year = []
+        _run = 0.0
+        for y in years:
+            _run += float(vol.get("oil_vol", {}).get(y, 0.0))
+            _cum_oil_year.append(_run)
+        fig.add_trace(go.Scatter(
+            x=years, y=_cum_oil_year, name=f"Cumulative oil ({oilv_label})",
+            mode="lines+markers", line=dict(color="#8B4513", width=2,
+                                            dash="dash")),
+            secondary_y=True)
+    if "gas_rate" in d.columns and "gas_vol" in vol:
+        _cum_gas_year = []
+        _rung = 0.0
+        for y in years:
+            _rung += float(vol.get("gas_vol", {}).get(y, 0.0))
+            _cum_gas_year.append(_rung)
+        fig.add_trace(go.Scatter(
+            x=years, y=_cum_gas_year, name=f"Cumulative gas ({gasv_label})",
+            mode="lines+markers", line=dict(color="#555", width=2,
+                                            dash="dot")),
             secondary_y=True)
     fig.update_layout(
-        title="Annual production profile (average rates)",
+        title="Annual production profile (rates + cumulative)",
         barmode="group", hovermode="x unified", height=460,
         legend=dict(orientation="h", y=-0.18),
         xaxis_title="Year")
-    fig.update_yaxes(title_text=f"Oil & water avg rate ({oil_label})",
-                     secondary_y=False, showgrid=True)
-    fig.update_yaxes(title_text=f"Gas avg rate ({gas_label})",
+    fig.update_yaxes(title_text=f"Avg rate", secondary_y=False, showgrid=True)
+    fig.update_yaxes(title_text="Cumulative production",
                      secondary_y=True, showgrid=False)
     return fh.apply_plot_template(fig)
 
@@ -10951,6 +11047,8 @@ def collect_inputs_payload() -> dict:
         "dc_manhours", "dc_gas_lift", "dc_n_gas_lift_wells",
         "dc_heating_type", "dc_heated_km", "dc_hpht_choice",
         "dc_hipps", "dc_n_hipps", "dc_mpfm", "dc_n_mpfm",
+        # Cost-input currency (input side — converts NOK costs to USD)
+        "cost_input_currency", "usd_to_nok",
     ]
     payload = {"scalar": {}, "tables": {}}
     for k in KEYS:
@@ -16089,7 +16187,129 @@ def concept_selector_section(default_start_date):
         except Exception:
             pass
         st.dataframe(df_res, use_container_width=True, hide_index=True)
-        # ---- Downloads: CSV (flat) + nested YAML + full Excel workbook ----
+
+        # ---- "Compare cases" transposed view (metrics as rows, cases as
+        # columns, grouped into sections with units) — the layout used in
+        # corporate concept-screening tools. Toggle between this and the
+        # flat table above.
+        _layout = st.radio(
+            "Results layout", ["Wide table", "Compare cases (transposed)"],
+            horizontal=True, key="concept_results_layout",
+            help="Wide table: one row per case. Compare cases: metrics as "
+                 "rows grouped by section, one column per case — the "
+                 "side-by-side concept-screening format.")
+        if _layout == "Compare cases (transposed)":
+            try:
+                _ordered = sorted(
+                    results.values(),
+                    key=lambda x: (x.get("npv_MM")
+                                    if x.get("npv_MM") is not None
+                                    else -9e18),
+                    reverse=True)
+                # Column header per case: "Dimension: Option"
+                def _case_col(r):
+                    d = r.get("dim", ""); l = r.get("label", "")
+                    return f"{d}: {l}" if d else (l or r.get("name", "case"))
+                col_names = []
+                seen = {}
+                for r in _ordered:
+                    c = _case_col(r)
+                    if c in seen:
+                        seen[c] += 1; c = f"{c} ({seen[c]})"
+                    else:
+                        seen[c] = 1
+                    col_names.append(c)
+
+                # (section, metric label, value-fn → (number, unit))
+                def _fmt(v, unit, dp=0):
+                    if v is None:
+                        return "—"
+                    if dp == 0:
+                        return f"{v:,.0f} {unit}".strip()
+                    return f"{v:,.{dp}f} {unit}".strip()
+
+                # Unit labels follow each case's own unit system.
+                def _vol_units(r):
+                    return (r.get("cum_oil_unit", "MMstb"),
+                            r.get("cum_gas_unit", "Bscf"),
+                            r.get("peak_rate_unit", "stb/d"))
+
+                spec = [
+                    ("Economic KPIs", "NPV after-tax",
+                     lambda r: _fmt(r.get("npv_MM"), "$MM")),
+                    ("Economic KPIs", "NPV pre-tax",
+                     lambda r: _fmt(r.get("npv_pretax_MM"), "$MM")),
+                    ("Economic KPIs", "IRR",
+                     lambda r: (f"{r['irr']:.1%}"
+                                if r.get("irr") is not None else "—")),
+                    ("Economic KPIs", "Payback",
+                     lambda r: (f"{r['payback_yrs']:.1f} yrs"
+                                if r.get("payback_yrs") is not None else "—")),
+                    ("Economic KPIs", "Breakeven oil",
+                     lambda r: _fmt(r.get("breakeven_oil"), "$/bbl", 1)),
+                    ("Volumes", "Recoverable resources",
+                     lambda r: _fmt(r.get("resources_mmboe"), "MMboe", 1)),
+                    ("Volumes", "Cumulative oil/condensate",
+                     lambda r: _fmt(r.get("cum_oil_disp",
+                                          r.get("cum_oil_MMstb")),
+                                    _vol_units(r)[0], 2)),
+                    ("Volumes", "Cumulative gas",
+                     lambda r: _fmt(r.get("cum_gas_disp",
+                                          r.get("cum_gas_Bscf")),
+                                    _vol_units(r)[1], 2)),
+                    ("Volumes", "Peak rate",
+                     lambda r: _fmt(r.get("peak_primary_rate"),
+                                    _vol_units(r)[2], 0)),
+                    ("Volumes", "Final recovery factor",
+                     lambda r: (f"{r['final_rf']:.1%}"
+                                if r.get("final_rf") is not None else "—")),
+                    ("Investment cost", "Total CAPEX",
+                     lambda r: _fmt(r.get("capex_total_MM"), "$MM")),
+                    ("Investment cost", "  Wells",
+                     lambda r: _fmt(r.get("capex_well_MM"), "$MM")),
+                    ("Investment cost", "  Facilities",
+                     lambda r: _fmt(r.get("capex_facility_MM"), "$MM")),
+                    ("Investment cost", "  Abandonment",
+                     lambda r: _fmt(r.get("capex_abandonment_MM"), "$MM")),
+                    ("Cost", "Revenue (gross)",
+                     lambda r: _fmt(r.get("revenue_MM"), "$MM")),
+                    ("Cost", "OPEX",
+                     lambda r: _fmt(r.get("opex_MM"), "$MM")),
+                    ("Cost", "Tax",
+                     lambda r: _fmt(r.get("tax_MM"), "$MM")),
+                    ("CO₂", "CO₂ cost",
+                     lambda r: _fmt(r.get("co2_cost_MM"), "$MM")),
+                    ("CO₂", "CO₂ emissions total",
+                     lambda r: _fmt(r.get("co2_total_Mt"), "Mt", 2)),
+                ]
+                comp_rows = []
+                last_section = None
+                for section, metric, fn in spec:
+                    rowd = {"Section": section, "Metric": metric}
+                    for cn, r in zip(col_names, _ordered):
+                        rowd[cn] = fn(r)
+                    comp_rows.append(rowd)
+                comp_df = pd.DataFrame(comp_rows)
+                # Show grouped by section with a subheader each
+                for section in ["Economic KPIs", "Volumes",
+                                "Investment cost", "Cost", "CO₂"]:
+                    sub = comp_df[comp_df["Section"] == section].drop(
+                        columns=["Section"])
+                    if len(sub) == 0:
+                        continue
+                    st.markdown(f"**{section}**")
+                    st.dataframe(sub, use_container_width=True,
+                                 hide_index=True)
+                # Offer the transposed matrix as its own CSV
+                _tcsv = comp_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "📥 Download compare-cases matrix (CSV)",
+                    data=_tcsv,
+                    file_name="concept_compare_cases.csv",
+                    mime="text/csv")
+            except Exception as _te:
+                st.warning(f"Compare-cases view unavailable: {_te}")
+
         dl1, dl2, dl3, dl4 = st.columns(4)
         csv = df_res.to_csv(index=False).encode("utf-8")
         dl1.download_button(
