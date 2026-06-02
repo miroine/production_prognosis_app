@@ -3652,6 +3652,9 @@ def stea_investment_category(label: str) -> str:
     # umbilicals, risers, controls, boosting, metering, PLEM, jumpers)
     # — everything else in the subsea scope.
     return "Subsea production system"
+
+
+def build_well_completion_svg(spec: dict) -> str:
     """Equinor-style well + completion cross-section schematic.
 
     Draws a subsea well from sea surface through the mudline to TD with a

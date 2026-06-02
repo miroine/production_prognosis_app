@@ -4930,10 +4930,13 @@ def well_section(units, fluid, start_date):
                       "as a caption below the table. "
                       "1 psi/ft ≈ 0.2262 bar/m.")),
             "friction_psi_per_kbpd": st.column_config.NumberColumn(
-                "Friction [psi/kbpd]",
+                "Friction [psi/kbpd]" if units == "field"
+                else "Friction [bar/(k Sm³/d)]",
                 min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
-                help=("Linear friction proxy (psi per 1000 bbl/d, kept in field "
-                      "convention regardless of unit system). Higher tubing ID "
+                help=("Linear friction proxy. In field units this is psi per "
+                      "1000 bbl/d; the metric label is bar per 1000 Sm³/d for "
+                      "reference, but the stored value is the same field-"
+                      "convention number the engine uses. Higher tubing ID "
                       "and lower viscosity reduce this. Typical 2-10 for oil "
                       "wells, 5-20 for high-rate gas wells.")),
         },
@@ -6369,11 +6372,15 @@ def economics_section(units, start_date):
             "(so at oil = $75/bbl, expect NGL $22–45/bbl)."
         )
         ngl1, ngl2, ngl3, ngl4 = st.columns(4)
+        _ngl_unit = ("bbl/MMscf" if units == "field"
+                     else "Sm³/kSm³")
         ngl_yield = ngl1.number_input(
-            "NGL yield (bbl/MMscf)", value=0.0, min_value=0.0, step=5.0,
+            f"NGL yield ({_ngl_unit})", value=0.0, min_value=0.0, step=5.0,
             key="ngl_yield", on_change=mark_stale,
-            help="Volume of NGL recovered per MMscf of gross gas processed. "
-                 "Always bbl/MMscf regardless of unit system."
+            help="Volume of NGL recovered per unit of gross gas processed. "
+                 "Entered in bbl per MMscf (field) — the metric label shown "
+                 "is Sm³ NGL per kSm³ gas for reference; 1 bbl/MMscf ≈ 5.6 "
+                 "Sm³/MSm³. The engine value is the same yield number."
         )
         ngl_price = ngl2.number_input(
             "NGL price ($/bbl)", value=25.0, min_value=0.0, step=1.0,
@@ -10539,13 +10546,40 @@ def main():
                  if be.get("oil_price") is not None else "—")
         _pb_s = f"{payback/12:.1f} yrs" if payback is not None else "—"
         _tax_take = _npv_pretax - _npv_at
+        # Production split (display units) + field cut-off year.
+        _oil_disp = from_field(_cum_oil, "oil_vol", units)
+        _gas_disp = from_field(_cum_gas, "gas_vol", units)
+        _ngl_disp = from_field(_ngl_mmbbl, "oil_vol", units)
+        _oilvol_u = ulabel("oil_vol", units)
+        _gasvol_u = ulabel("gas_vol", units)
+        _is_cond = fluid and "ondensate" in str(fluid)
+        _liquid_label = "Cumulative condensate" if _is_cond \
+            else "Cumulative oil"
+        # Cut-off / cessation year — last month with positive total production.
+        _cutoff_year = "—"
+        try:
+            _prod_cols = [c for c in ("oil_rate", "gas_rate", "primary_rate")
+                          if c in df.columns]
+            if _prod_cols and "date" in df.columns:
+                _tot = sum(df[c].fillna(0) for c in _prod_cols)
+                _live = df.loc[_tot > 1e-9, "date"]
+                if len(_live) > 0:
+                    _cutoff_year = str(pd.to_datetime(_live.iloc[-1]).year)
+        except Exception:
+            _cutoff_year = "—"
+
         summary_tbl = pd.DataFrame({
             "Metric": [
                 "NPV after-tax", "NPV pre-tax", "Fiscal take (NPV)",
                 "IRR", "Payback", "Breakeven oil",
                 "Total CAPEX (undisc.)",
                 "  ↳ Wells", "  ↳ Facilities", "  ↳ Abandonment",
-                "Recoverable resources", "Final recovery factor",
+                "Recoverable resources (total)",
+                f"  ↳ {_liquid_label}",
+                "  ↳ Cumulative gas",
+                "  ↳ Cumulative NGL",
+                "Final recovery factor",
+                "Field cut-off year",
             ],
             "Value": [
                 f"${_npv_at:,.0f} MM",
@@ -10559,7 +10593,12 @@ def main():
                 f"${_capex_fac:,.0f} MM",
                 f"${_capex_aban:,.0f} MM",
                 f"{_boe:,.1f} MMboe",
+                f"{_oil_disp:,.2f} {_oilvol_u}",
+                f"{_gas_disp:,.2f} {_gasvol_u}",
+                (f"{_ngl_disp:,.2f} {_oilvol_u}"
+                 if _ngl_mmbbl > 0 else "—"),
                 f"{final_rf:.1%}",
+                _cutoff_year,
             ],
         })
         with st.expander("📊 Summary KPI table (full figures)",
