@@ -3409,6 +3409,81 @@ _SUBSEA_WELL_COST_BENCHMARKS = [
      "UKCS subsea well — typically a little higher than NCS."),
 ]
 
+# =============================================================================
+# Named NCS / UKCS peer projects for the benchmarking cross-plots
+# =============================================================================
+# Screening-level reference points for the Drilling & Well and Subsea/SURF
+# benchmark cross-plots (modelled on Equinor-style DG3 benchmark slides).
+#
+# UNITS (must stay consistent across the app and all exports):
+#   well_cost_MNOK     : average well cost            [MNOK] (millions of NOK)
+#   days_per_well      : drilling+completion duration [days/well]
+#   meters_per_well    : measured depth drilled       [m/well]
+#   dw_capex_usd_boe   : total D&W CAPEX per barrel    [USD/boe]
+#   reserves_mmboe     : recoverable reserves          [MMboe]
+#   umb_unit_kNOK_m    : umbilical unit cost           [kNOK/m]
+#   umb_length_m       : total umbilical length        [m]
+#   subsea_fac_kNOK_well: subsea facility unit cost excl WoS [kNOK/well]
+#   n_wells            : number of subsea wells         [-]
+#   pipe_unit_kNOK_m   : infield pipeline unit cost     [kNOK/m]
+#   pipe_length_m      : infield pipeline length        [m]
+#
+# These are rounded, public-domain-style screening anchors compiled to give a
+# realistic peer cloud — NOT project-specific disclosed figures. They exist so
+# a user can see roughly where a concept sits among comparable NCS/UKCS
+# developments. The user can filter any point in or out in the UI.
+_PEER_PROJECTS = [
+    # name,            region, well_cost_MNOK, days_per_well, meters_per_well,
+    #                  dw_capex_usd_boe, reserves_mmboe,
+    #                  umb_unit_kNOK_m, umb_length_m,
+    #                  subsea_fac_kNOK_well, n_wells,
+    #                  pipe_unit_kNOK_m, pipe_length_m
+    ("Wisting RS",        "NCS",  520,  42,  3200,  2.1,  440,
+        18,  9000,  1500, 8,  90,  12000),
+    ("TWIN",              "NCS",  600,  48,  3600,  1.9,  520,
+        22,  8000,  1750, 6,  110, 9000),
+    ("Hedrun Extension",  "NCS",  640,  52,  3900,  3.0,  210,
+        28,  6500,  1850, 4,  120, 7000),
+    ("Heidrun Extension", "NCS",  650,  53,  4000,  3.1,  200,
+        28,  6300,  1900, 4,  120, 6800),
+    ("J.Sverdrup Ph.3",   "NCS",  720,  58,  4300,  1.4,  900,
+        30,  18000, 1400, 12, 70,  22000),
+    ("Fram Sør",          "NCS",  760,  60,  4500,  2.7,  240,
+        32,  6000,  1950, 4,  130, 6500),
+    ("Grane Energy",      "NCS",  430,  38,  2900,  2.4,  300,
+        24,  20000, 1600, 7,  150, 18000),
+    ("RVV_Grosbeak",      "NCS",  640,  55,  4100,  2.8,  230,
+        45,  5000,  2000, 5,  140, 5500),
+    ("Linnorm",           "NCS",  900,  72,  5200, -0.1,  300,
+        40,  12000, 1300, 6,  100, 14000),
+    ("Njord NHA",         "NCS", 1180,  92,  6400, -0.2,  150,
+        85,  500,   1200, 6,  100, 5000),
+    ("Kristin Sør DG3",   "NCS", 1050,  80,  6000,  1.6,  340,
+        20,  31000, 1350, 5,  140, 50000),
+    ("Snøhvit (Albatross)","NCS", 880,  70,  5000,  1.7,  280,
+        35,  10000, 1500, 5,  120, 11000),
+    # UKCS analogs
+    ("Glengorm (UKCS)",   "UKCS", 980,  78,  5500,  2.9,  220,
+        50,  7000,  1700, 5,  150, 8000),
+    ("Cambo (UKCS)",      "UKCS", 1100, 88,  6200,  3.4,  170,
+        60,  9000,  1600, 6,  140, 10000),
+    ("Rosebank (UKCS)",   "UKCS", 1200, 95,  6600,  3.0,  300,
+        70,  15000, 1450, 8,  130, 18000),
+]
+_PEER_FIELDS = (
+    "name", "region", "well_cost_MNOK", "days_per_well", "meters_per_well",
+    "dw_capex_usd_boe", "reserves_mmboe", "umb_unit_kNOK_m", "umb_length_m",
+    "subsea_fac_kNOK_well", "n_wells", "pipe_unit_kNOK_m", "pipe_length_m",
+)
+
+
+def peer_projects_df():
+    """Return the NCS/UKCS peer-project reference set as a DataFrame, one row
+    per project, columns per _PEER_FIELDS. Units are documented on
+    _PEER_PROJECTS. Screening-level anchors for benchmarking cross-plots."""
+    import pandas as _pd
+    return _pd.DataFrame(_PEER_PROJECTS, columns=_PEER_FIELDS)
+
 
 def benchmark_concept_cost(grand_total_MMUSD: float,
                             reserves_mmboe: float,

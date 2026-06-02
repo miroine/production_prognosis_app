@@ -6526,10 +6526,77 @@ def economics_section(units, start_date):
     # the engine converts them to USD for the calculation; all RESULTS are
     # always displayed in USD). NCS costs are typically quoted in NOK, so
     # this lets you enter MNOK figures directly. ----
+    # When the user flips the currency we rescale the EXISTING cost values in
+    # session_state by the FX rate, so a "$20MM" fixed-OPEX default becomes
+    # "210 MNOK" (not a bare 20 that would silently mean ~$1.9MM). Scalar cost
+    # widgets and the facility-schedule amounts are converted together.
+    _COST_SCALAR_KEYS = ["opex_fixed", "opex_var_oil", "opex_var_gas",
+                         "capex_well", "aban_cost", "rig_dayrate",
+                         "cmpl_dayrate", "well_tangibles",
+                         "dc_topside_rate_k", "dc_manhour_rate"]
+
+    def _rescale_costs(factor):
+        """Multiply all cost scalar widgets + facility schedule by `factor`."""
+        if factor == 1.0:
+            return
+        for k in _COST_SCALAR_KEYS:
+            if k in st.session_state and st.session_state[k] is not None:
+                try:
+                    st.session_state[k] = round(
+                        float(st.session_state[k]) * factor, 4)
+                except (TypeError, ValueError):
+                    pass
+        try:
+            _f = st.session_state.get("fac_df")
+            if _f is not None and "amount_MMUSD" in _f.columns:
+                _f = _f.copy()
+                _f["amount_MMUSD"] = (
+                    _f["amount_MMUSD"].astype(float) * factor).round(4)
+                st.session_state["fac_df"] = _f
+        except Exception:
+            pass
+
+    def _on_currency_switch():
+        prev = st.session_state.get("_cost_currency_prev", "USD")
+        now = st.session_state.get("cost_input_currency", "USD")
+        if prev == now:
+            return
+        rate = float(st.session_state.get("usd_to_nok", 10.5))
+        if rate <= 0:
+            st.session_state["_cost_currency_prev"] = now
+            return
+        # USD→NOK multiplies by rate; NOK→USD divides.
+        factor = rate if (prev == "USD" and now == "NOK") else (
+            1.0 / rate if (prev == "NOK" and now == "USD") else 1.0)
+        _rescale_costs(factor)
+        st.session_state["_cost_currency_prev"] = now
+        # Keep the rate tracker in sync so a switch isn't double-counted as a
+        # rate change.
+        st.session_state["_cost_rate_prev"] = rate
+        mark_stale()
+
+    def _on_rate_change():
+        # Behaviour on FX-rate change is controlled by the toggle below.
+        # "Hold USD" → rescale the NOK figures so the real USD cost stays
+        # constant at the new rate (good after seeding USD-equivalent
+        # defaults). "Hold NOK" → leave the typed NOK numbers as-is; only
+        # their USD equivalent changes (good once you've entered real NOK
+        # quotes).
+        new_rate = float(st.session_state.get("usd_to_nok", 10.5))
+        old_rate = float(st.session_state.get("_cost_rate_prev", new_rate))
+        st.session_state["_cost_rate_prev"] = new_rate
+        mode = st.session_state.get("_rate_change_mode", "Hold USD value")
+        if (mode == "Hold USD value"
+                and st.session_state.get("cost_input_currency", "USD") == "NOK"
+                and old_rate > 0 and new_rate > 0 and new_rate != old_rate):
+            _rescale_costs(new_rate / old_rate)
+        mark_stale()
+
     cur_col1, cur_col2 = st.columns([2, 1])
     cost_input_currency = cur_col1.radio(
         "Cost input currency", ["USD", "NOK"],
         horizontal=True, key="cost_input_currency",
+        on_change=_on_currency_switch,
         help="The currency you ENTER costs in (CAPEX, OPEX, day-rates, "
              "tangibles, facility schedule). Selecting NOK lets you type "
              "MNOK figures; the engine converts them to USD using the rate "
@@ -6538,10 +6605,22 @@ def economics_section(units, start_date):
     nok_to_usd_rate = cur_col2.number_input(
         "NOK→USD rate", min_value=1.0, max_value=30.0,
         value=float(st.session_state.get("usd_to_nok", 10.5)),
-        step=0.1, key="usd_to_nok",
+        step=0.1, key="usd_to_nok", on_change=_on_rate_change,
         help="NOK per 1 USD (≈10-11 recently). Cost inputs in NOK are "
-             "divided by this to get USD for the engine.")
+             "divided by this to get USD for the engine. Changing this while "
+             "in NOK mode rescales your entered NOK costs to the new rate.")
     if cost_input_currency == "NOK":
+        st.session_state.setdefault("_rate_change_mode", "Hold USD value")
+        cur_col2.radio(
+            "On rate change",
+            ["Hold USD value", "Hold NOK value"],
+            key="_rate_change_mode", horizontal=False,
+            help="**Hold USD value**: when you change the rate, your NOK "
+                 "figures are rescaled so the real USD cost (and the "
+                 "USD-equivalent defaults) stay constant. **Hold NOK "
+                 "value**: your typed NOK numbers stay fixed; only their USD "
+                 "equivalent changes. Use Hold NOK once you've entered real "
+                 "NOK quotes.")
         cur_col2.caption(f"1 USD = {nok_to_usd_rate:.1f} NOK — "
                          f"costs entered as NOK ÷ {nok_to_usd_rate:.1f}")
         st.info(f"💱 **Cost inputs are in NOK.** All cost fields below "
@@ -6550,6 +6629,9 @@ def economics_section(units, start_date):
                 f"{nok_to_usd_rate:.1f} NOK/USD for the calculation. "
                 f"Oil/gas prices stay in USD. **All results are shown in "
                 f"USD.**")
+    # Track current currency so the next flip can rescale existing values.
+    st.session_state.setdefault("_cost_currency_prev", cost_input_currency)
+    st.session_state.setdefault("_cost_rate_prev", float(nok_to_usd_rate))
 
     # ---- Fiscal regime (Tax/Royalty / PSC / NCS) ----
     st.markdown("**Fiscal regime**")
@@ -6731,6 +6813,22 @@ def economics_section(units, start_date):
             help="Pipes carrying fluids from the seabed up to a floating or "
                  "fixed host. Subsea production needs risers; dry-tree wells "
                  "do not.")
+        # Drilling metrics used for the NCS/UKCS benchmark cross-plots
+        # (well cost vs days, vs meters). These don't change the CAPEX
+        # estimate — they only place the project on the benchmark scatters.
+        wsd1, wsd2 = st.columns(2)
+        _ = wsd1.number_input(
+            "Days per well (for benchmarking)", min_value=1.0,
+            value=60.0, step=1.0, key="dc_days_per_well",
+            help="Average drilling + completion duration per well, in days. "
+                 "Used to plot this project on the 'well cost vs days' and "
+                 "'days vs meters' benchmark cross-plots. Does not affect the "
+                 "cost estimate itself.")
+        _ = wsd2.number_input(
+            "Meters drilled per well (for benchmarking)", min_value=0.0,
+            value=4200.0, step=100.0, key="dc_meters_per_well",
+            help="Average measured depth drilled per well, in metres. Used "
+                 "for the benchmark cross-plots only.")
         # Template type — sets slot capacity and per-template cost.
         tt1, tt2 = st.columns(2)
         template_type = tt1.selectbox(
@@ -7710,48 +7808,67 @@ def economics_section(units, start_date):
                     host_type=host_type or "",
                     n_subsea_wells=n_subsea_wells)
             if bench is not None:
+                _nokc = (st.session_state.get("cost_input_currency", "USD")
+                         == "NOK")
+                _cfac = (float(st.session_state.get("usd_to_nok", 10.5))
+                         if _nokc else 1.0)
+                _csym = "NOK" if _nokc else "$"
                 st.caption(
                     f"Matched benchmark class: **{bench['concept_class']}**. "
                     f"Your concept: "
-                    f"**${bench['capex_per_boe']:.1f}/boe**"
+                    f"**{_csym}{bench['capex_per_boe'] * _cfac:.1f}/boe**"
                     if bench['capex_per_boe'] is not None
                     else "Enter a reserves figure above to compute $/boe.")
 
             if bench is not None and bench["rows"] \
                     and bench["capex_per_boe"] is not None:
+                # Currency factor for the benchmark comparison: the reference
+                # bands and the concept value are in $/boe; when the user is
+                # working in NOK, convert everything to NOK/boe so the
+                # comparison is consistent with their cost inputs.
+                _nok = (st.session_state.get("cost_input_currency", "USD")
+                        == "NOK")
+                _bfac = (float(st.session_state.get("usd_to_nok", 10.5))
+                         if _nok else 1.0)
+                _bsym = "NOK" if _nok else "$"
+                _bunit = "NOK/boe" if _nok else "$/boe"
                 # Bar chart: benchmark low/mid/high bands + the user's value,
                 # per region.
                 fig_bm = go.Figure()
                 regions = [r["region"] for r in bench["rows"]]
-                lows = [r["low"] for r in bench["rows"]]
-                mids = [r["mid"] for r in bench["rows"]]
-                highs = [r["high"] for r in bench["rows"]]
+                lows = [r["low"] * _bfac for r in bench["rows"]]
+                mids = [r["mid"] * _bfac for r in bench["rows"]]
+                highs = [r["high"] * _bfac for r in bench["rows"]]
+                _conc = bench["capex_per_boe"] * _bfac
                 # low-to-high range bar
                 fig_bm.add_trace(go.Bar(
                     x=regions, y=[h - l for h, l in zip(highs, lows)],
                     base=lows, name="Typical range",
                     marker_color="#bcd4e6",
-                    hovertemplate="%{x}: $%{base:.0f}-$%{customdata:.0f}/boe"
-                                   "<extra></extra>",
+                    hovertemplate=(f"%{{x}}: {_bsym}%{{base:.0f}}-"
+                                   f"{_bsym}%{{customdata:.0f}}/boe"
+                                   "<extra></extra>"),
                     customdata=highs))
                 # mid markers
                 fig_bm.add_trace(go.Scatter(
                     x=regions, y=mids, mode="markers", name="Benchmark mid",
                     marker=dict(symbol="line-ew", size=26, color="#2a6f97",
                                 line=dict(width=3, color="#2a6f97")),
-                    hovertemplate="%{x} mid: $%{y:.0f}/boe<extra></extra>"))
+                    hovertemplate=(f"%{{x}} mid: {_bsym}%{{y:.0f}}/boe"
+                                   "<extra></extra>")))
                 # the user's concept
                 fig_bm.add_trace(go.Scatter(
-                    x=regions, y=[bench["capex_per_boe"]] * len(regions),
+                    x=regions, y=[_conc] * len(regions),
                     mode="markers+text", name="This concept",
                     marker=dict(symbol="diamond", size=15, color="#d62828"),
-                    text=[f"${bench['capex_per_boe']:.0f}"] * len(regions),
+                    text=[f"{_bsym}{_conc:.0f}"] * len(regions),
                     textposition="top center",
-                    hovertemplate="This concept: $%{y:.1f}/boe<extra></extra>"))
+                    hovertemplate=(f"This concept: {_bsym}%{{y:.1f}}/boe"
+                                   "<extra></extra>")))
                 fig_bm.update_layout(
                     title=f"Development CAPEX intensity vs NCS / UKCS — "
                           f"{bench['concept_class']}",
-                    yaxis_title="CAPEX per boe ($/boe)",
+                    yaxis_title=f"CAPEX per boe ({_bunit})",
                     height=380, barmode="overlay",
                     margin=dict(t=60, b=30, l=10, r=10),
                     legend=dict(orientation="h", y=-0.15))
@@ -7766,14 +7883,20 @@ def economics_section(units, start_date):
             # Per-subsea-well benchmark
             if bench is not None and bench["well_rows"] \
                     and bench["well_share_MM"] is not None:
-                with st.expander("CAPEX per subsea well vs NCS / UKCS",
+                _nokw = (st.session_state.get("cost_input_currency", "USD")
+                         == "NOK")
+                _wfac = (float(st.session_state.get("usd_to_nok", 10.5))
+                         if _nokw else 1.0)
+                _wu = "MNOK" if _nokw else "$MM"
+                with st.expander(f"CAPEX per subsea well vs NCS / UKCS",
                                  expanded=False):
                     wb_df = pd.DataFrame([
                         {"Region": r["region"],
-                         "Typical low ($MM)": r["low"],
-                         "Typical mid ($MM)": r["mid"],
-                         "Typical high ($MM)": r["high"],
-                         "This concept ($MM)": round(bench["well_share_MM"], 1),
+                         f"Typical low ({_wu})": round(r["low"] * _wfac, 1),
+                         f"Typical mid ({_wu})": round(r["mid"] * _wfac, 1),
+                         f"Typical high ({_wu})": round(r["high"] * _wfac, 1),
+                         f"This concept ({_wu})": round(
+                             bench["well_share_MM"] * _wfac, 1),
                          "Verdict": r["verdict"]}
                         for r in bench["well_rows"]])
                     st.dataframe(wb_df, use_container_width=True,
@@ -7793,6 +7916,170 @@ def economics_section(units, start_date):
                     "project disclosures. Real project costs vary widely — "
                     "use these to check order of magnitude, not as a "
                     "class-3 estimate.")
+
+            # ---- NCS / UKCS benchmarking cross-plots ---------------------
+            # Equinor-style DG3 benchmark scatter plots: the user's project
+            # against a named NCS/UKCS peer cloud, with in/out filtering.
+            with st.expander("📊 NCS / UKCS benchmarking cross-plots",
+                             expanded=False):
+                try:
+                    peers = fh.peer_projects_df()
+                    # Region filter
+                    regions_avail = sorted(peers["region"].unique())
+                    sel_regions = st.multiselect(
+                        "Peer regions", regions_avail, default=regions_avail,
+                        key="bm_regions",
+                        help="Include NCS and/or UKCS analogs.")
+                    peers_r = peers[peers["region"].isin(sel_regions)]
+                    # Per-project in/out filter
+                    all_names = list(peers_r["name"])
+                    kept = st.multiselect(
+                        "Peer projects to include", all_names,
+                        default=all_names, key="bm_keep_projects",
+                        help="Filter individual peer projects in or out of "
+                             "every cross-plot below (e.g. drop a project "
+                             "that isn't a true analog).")
+                    pf = peers_r[peers_r["name"].isin(kept)].copy()
+
+                    # --- The user's own project points ---
+                    # Average well cost (MNOK) from the concept day-rates /
+                    # tangibles if available, else from CAPEX-per-well.
+                    _rate = float(st.session_state.get("usd_to_nok", 10.5))
+                    _np_prod = int(st.session_state.get("dc_n_subsea_wells",
+                                   n_subsea_wells) or 0) or max(
+                                   int(n_subsea_wells or 1), 1)
+                    # well cost in MNOK: prefer the engine's per-well figure
+                    _well_usd_mm = None
+                    try:
+                        _wb = concept.get("well_cost_breakdown") or []
+                        if _wb:
+                            _well_usd_mm = float(np.mean(
+                                [w.get("cost_MM", 0) for w in _wb]))
+                    except Exception:
+                        _well_usd_mm = None
+                    if not _well_usd_mm:
+                        _well_usd_mm = float(
+                            st.session_state.get("capex_well", 120.0) or 120.0)
+                    _mine_well_MNOK = _well_usd_mm * _rate
+                    _mine_days = float(st.session_state.get(
+                        "dc_days_per_well", 60.0) or 60.0)
+                    _mine_meters = float(st.session_state.get(
+                        "dc_meters_per_well", 4200.0) or 4200.0)
+
+                    def _scatter(xcol, ycol, xlabel, ylabel, title,
+                                  mine_x=None, mine_y=None, logfit=False):
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=pf[xcol], y=pf[ycol], mode="markers+text",
+                            text=pf["name"], textposition="top center",
+                            textfont=dict(size=9),
+                            marker=dict(size=9, color="#2a6f97"),
+                            name="NCS/UKCS peers",
+                            hovertemplate="%{text}<br>"+xlabel+": %{x:,.0f}<br>"
+                                          +ylabel+": %{y:,.0f}<extra></extra>"))
+                        # trend line (linear, or power for the WoS curve)
+                        try:
+                            import numpy as _n2
+                            _x = pf[xcol].astype(float).values
+                            _y = pf[ycol].astype(float).values
+                            _ok = _n2.isfinite(_x) & _n2.isfinite(_y) & (_x > 0)
+                            if _ok.sum() >= 3:
+                                if logfit:
+                                    _b, _a = _n2.polyfit(
+                                        _n2.log(_x[_ok]), _y[_ok], 1)
+                                    _xs = _n2.linspace(_x[_ok].min(),
+                                                       _x[_ok].max(), 50)
+                                    _ys = _a + _b * _n2.log(_xs)
+                                else:
+                                    _b, _a = _n2.polyfit(_x[_ok], _y[_ok], 1)
+                                    _xs = _n2.linspace(_x[_ok].min(),
+                                                       _x[_ok].max(), 50)
+                                    _ys = _a + _b * _xs
+                                fig.add_trace(go.Scatter(
+                                    x=_xs, y=_ys, mode="lines",
+                                    line=dict(dash="dash", color="#888"),
+                                    name="Peer trend"))
+                        except Exception:
+                            pass
+                        if mine_x is not None and mine_y is not None:
+                            fig.add_trace(go.Scatter(
+                                x=[mine_x], y=[mine_y], mode="markers+text",
+                                text=["This project"], textposition="bottom center",
+                                marker=dict(symbol="diamond", size=16,
+                                            color="#d62828"),
+                                name="This project",
+                                hovertemplate="This project<br>"+xlabel+
+                                    ": %{x:,.0f}<br>"+ylabel+
+                                    ": %{y:,.0f}<extra></extra>"))
+                        fig.update_layout(
+                            title=title, xaxis_title=xlabel, yaxis_title=ylabel,
+                            height=360, margin=dict(t=50, b=40, l=10, r=10),
+                            legend=dict(orientation="h", y=-0.25))
+                        return fh.apply_plot_template(fig)
+
+                    st.caption("Units: well cost **MNOK**, days **per well**, "
+                               "depth **m/well**, D&W intensity **USD/boe**, "
+                               "umbilical & pipeline unit cost **kNOK/m**, "
+                               "subsea facility **kNOK/well**.")
+                    cpa, cpb = st.columns(2)
+                    with cpa:
+                        st.plotly_chart(_scatter(
+                            "days_per_well", "well_cost_MNOK",
+                            "Days per well", "Well cost (MNOK)",
+                            "Well cost vs days per well",
+                            _mine_days, _mine_well_MNOK),
+                            use_container_width=True)
+                        st.plotly_chart(_scatter(
+                            "meters_per_well", "well_cost_MNOK",
+                            "Meters drilled / well", "Well cost (MNOK)",
+                            "Well cost vs meters drilled",
+                            _mine_meters, _mine_well_MNOK),
+                            use_container_width=True)
+                    with cpb:
+                        st.plotly_chart(_scatter(
+                            "meters_per_well", "days_per_well",
+                            "Meters drilled / well", "Days per well",
+                            "Days per well vs meters drilled",
+                            _mine_meters, _mine_days),
+                            use_container_width=True)
+                        st.plotly_chart(_scatter(
+                            "n_wells", "subsea_fac_kNOK_well",
+                            "Number of wells",
+                            "Subsea facility unit cost (kNOK/well)",
+                            "Subsea facility unit cost vs number of wells",
+                            _np_prod, None, logfit=True),
+                            use_container_width=True)
+                    cpc, cpd = st.columns(2)
+                    with cpc:
+                        st.plotly_chart(_scatter(
+                            "umb_length_m", "umb_unit_kNOK_m",
+                            "Total umbilical length (m)",
+                            "Umbilical unit cost (kNOK/m)",
+                            "Umbilical unit cost vs length"),
+                            use_container_width=True)
+                    with cpd:
+                        st.plotly_chart(_scatter(
+                            "pipe_length_m", "pipe_unit_kNOK_m",
+                            "Infield pipeline length (m)",
+                            "Infield pipeline unit cost (kNOK/m)",
+                            "Infield pipeline unit cost vs length"),
+                            use_container_width=True)
+                    st.caption(
+                        "Peer points are screening-level NCS/UKCS anchors "
+                        "(public-domain style, not disclosed project figures). "
+                        "Your project's well cost is shown in MNOK at the "
+                        f"current rate ({_rate:.1f} NOK/USD). Use the filters "
+                        "above to drop non-analog projects.")
+                    # Export the (filtered) peer table + this project's points
+                    _exp = pf.copy()
+                    _bm_csv = _exp.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "📥 Download benchmark peer data (CSV)",
+                        data=_bm_csv,
+                        file_name="ncs_ukcs_benchmark_peers.csv",
+                        mime="text/csv", key="bm_peer_dl")
+                except Exception as _bme:
+                    st.info(f"Benchmark cross-plots unavailable: {_bme}")
 
             if st.button("⚙️ Generate CAPEX schedule from this concept",
                           key="dc_generate", type="primary"):
@@ -11084,6 +11371,7 @@ def collect_inputs_payload() -> dict:
         "dc_manhours", "dc_gas_lift", "dc_n_gas_lift_wells",
         "dc_heating_type", "dc_heated_km", "dc_hpht_choice",
         "dc_hipps", "dc_n_hipps", "dc_mpfm", "dc_n_mpfm",
+        "dc_days_per_well", "dc_meters_per_well",
         # Cost-input currency (input side — converts NOK costs to USD)
         "cost_input_currency", "usd_to_nok",
     ]
