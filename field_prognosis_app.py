@@ -2195,6 +2195,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     # rig's first well spud; move-out at the last well's end; maintenance is
     # spread across the rig's active months. All use the rig day rate.
     rig_meta = getattr(econ, "rig_meta", None) or {}
+    rig_mob = np.zeros(len(df))   # tracked separately for STEA reporting
     if rig_meta:
         # Group wells by rig to find first-spud and last-end per rig
         from collections import defaultdict
@@ -2218,11 +2219,13 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                 idx_arr = df.index[df["date"] >= first_spud - pd.Timedelta(days=mi_days)]
                 if len(idx_arr) > 0:
                     capex_fac[idx_arr[0]] += mi_days * day_rate
+                    rig_mob[idx_arr[0]] += mi_days * day_rate
             # Move-out cost — booked at last well end
             if mo_days > 0:
                 idx_arr = df.index[df["date"] >= last_end]
                 book_idx = idx_arr[0] if len(idx_arr) > 0 else (len(df) - 1)
                 capex_fac[int(book_idx)] += mo_days * day_rate
+                rig_mob[int(book_idx)] += mo_days * day_rate
             # Maintenance cost — spread across the rig's active months
             if maint_per_yr > 0:
                 active_mask = (df["date"] >= first_spud) & (df["date"] <= last_end)
@@ -2232,6 +2235,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                     total_maint_days = maint_per_yr * active_yrs
                     maint_cost_per_month = (total_maint_days * day_rate) / n_active
                     capex_fac[active_mask.values] += maint_cost_per_month
+                    rig_mob[active_mask.values] += maint_cost_per_month
 
     aban_cost = np.zeros(len(df))
     cutoff_idx_attr = df.attrs.get("economic_cutoff_idx")
@@ -2392,6 +2396,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["opex"] = opex
         df_e["capex_well"] = capex_well
         df_e["capex_facility"] = capex_fac
+        df_e["rig_mob"] = rig_mob
         df_e["abandonment"] = aban_cost
         df_e["co2_emissions_tonnes"] = co2_total_t
         df_e["co2_scope1_tonnes"] = co2_total_t
@@ -2541,6 +2546,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["opex"] = opex
         df_e["capex_well"] = capex_well
         df_e["capex_facility"] = capex_fac
+        df_e["rig_mob"] = rig_mob
         df_e["abandonment"] = aban_cost
         df_e["co2_emissions_tonnes"] = co2_total_t
         df_e["co2_scope1_tonnes"] = co2_total_t
@@ -12292,8 +12298,52 @@ def _stea_annual_from_profile(profile, fluid, units, rate=10.5):
         out["Condensate production"] = _sum_year(oil_col, _oil_annual)
     else:
         out["Oil production"] = _sum_year(oil_col, _oil_annual)
-    out["Rich gas production"] = _sum_year(gas_col, _gas_annual)
-    out["Net sales gas"] = dict(out.get("Rich gas production", {}))
+    # Rich gas = gross gas produced (the wellstream gas before fuel/flare).
+    rich_col = ("gross_gas_rate" if "gross_gas_rate" in df.columns
+                else gas_col)
+    out["Rich gas production"] = _sum_year(rich_col, _gas_annual)
+    # Net sales gas = gross minus fuel, flare and shrinkage. Prefer the
+    # engine's explicit net-gas column; otherwise subtract fuel+flare.
+    if "gas_net_rate" in df.columns:
+        out["Net sales gas"] = _sum_year("gas_net_rate", _gas_annual)
+    elif all(c in df.columns for c in ("gas_fuel_rate", "gas_flare_rate")):
+        net = {}
+        for y, g in df.groupby("year"):
+            gross = float(_gas_annual(g[rich_col]).sum())
+            fuel = float(_gas_annual(g["gas_fuel_rate"]).sum())
+            flare = float(_gas_annual(g["gas_flare_rate"]).sum())
+            net[int(y)] = gross - fuel - flare
+        out["Net sales gas"] = net
+    else:
+        out["Net sales gas"] = dict(out.get("Rich gas production", {}))
+    # Fuel, flaring & losses → STEA reports this as energy (GWh). Convert the
+    # fuel+flare gas volume to GWh using ~40 MJ/Sm³ (≈0.0111 GWh per 1000 Sm³,
+    # i.e. 11.1 GWh per MSm³). Sum fuel+flare annual volume in Sm³ then × GWh
+    # factor.
+    if any(c in df.columns for c in ("gas_fuel_rate", "gas_flare_rate")):
+        GWH_PER_SM3 = 40.0 / 3600.0 / 1000.0   # 40 MJ/Sm³ → GWh/Sm³
+        ff = {}
+        for y, g in df.groupby("year"):
+            vol_sm3 = 0.0
+            for c in ("gas_fuel_rate", "gas_flare_rate"):
+                if c in g.columns:
+                    v = g[c].astype(float) * DAYS_PER_MONTH
+                    if not is_metric:
+                        v = v * 1000.0 / 35.3147   # Mscf/d → Sm³ (monthly)
+                    vol_sm3 += float(v.sum())
+            ff[int(y)] = vol_sm3 * GWH_PER_SM3
+        out["Fuel, flaring and losses"] = ff
+    # NGL (mass, MTPA). Engine ngl_rate is bbl/d. NGL density ≈ 0.55 t/m³ →
+    # 1 bbl (0.159 m³) ≈ 0.0875 t. Annual: ×365.25 ÷ 1e6.
+    if "ngl_rate" in df.columns:
+        ngl = {}
+        for y, g in df.groupby("year"):
+            bbl_yr = float((g["ngl_rate"].astype(float)
+                            * DAYS_PER_MONTH).sum()) * (365.25 / 365.25)
+            # ngl_rate is per-day; monthly volume = rate*DAYS_PER_MONTH; sum
+            # over the year already gives annual bbl. Convert bbl→tonnes→Mt.
+            ngl[int(y)] = bbl_yr * 0.0875 / 1e6
+        out["NGL Production"] = ngl
 
     def _cost_year(col):
         s = {}
@@ -12344,10 +12394,10 @@ def _stea_annual_from_case(df, df_e, fluid, units, base_year=None,
     def _gas_GSm3(rate_mscfd):
         return rate_mscfd * DAYS_PER_MONTH * 1000.0 / 35.3147 / 1e9
     def _ngl_MTPA(rate_bbld):
-        # NGL bbl/d → tonnes/yr → MTPA. ~0.55 t/bbl typical NGL; STEA uses
-        # mass. Use 0.118 t/bbl? NGL density ~ 0.55 t/m³, 1 bbl = 0.159 m³ →
-        # 0.0875 t/bbl. Annual: * 365.25 / 1e6.
-        return rate_bbld * 0.0875 * 365.25 / 1e6
+        # NGL bbl/d → tonnes. Monthly mass = rate(bbl/d) × DAYS_PER_MONTH ×
+        # 0.0875 t/bbl; summed over the year and ÷1e6 gives MTPA (Mt/yr).
+        # NGL density ≈ 0.55 t/m³ → 1 bbl (0.159 m³) ≈ 0.0875 t.
+        return rate_bbld * DAYS_PER_MONTH * 0.0875 / 1e6
 
     years = sorted(int(y) for y in d["year"].unique())
     if not years:
@@ -12362,7 +12412,9 @@ def _stea_annual_from_case(df, df_e, fluid, units, base_year=None,
 
     # Production profiles
     out["Oil production"] = _annual_sum("oil_rate", _oil_MSm3)
-    out["Rich gas production"] = _annual_sum("gas_rate", _gas_GSm3)
+    # Rich gas = gross wellstream gas (before fuel/flare).
+    _rich_col = "gross_gas_rate" if "gross_gas_rate" in d.columns else "gas_rate"
+    out["Rich gas production"] = _annual_sum(_rich_col, _gas_GSm3)
     if "ngl_rate" in (df_e.columns if df_e is not None else []):
         de = df_e.copy(); de["year"] = _pd.to_datetime(de["date"]).dt.year \
             if "date" in de.columns else d["year"].values
@@ -12373,7 +12425,32 @@ def _stea_annual_from_case(df, df_e, fluid, units, base_year=None,
     if fluid and "ondensate" in str(fluid):
         out["Condensate production"] = _annual_sum("oil_rate", _oil_MSm3)
         out["Oil production"] = {}
-    out["Net sales gas"] = dict(out.get("Rich gas production", {}))
+    # Net sales gas = gross − fuel − flare (− shrinkage). Prefer the engine's
+    # explicit net-gas column; else subtract fuel+flare from gross.
+    if "gas_net_rate" in d.columns:
+        out["Net sales gas"] = _annual_sum("gas_net_rate", _gas_GSm3)
+    elif all(c in d.columns for c in ("gas_fuel_rate", "gas_flare_rate")):
+        net = {}
+        for y, g in d.groupby("year"):
+            gross = float(_gas_GSm3(g[_rich_col].astype(float)).sum())
+            fuel = float(_gas_GSm3(g["gas_fuel_rate"].astype(float)).sum())
+            flare = float(_gas_GSm3(g["gas_flare_rate"].astype(float)).sum())
+            net[int(y)] = gross - fuel - flare
+        out["Net sales gas"] = net
+    else:
+        out["Net sales gas"] = dict(out.get("Rich gas production", {}))
+    # Fuel, flaring & losses → energy (GWh) via ~40 MJ/Sm³.
+    if any(c in d.columns for c in ("gas_fuel_rate", "gas_flare_rate")):
+        GWH_PER_SM3 = 40.0 / 3600.0 / 1000.0
+        ff = {}
+        for y, g in d.groupby("year"):
+            vol_sm3 = 0.0
+            for c in ("gas_fuel_rate", "gas_flare_rate"):
+                if c in g.columns:
+                    # _gas_GSm3 returns GSm³; ×1e9 → Sm³
+                    vol_sm3 += float(_gas_GSm3(g[c].astype(float)).sum()) * 1e9
+            ff[int(y)] = vol_sm3 * GWH_PER_SM3
+        out["Fuel, flaring and losses"] = ff
 
     # Cost & investment profiles (USD→NOK). df_e money cols are USD/month.
     rate = 10.5
@@ -12432,14 +12509,32 @@ def _stea_annual_from_case(df, df_e, fluid, units, base_year=None,
         for cat, series in fac_split.items():
             out[cat] = series
     else:
-        out["Subsea production system"] = _annual_cost_MNOK("capex_facility")
-    if "co2_tonnes" in (df_e.columns if df_e is not None else []):
+        # No labelled schedule — lump engine facility CAPEX into Subsea, but
+        # net out the rig mob/demob portion which gets its own row below.
+        sub = _annual_cost_MNOK("capex_facility")
+        rm = _annual_cost_MNOK("rig_mob")
+        if rm:
+            sub = {y: sub.get(y, 0.0) - rm.get(y, 0.0)
+                   for y in set(sub) | set(rm)}
+        out["Subsea production system"] = sub
+    # Rig mobilization / demobilization (development wells) — tracked
+    # separately in the engine; report on its own STEA investment row.
+    _rm = _annual_cost_MNOK("rig_mob")
+    if _rm and any(abs(v) > 1e-9 for v in _rm.values()):
+        out["Rig mob/demob - development wells"] = _rm
+    # CO₂ emissions (MTPA) — engine column is co2_emissions_tonnes (scope-1).
+    _co2_col = None
+    for _cc in ("co2_emissions_tonnes", "co2_scope1_tonnes", "co2_tonnes"):
+        if _cc in (df_e.columns if df_e is not None else []):
+            _co2_col = _cc
+            break
+    if _co2_col:
         de = df_e.copy()
         de["year"] = (_pd.to_datetime(de["date"]).dt.year
                       if "date" in de.columns else d["year"].values)
         s = {}
         for y, g in de.groupby("year"):
-            s[int(y)] = float(g["co2_tonnes"].astype(float).sum()) / 1e6
+            s[int(y)] = float(g[_co2_col].astype(float).sum()) / 1e6
         out["Co2 Emissions"] = s
 
     return out, years[0], years[-1]
@@ -16865,7 +16960,11 @@ def concept_selector_section(default_start_date):
                                     for _c in ("opex", "capex_well",
                                                "capex_facility",
                                                "abandonment", "ngl_rate",
-                                               "co2_tonnes"):
+                                               "co2_emissions_tonnes",
+                                               "gross_gas_rate",
+                                               "gas_net_rate",
+                                               "gas_fuel_rate",
+                                               "gas_flare_rate", "rig_mob"):
                                         if _c in _dffe.columns:
                                             _stea_cols[_c] = [
                                                 float(x) for x in
