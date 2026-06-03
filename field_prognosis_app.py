@@ -12478,17 +12478,16 @@ def _stea_annual_from_case(df, df_e, fluid, units, base_year=None,
         out["Net sales gas"] = net
     else:
         out["Net sales gas"] = dict(out.get("Rich gas production", {}))
-    # Fuel, flaring & losses → energy (GWh) via ~40 MJ/Sm³.
+    # Fuel, flaring & losses → reported as gas VOLUME (GSm³/yr), consistent
+    # with the rich/net sales gas rows (not energy).
     if any(c in d.columns for c in ("gas_fuel_rate", "gas_flare_rate")):
-        GWH_PER_SM3 = 40.0 / 3600.0 / 1000.0
         ff = {}
         for y, g in d.groupby("year"):
-            vol_sm3 = 0.0
+            vol = 0.0
             for c in ("gas_fuel_rate", "gas_flare_rate"):
                 if c in g.columns:
-                    # _gas_GSm3 returns GSm³; ×1e9 → Sm³
-                    vol_sm3 += float(_gas_GSm3(g[c].astype(float)).sum()) * 1e9
-            ff[int(y)] = vol_sm3 * GWH_PER_SM3
+                    vol += float(_gas_GSm3(g[c].astype(float)).sum())
+            ff[int(y)] = vol
         out["Fuel, flaring and losses"] = ff
 
     # Cost & investment profiles (USD→NOK). df_e money cols are USD/month.
@@ -12588,7 +12587,7 @@ _STEA_TEMPLATE = [
     ("Additional rich gas production", "GSm³/yr", False),
     ("NGL Production", "MTPA", False),
     ("Condensate production", "MSm³/yr", False),
-    ("Fuel, flaring and losses", "GWh", False),
+    ("Fuel, flaring and losses", "GSm³/yr", False),
     ("Deferred oil production", "MSm³/yr", False),
     ("Deferred gas production", "GSm³/yr", False),
     ("Net sales gas", "GSm³/yr", False),
@@ -17161,6 +17160,8 @@ def concept_selector_section(default_start_date):
                     _case_source = _case_source + f"  · {_verify}"
 
                 rec_payload = {
+                    "name": name, "dim": dim_name, "label": label,
+                    "npv_MM": npv_MM,
                     "npv_pretax_MM": npv_pretax_MM,
                     "cum_primary": cum_primary,
                     "final_rf": rf,
@@ -17286,9 +17287,34 @@ def concept_selector_section(default_start_date):
             df_res = df_res.drop(columns=["_sort"])
         except Exception:
             pass
-        st.dataframe(df_res, use_container_width=True, hide_index=True)
-
-        # ---- "Compare cases" transposed view (metrics as rows, cases as
+        # Colour-code the economic columns (green = better) so the best
+        # concepts stand out at a glance — the screening "heat map" view.
+        try:
+            _num_cols = {
+                "NPV after-tax ($MM)": True, "NPV pre-tax ($MM)": True,
+                "IRR": True, "Resources (MMboe)": True,
+                "CAPEX ($MM)": False, "BE oil ($/bbl)": False,
+            }
+            _present = {c: hi for c, hi in _num_cols.items()
+                        if c in df_res.columns}
+            if _present:
+                def _to_num(s):
+                    return pd.to_numeric(
+                        s.astype(str).str.replace(",", "", regex=False)
+                         .str.replace("%", "", regex=False),
+                        errors="coerce")
+                sty = df_res.style
+                for _c, _hi in _present.items():
+                    sty = sty.background_gradient(
+                        cmap=("RdYlGn" if _hi else "RdYlGn_r"),
+                        subset=[_c],
+                        gmap=_to_num(df_res[_c]))
+                st.dataframe(sty, use_container_width=True, hide_index=True)
+            else:
+                st.dataframe(df_res, use_container_width=True,
+                             hide_index=True)
+        except Exception:
+            st.dataframe(df_res, use_container_width=True, hide_index=True)
         # columns, grouped into sections with units) — the layout used in
         # corporate concept-screening tools. Toggle between this and the
         # flat table above.
