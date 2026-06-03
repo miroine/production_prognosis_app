@@ -13342,10 +13342,25 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         gas_price_f = float(scalar.get("gas_price_mmbtu", 3.5)) * MMBTU_PER_MCF
     else:
         gas_price_f = to_field(float(scalar.get("gas_price", 3.5)), "price_gas", units)
-    if "opex_var_bbl" in scalar:
+    # Variable OPEX — the live path stores this under opex_var_oil /
+    # opex_var_gas (keyed by the primary phase), NOT opex_var_bbl/opex_var.
+    # Read the phase-matched key first so the batch reproduces the live
+    # variable-OPEX charge; fall back to the legacy keys for old payloads.
+    _fluid_l = str(scalar.get("fluid", "")).lower()
+    _is_gas_primary = ("gas" in _fluid_l and "condensate" not in _fluid_l) \
+        or _fluid_l.startswith("gas")
+    _opex_phase_key = "opex_var_gas" if _is_gas_primary else "opex_var_oil"
+    if _opex_phase_key in scalar and scalar.get(_opex_phase_key) is not None:
+        opex_var_f = float(scalar.get(_opex_phase_key))
+    elif "opex_var_oil" in scalar and scalar.get("opex_var_oil") is not None:
+        opex_var_f = float(scalar.get("opex_var_oil"))
+    elif "opex_var_gas" in scalar and scalar.get("opex_var_gas") is not None:
+        opex_var_f = float(scalar.get("opex_var_gas"))
+    elif "opex_var_bbl" in scalar:
         opex_var_f = float(scalar.get("opex_var_bbl", 8.0))
     else:
-        opex_var_f = to_field(float(scalar.get("opex_var", 8)), "price_oil", units)
+        opex_var_f = to_field(float(scalar.get("opex_var", 8)),
+                              "price_oil", units)
     if "tariff_oil_bbl" in scalar:
         tariff_oil_f = float(scalar.get("tariff_oil_bbl", 2.0))
     else:
