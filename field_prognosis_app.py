@@ -15603,9 +15603,15 @@ _CONCEPT_TEMPLATES = {
 
 
 def _concept_study_to_doc(dimensions, selected, results, base_source,
-                          base_loaded):
-    """Assemble the nested study dict (matrix + base + results)."""
+                          base_loaded, reference=None):
+    """Assemble the nested study dict (matrix + base + results).
+
+    `reference` is the per-dimension reference map {dim_index: opt_index};
+    we serialise it as a per-option boolean flag so it survives dimension
+    reordering on reload.
+    """
     from datetime import datetime as _dt, timezone as _tz
+    reference = reference or {}
     return {
         "fieldvista_concept_study": {
             "schema_version": 1,
@@ -15628,6 +15634,7 @@ def _concept_study_to_doc(dimensions, selected, results, base_source,
                                 "description": o.get("description", ""),
                                 "patches": o.get("patches", {}),
                                 "swept": (oi in selected.get(di, set())),
+                                "reference": (reference.get(di) == oi),
                             }
                             for oi, o in enumerate(d["options"])
                         ],
@@ -15666,16 +15673,19 @@ def _concept_study_to_doc(dimensions, selected, results, base_source,
 
 
 def _concept_doc_to_matrix(doc):
-    """Reconstruct (dimensions, selected) from a study doc.
+    """Reconstruct (dimensions, selected, reference) from a study doc.
 
     Inverse of _concept_study_to_doc for the matrix portion — lets a
     study YAML be re-imported to rebuild the editable matrix.
-    Returns (dimensions_list, selected_dict) or raises on bad schema.
+    Returns (dimensions_list, selected_dict, reference_dict) or raises on
+    bad schema. `reference_dict` maps {dim_index: opt_index} for the option
+    flagged as the reference baseline in each dimension.
     """
     root = doc.get("fieldvista_concept_study", doc)
     dims_in = root.get("matrix", {}).get("dimensions", [])
     dimensions = []
     selected = {}
+    reference = {}
     for di, d in enumerate(dims_in):
         opts = []
         sel = set()
@@ -15687,6 +15697,8 @@ def _concept_doc_to_matrix(doc):
             })
             if o.get("swept", True):
                 sel.add(oi)
+            if o.get("reference", False) and di not in reference:
+                reference[di] = oi      # first flagged option wins
         dimensions.append({
             "name": d.get("name", f"Dimension {di+1}"),
             "description": d.get("description", ""),
@@ -15695,7 +15707,7 @@ def _concept_doc_to_matrix(doc):
         selected[di] = sel
     if not dimensions:
         raise ValueError("No dimensions found in study document.")
-    return dimensions, selected
+    return dimensions, selected, reference
 
 
 def _concept_pareto_front(rows):
@@ -16209,6 +16221,12 @@ def concept_selector_section(default_start_date):
 
     dimensions = st.session_state["concept_dimensions"]
     selected = st.session_state["concept_selected"]
+    # Per-dimension reference option: concept_reference[di] = option index
+    # chosen as the "approved plans" baseline for THAT category. Used to
+    # anchor ΔNPV in the staircase and draw a thick square in the garden.
+    if "concept_reference" not in st.session_state:
+        st.session_state["concept_reference"] = {}
+    concept_reference = st.session_state["concept_reference"]
     results = st.session_state["concept_results"]
 
     # ---- Base case source -------------------------------------------------
@@ -16324,7 +16342,9 @@ def concept_selector_section(default_start_date):
                         st.session_state.get("concept_results", {}),
                         st.session_state.get("concept_base_source",
                                               "Current sidebar inputs"),
-                        st.session_state.get("concept_base_payload"))
+                        st.session_state.get("concept_base_payload"),
+                        reference=st.session_state.get(
+                            "concept_reference", {}))
                     path = fh.save_concept_study(study_name, doc)
                     # Reflect the version that was written
                     _saved = [s for s in fh.list_concept_studies()
@@ -16354,9 +16374,10 @@ def concept_selector_section(default_start_date):
                     try:
                         doc = fh.load_concept_study(
                             studies[idx]["filename"])
-                        dims, sel = _concept_doc_to_matrix(doc)
+                        dims, sel, ref = _concept_doc_to_matrix(doc)
                         st.session_state["concept_dimensions"] = dims
                         st.session_state["concept_selected"] = sel
+                        st.session_state["concept_reference"] = ref
                         st.session_state["concept_results"] = {}
                         st.session_state["concept_applied"] = None
                         st.success(
@@ -16404,9 +16425,10 @@ def concept_selector_section(default_start_date):
                     else:
                         import yaml as _yaml
                         doc = _yaml.safe_load(raw)
-                    dims, sel = _concept_doc_to_matrix(doc)
+                    dims, sel, ref = _concept_doc_to_matrix(doc)
                     st.session_state["concept_dimensions"] = dims
                     st.session_state["concept_selected"] = sel
+                    st.session_state["concept_reference"] = ref
                     st.session_state["concept_results"] = {}
                     st.session_state["concept_applied"] = None
                     st.success(
@@ -16441,6 +16463,7 @@ def concept_selector_section(default_start_date):
                     di: set(range(len(d["options"])))
                     for di, d in enumerate(
                         st.session_state["concept_dimensions"])}
+                st.session_state["concept_reference"] = {}
                 st.session_state["concept_results"] = {}
                 st.session_state["concept_applied"] = None
                 st.success(f"Loaded the '{_tname}' template.")
@@ -16459,6 +16482,7 @@ def concept_selector_section(default_start_date):
             st.session_state["concept_selected"] = {
                 di: set(range(len(d["options"])))
                 for di, d in enumerate(combined)}
+            st.session_state["concept_reference"] = {}
             st.session_state["concept_results"] = {}
             st.session_state["concept_applied"] = None
             st.success("Loaded the full-value-chain template "
@@ -16490,6 +16514,7 @@ def concept_selector_section(default_start_date):
             di: set(range(len(d["options"])))
             for di, d in enumerate(st.session_state["concept_dimensions"])
         }
+        st.session_state["concept_reference"] = {}
         st.session_state["concept_results"] = {}
         st.rerun()
     if tb3.button("🧹 Clear results", key="concept_clear_results",
@@ -16562,7 +16587,8 @@ def concept_selector_section(default_start_date):
             _opt_drafts = []
             for oi, opt in enumerate(d["options"]):
                 _oid = opt["_id"]
-                oc1, oc2, oc3, oc4, oc5 = st.columns([0.6, 2, 3, 3, 0.6])
+                oc1, ocr, oc2, oc3, oc4, oc5 = st.columns(
+                    [0.6, 0.7, 2, 3, 3, 0.6])
                 # Selection checkbox — applied immediately (cheap, and it
                 # drives the live garden colours / case count).
                 is_sel = oi in selected.get(di, set())
@@ -16575,6 +16601,22 @@ def concept_selector_section(default_start_date):
                     selected.setdefault(di, set()).add(oi)
                 elif (not new_sel) and is_sel:
                     selected.setdefault(di, set()).discard(oi)
+                # Reference radio — ticking sets THIS option as the reference
+                # (approved plans) for this dimension; mutually exclusive
+                # within the dimension. Drives the staircase baseline and the
+                # thick square in the garden.
+                _is_ref = (concept_reference.get(di) == oi)
+                _new_ref = ocr.checkbox(
+                    "⭐", value=_is_ref,
+                    key=f"concept_ref_{_did}_{_oid}",
+                    label_visibility="collapsed",
+                    help="Set as the REFERENCE (approved-plans baseline) for "
+                         "this category. ΔNPV is measured from here and it's "
+                         "outlined with a thick square in the garden.")
+                if _new_ref and not _is_ref:
+                    concept_reference[di] = oi          # exclusive
+                elif (not _new_ref) and _is_ref:
+                    concept_reference.pop(di, None)
                 _draft_label = oc2.text_input(
                     "Label", value=opt["label"],
                     key=f"concept_opt_{_oid}_label",
@@ -16752,6 +16794,13 @@ def concept_selector_section(default_start_date):
                     elif oi > opt_to_remove:
                         new_sel.add(oi - 1)
                 selected[di] = new_sel
+                # Re-key the reference for this dimension if needed.
+                _refoi = concept_reference.get(di)
+                if _refoi is not None:
+                    if _refoi == opt_to_remove:
+                        concept_reference.pop(di, None)   # ref deleted
+                    elif _refoi > opt_to_remove:
+                        concept_reference[di] = _refoi - 1
                 st.rerun()
             if st.button("➕ Add option", key=f"concept_opt_add_{_did}"):
                 d["options"].append({
@@ -16770,6 +16819,16 @@ def concept_selector_section(default_start_date):
             elif di > dim_to_remove:
                 new_selected[di - 1] = opts
         st.session_state["concept_selected"] = new_selected
+        # Re-key the reference map across the removed dimension.
+        _new_ref = {}
+        for _di, _oi in (st.session_state.get(
+                "concept_reference", {}) or {}).items():
+            if _di < dim_to_remove:
+                _new_ref[_di] = _oi
+            elif _di > dim_to_remove:
+                _new_ref[_di - 1] = _oi
+            # _di == dim_to_remove → dropped
+        st.session_state["concept_reference"] = _new_ref
         st.rerun()
 
     # ---- Apply + Run batch ----
@@ -17948,6 +18007,28 @@ def concept_selector_section(default_start_date):
             for r in chart_rows:
                 r["pareto"] = (r["concept"] in pareto_labels)
 
+            # Mark which concept(s) are the user-chosen reference. A concept
+            # label is a reference if it contains a reference option's label
+            # (the staircase uses these as the ΔNPV baseline and the garden
+            # outlines them with a thick square).
+            try:
+                _ref_opt_labels = set()
+                for _di, _oi in (st.session_state.get(
+                        "concept_reference", {}) or {}).items():
+                    try:
+                        _ddim = st.session_state["concept_dimensions"][_di]
+                        _ref_opt_labels.add(
+                            str(_ddim["options"][_oi]["label"]))
+                    except Exception:
+                        continue
+                for r in chart_rows:
+                    _cl = str(r["concept"])
+                    r["is_reference"] = any(
+                        _rl and _rl in _cl for _rl in _ref_opt_labels)
+            except Exception:
+                for r in chart_rows:
+                    r["is_reference"] = False
+
             if not chart_rows:
                 st.info("Selected concepts have no successful results.")
             else:
@@ -17955,32 +18036,67 @@ def concept_selector_section(default_start_date):
                 # bars on the right axis, both keyed by CAPEX on the x.
                 fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
 
-                # Plot P90/Mean/P10 as three points per concept, stacked
-                # vertically, with the mean labelled. Use the project's
-                # green palette to echo the reference chart.
+                # Build the figure: NPV markers on the left axis, emissions
+                # bars on the right axis, both keyed by CAPEX on the x.
+                fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
+
+                # Whether ANY concept carries a real Monte-Carlo spread. When
+                # no MC was run, P90 = mean = P10, so the three stacked text
+                # labels collapse onto the same point and become unreadable —
+                # in that case we draw only the mean marker with a single
+                # clean label per concept.
+                _any_mc = any(r.get("probabilistic") for r in chart_rows)
+
                 colors_npv = ["#2ca02c", "#2ca02c", "#2ca02c"]
-                # P90 — lower point
-                fig_cc.add_trace(go.Scatter(
-                    x=[r["capex_disc_MM"] for r in chart_rows],
-                    y=[r["p90"] for r in chart_rows],
-                    mode="markers+text",
-                    name="P90 (downside)",
-                    marker=dict(size=14, color=colors_npv[0],
-                                 line=dict(color="black", width=1)),
-                    text=[f"P90 — {r['concept']}" for r in chart_rows],
-                    textposition="middle right",
-                    textfont=dict(size=10),
-                    hovertemplate=(
-                        "<b>%{text}</b><br>"
-                        "CAPEX: $%{x:,.0f}MM<br>"
-                        "NPV P90: $%{y:,.0f}MM<extra></extra>"),
-                ), secondary_y=False)
-                # Mean — middle point
+                if _any_mc:
+                    # P90 — lower point
+                    fig_cc.add_trace(go.Scatter(
+                        x=[r["capex_disc_MM"] for r in chart_rows],
+                        y=[r["p90"] for r in chart_rows],
+                        mode="markers",
+                        name="P90 (downside)",
+                        marker=dict(size=12, color=colors_npv[0],
+                                     symbol="triangle-down",
+                                     line=dict(color="black", width=1)),
+                        hovertemplate=(
+                            "<b>%{customdata}</b><br>"
+                            "CAPEX: $%{x:,.0f}MM<br>"
+                            "NPV P90: $%{y:,.0f}MM<extra></extra>"),
+                        customdata=[r["concept"] for r in chart_rows],
+                    ), secondary_y=False)
+                    # P10 — upper point
+                    fig_cc.add_trace(go.Scatter(
+                        x=[r["capex_disc_MM"] for r in chart_rows],
+                        y=[r["p10"] for r in chart_rows],
+                        mode="markers",
+                        name="P10 (upside)",
+                        marker=dict(size=12, color=colors_npv[2],
+                                     symbol="triangle-up",
+                                     line=dict(color="black", width=1)),
+                        hovertemplate=(
+                            "<b>%{customdata}</b><br>"
+                            "CAPEX: $%{x:,.0f}MM<br>"
+                            "NPV P10: $%{y:,.0f}MM<extra></extra>"),
+                        customdata=[r["concept"] for r in chart_rows],
+                    ), secondary_y=False)
+                    # Vertical bracket lines connecting P90 → P10 per concept
+                    for r in chart_rows:
+                        fig_cc.add_trace(go.Scatter(
+                            x=[r["capex_disc_MM"], r["capex_disc_MM"]],
+                            y=[r["p90"], r["p10"]],
+                            mode="lines",
+                            line=dict(color="#888", width=1, dash="dot"),
+                            showlegend=False, hoverinfo="skip",
+                        ), secondary_y=False)
+
+                # Mean — the main labelled point (always shown). The concept
+                # label sits beside it; the P10/P90 are unlabeled markers.
+                _mean_name = "Mean NPV" if _any_mc else "NPV post-tax"
                 fig_cc.add_trace(go.Scatter(
                     x=[r["capex_disc_MM"] for r in chart_rows],
                     y=[r["mean"] for r in chart_rows],
                     mode="markers+text",
-                    name="Mean",
+                    name=_mean_name,
                     marker=dict(
                         size=[20 if r.get("pareto") else 15
                               for r in chart_rows],
@@ -17992,39 +18108,32 @@ def concept_selector_section(default_start_date):
                     text=[(f"<b>{r['concept']}</b>" if r.get("pareto")
                            else f"{r['concept']} (dominated)")
                           for r in chart_rows],
-                    textposition="middle right",
+                    textposition="top center" if not _any_mc
+                    else "middle right",
                     textfont=dict(size=11, color="black"),
+                    cliponaxis=False,
                     hovertemplate=(
                         "<b>%{text}</b><br>"
                         "CAPEX: $%{x:,.0f}MM<br>"
-                        "NPV mean: $%{y:,.0f}MM<extra></extra>"),
-                ), secondary_y=False)
-                # P10 — upper point
-                fig_cc.add_trace(go.Scatter(
-                    x=[r["capex_disc_MM"] for r in chart_rows],
-                    y=[r["p10"] for r in chart_rows],
-                    mode="markers+text",
-                    name="P10 (upside)",
-                    marker=dict(size=14, color=colors_npv[2],
-                                 line=dict(color="black", width=1)),
-                    text=[f"P10 — {r['concept']}" for r in chart_rows],
-                    textposition="middle right",
-                    textfont=dict(size=10),
-                    hovertemplate=(
-                        "<b>%{text}</b><br>"
-                        "CAPEX: $%{x:,.0f}MM<br>"
-                        "NPV P10: $%{y:,.0f}MM<extra></extra>"),
+                        + ("NPV mean: " if _any_mc else "NPV: ")
+                        + "$%{y:,.0f}MM<extra></extra>"),
                 ), secondary_y=False)
 
-                # Vertical bracket lines connecting P90 → P10 per concept
-                for r in chart_rows:
+                # Thick square outline around any concept flagged as the
+                # reference (approved-plans baseline) for its category.
+                _ref_rows = [r for r in chart_rows if r.get("is_reference")]
+                if _ref_rows:
                     fig_cc.add_trace(go.Scatter(
-                        x=[r["capex_disc_MM"], r["capex_disc_MM"]],
-                        y=[r["p90"], r["p10"]],
-                        mode="lines",
-                        line=dict(color="#888", width=1, dash="dot"),
-                        showlegend=False,
-                        hoverinfo="skip",
+                        x=[r["capex_disc_MM"] for r in _ref_rows],
+                        y=[r["mean"] for r in _ref_rows],
+                        mode="markers",
+                        name="Reference (baseline)",
+                        marker=dict(size=30, color="rgba(0,0,0,0)",
+                                     symbol="square-open",
+                                     line=dict(color="#d62728", width=3)),
+                        hovertemplate=("<b>Reference</b>: %{customdata}"
+                                       "<extra></extra>"),
+                        customdata=[r["concept"] for r in _ref_rows],
                     ), secondary_y=False)
 
                 # Breakeven labels — boxed beside each mean marker, like a
@@ -18606,17 +18715,53 @@ def concept_selector_section(default_start_date):
                 # Sort by ascending CAPEX — the staircase axis
                 staircase.sort(key=lambda x: x["capex_disc_MM"])
 
-                # Insert a synthetic "Reference (approved plans)" step
-                # at zero CAPEX / zero NPV — this is what the reference
-                # slide shows on the far left. Keeps the visual familiar
-                # to anyone who's seen the NCS DTC template before.
-                staircase.insert(0, {
-                    "concept": "Reference (approved plans)",
-                    "npv_MM": 0.0,
-                    "capex_disc_MM": 0.0,
-                    "breakeven_oil": None,
-                    "_is_reference": True,
-                })
+                # Insert the "Reference (approved plans)" step. If one of the
+                # swept concepts is itself the reference/approved case (its
+                # label contains "reference" or "approved"), promote it to the
+                # baseline with its REAL economics instead of forcing zero —
+                # so the table shows the reference's actual NPV/CAPEX/BE and
+                # ΔNPV is measured from a meaningful datum. Only when no such
+                # case exists do we fall back to the synthetic zero baseline
+                # (the classic DTC template look).
+                # Determine the user-chosen reference concept label(s) from
+                # the per-dimension reference checkboxes, so the staircase
+                # baseline is the explicit reference rather than guessed from
+                # the label text.
+                _ref_opt_labels = set()
+                try:
+                    for _di, _oi in (st.session_state.get(
+                            "concept_reference", {}) or {}).items():
+                        _ddim = st.session_state["concept_dimensions"][_di]
+                        _ref_opt_labels.add(
+                            str(_ddim["options"][_oi]["label"]))
+                except Exception:
+                    _ref_opt_labels = set()
+
+                _ref_step = None
+                for _s in staircase:
+                    _lab = str(_s.get("concept", ""))
+                    _is_ref_flag = any(_rl and _rl in _lab
+                                        for _rl in _ref_opt_labels)
+                    if _is_ref_flag or "reference" in _lab.lower() \
+                            or "approved" in _lab.lower():
+                        _ref_step = _s
+                        break
+                if _ref_step is not None:
+                    staircase.remove(_ref_step)
+                    _ref_step["_is_reference"] = True
+                    staircase.sort(key=lambda x: x["capex_disc_MM"])
+                    staircase.insert(0, _ref_step)
+                else:
+                    staircase.insert(0, {
+                        "concept": "Reference (approved plans)",
+                        "npv_MM": 0.0,
+                        "capex_disc_MM": 0.0,
+                        "breakeven_oil": None,
+                        "_is_reference": True,
+                    })
+                # ΔNPV / ΔBE are measured against the reference baseline.
+                _ref_npv = staircase[0]["npv_MM"]
+                _ref_be = staircase[0].get("breakeven_oil")
 
                 # The "recommended" step is the one with the highest
                 # NPV — anything to the right of it is non-profitable
