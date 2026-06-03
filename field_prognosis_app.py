@@ -13004,6 +13004,8 @@ def run_payload_case(payload: dict, default_start_date,
         res["df_disp"] = df_disp
         res["units"] = case_units
         res["fluid"] = case_fluid
+        res["segments_defaulted"] = list(
+            (meta or {}).get("segments_defaulted", []))
         res["ok"] = True
     except Exception as e:
         res["error"] = f"{type(e).__name__}: {e}"
@@ -13069,6 +13071,7 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         rig_cursor["Rig-A"] = start_date
 
     wells = []
+    _seg_defaulted = []   # wells that fell back to default segments
     # Multi-segment decline profiles, keyed by well name. These were saved
     # under payload["segments"]; convert each to the engine's list-of-dicts.
     seg_payload = payload.get("segments", {}) or {}
@@ -13137,11 +13140,30 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                                 "oil_rate" if is_oil else "gas_rate", units)
                 qi_s = to_field(float(pdata["qi_secondary"][i]),
                                 "gas_rate" if is_oil else "oil_rate", units)
+                _dmodel = str(pdata["decline_model"][i])
+                _segs = _segments_for(pdata["name"][i])
+                # A Multi-segment well whose segment block did not survive the
+                # save (older YAML, or segments never materialised in session
+                # before export) would otherwise collapse to a bare
+                # exponential at di_annual — producing far too little and a
+                # very negative NPV vs the live case. Supply the same default
+                # plateau→decline profile the live editor seeds, so the batch
+                # stays close to live instead of cratering.
+                if _dmodel == "Multi-segment" and not _segs:
+                    _segs = [
+                        {"months": 24, "model": "Plateau",
+                         "di": 0.0, "b": 0.0, "mult": 1.0},
+                        {"months": 60, "model": "Hyperbolic",
+                         "di": 0.25, "b": 0.6, "mult": 1.0},
+                        {"months": 120, "model": "Exponential",
+                         "di": 0.12, "b": 0.0, "mult": 1.0},
+                    ]
+                    _seg_defaulted.append(str(pdata["name"][i]))
                 wells.append(WellSpec(
                     name=str(pdata["name"][i]), is_producer=True, rig=rig,
                     spud_date=spud, drill_days=drill, completion_days=compl,
                     qi_primary=qi_p, qi_secondary=qi_s,
-                    decline_model=str(pdata["decline_model"][i]),
+                    decline_model=_dmodel,
                     di_annual=float(pdata["di_annual"][i]),
                     b_factor=float(pdata["b_factor"][i]),
                     wc_initial=float(pdata["wc_initial"][i]),
@@ -13152,7 +13174,7 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                     # Multi-segment decline profile (was missing → wells
                     # with decline_model="Multi-segment" lost their profile
                     # on reload, the main live-vs-batch mismatch).
-                    segments=_segments_for(pdata["name"][i]),
+                    segments=_segs,
                     # Imported user / Eclipse profile (converted to field
                     # units above) — so a saved "User-defined profile" well
                     # reproduces the live production instead of silently
@@ -13319,6 +13341,7 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
 
     meta = {
         "start_date": start_date,
+        "segments_defaulted": list(_seg_defaulted),
         "horizon": int(scalar.get("horizon", 25)),
         "ooip": to_field(float(scalar.get("ooip", 250)), "oil_vol", units),
         "ogip": to_field(float(scalar.get("ogip", 300)), "gas_vol", units),
@@ -17325,6 +17348,23 @@ def concept_selector_section(default_start_date):
     if results:
         st.markdown("---")
         st.markdown("#### 📊 Batch results")
+        # Warn if any case had to fall back to default multi-segment decline
+        # because its saved profile lacked a segments block — this is the
+        # classic reason a reloaded case under-produces vs the live view.
+        _seg_warn_wells = set()
+        for _r in results.values():
+            for _w in (_r.get("segments_defaulted") or []):
+                _seg_warn_wells.add(str(_w))
+        if _seg_warn_wells:
+            st.warning(
+                "⚠️ Some Multi-segment wells had no saved decline profile in "
+                "the base case, so a generic default plateau→decline was used "
+                f"({', '.join(sorted(_seg_warn_wells))}). This usually means "
+                "the case was saved before its segment profiles were captured "
+                "— results here will UNDER-state production vs the live Field "
+                "prognosis view. Fix: re-open the case in Field prognosis, "
+                "open the **Multi-segment decline profiles** panel so the "
+                "segments populate, re-save the case, then reload it here.")
         rows = []
         for key, r in results.items():
             row = {"Dimension": r.get("dim", key[0] if isinstance(
