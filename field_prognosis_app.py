@@ -13072,6 +13072,27 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
     # Multi-segment decline profiles, keyed by well name. These were saved
     # under payload["segments"]; convert each to the engine's list-of-dicts.
     seg_payload = payload.get("segments", {}) or {}
+    # Imported user / Eclipse production profiles, saved under
+    # payload["user_profiles"] as {well: {index:[...], columns:{col:[...]}}}.
+    # We attach the profile to the WellSpec EXACTLY as the live path does
+    # (run_simulation reads primary_rate/secondary_rate straight as engine
+    # rates). The previous bug was that the batch never attached the profile
+    # at all, so a "User-defined profile" well silently fell back to Arps
+    # decline with whatever qi was saved — giving far-too-low production and
+    # a negative NPV. Attaching it (as-is, no unit re-scaling — identical to
+    # the live path) fixes the divergence.
+    prof_payload = payload.get("user_profiles", {}) or {}
+
+    def _profile_for(wname):
+        raw = prof_payload.get(str(wname)) or prof_payload.get(
+            str(wname).strip())
+        if not raw or not isinstance(raw, dict) or not raw.get("columns"):
+            return None
+        try:
+            df_p = pd.DataFrame(raw["columns"])
+            return df_p if not df_p.empty else None
+        except Exception:
+            return None
 
     def _segments_for(wname):
         raw = seg_payload.get(str(wname))
@@ -13132,6 +13153,11 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                     # with decline_model="Multi-segment" lost their profile
                     # on reload, the main live-vs-batch mismatch).
                     segments=_segments_for(pdata["name"][i]),
+                    # Imported user / Eclipse profile (converted to field
+                    # units above) — so a saved "User-defined profile" well
+                    # reproduces the live production instead of silently
+                    # falling back to Arps decline.
+                    user_profile=_profile_for(pdata["name"][i]),
                     # IPR / inflow fields so an ipr_mode well reproduces
                     # the live result.
                     derive_qi_from_pi=bool(pdata.get(
