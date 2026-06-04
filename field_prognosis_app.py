@@ -4070,6 +4070,13 @@ def sidebar_inputs():
                 st.info(f"Sum = {total_disp:.2f}; remainder ({1-total_disp:.2f}) treated as export.")
 
     with st.sidebar.expander("⛔ Abandonment", expanded=False):
+        st.caption(
+            "These minimum-rate / max-water-cut limits define the **economic "
+            "cut-off trigger**. They only take effect when *Cessation timing* "
+            "(in the Economics section) is set to **Economic limit**. Under "
+            "**Full forecast horizon** the field produces to the end of the "
+            "forecast and these limits are ignored — set the cessation MODE "
+            "there, set the LIMITS here.")
         aban_basis = st.radio("Apply at", ["Per well", "Field total"],
                               horizontal=True, key="aban_basis", on_change=mark_stale)
         default_oil = 50.0 if aban_basis == "Per well" else 5000.0
@@ -6919,6 +6926,14 @@ def economics_section(units, start_date):
             value=4200.0, step=100.0, key="dc_meters_per_well",
             help="Average measured depth drilled per well, in metres. Used "
                  "for the benchmark cross-plots only.")
+
+        # ---- Well Planner — design the well here, next to its cost ----
+        # Placed right by the drilling inputs so the planned trajectory and
+        # completion can feed suggested days/metres/tangibles straight into
+        # the cost fields above (via its "use as suggestions" button).
+        well_planner_section(
+            units, st.session_state.get("fluid", "Oil with associated gas"))
+
         # Template type — sets slot capacity and per-template cost.
         tt1, tt2 = st.columns(2)
         template_type = tt1.selectbox(
@@ -7416,10 +7431,11 @@ def economics_section(units, start_date):
             "Topside mod — net installed weight (tonnes)",
             min_value=0.0, value=0.0, step=50.0,
             key="dc_topside_tonnes",
-            help="Alternative basis to a lumped $MM number for host "
-                 "modifications: enter the total net new/modified topside "
-                 "weight (tonnes) and the cost rate per tonne. Set to 0 to "
-                 "use the default lumped tie-in modification cost.")
+            help="Weight basis for host/topside modifications. Enter the "
+                 "total net new/modified topside weight (tonnes) and the "
+                 "$/tonne rate. **If you set this > 0 it REPLACES the lumped "
+                 "tie-in host-modification cost** (no double-counting). Leave "
+                 "at 0 to use the default lumped modification cost instead.")
         topside_mod_rate_per_tonne_kUSD = tm2.number_input(
             f"Cost rate ({cost_unit('k')} per installed tonne)", min_value=0.0,
             value=60.0, step=5.0, key="dc_topside_rate_k",
@@ -11470,8 +11486,6 @@ def main():
                 f"screening values. {vfld['notes']}")
 
     scenario_compare_section(units, fluid, asm, econ, wells)
-
-    well_planner_section(units, fluid)
 
     portfolio_section(units, fluid, asm)
 
@@ -16168,6 +16182,81 @@ def well_planner_section(units, fluid):
                         "most clastic NCS reservoirs.")
                 for n in notes:
                     st.markdown(f"- {n}")
+
+            # ---- Cost estimate derived from the well geometry ----
+            # Translate the planned trajectory + completion into a screening
+            # well-cost estimate, and offer to push the drivers into the
+            # drilling-cost inputs (the user can still override them there).
+            st.markdown("---")
+            st.markdown("**💰 Estimated well cost (from this design)**")
+            td_m = td_disp * d2m
+            res_top_m = res_top_disp * d2m
+            # Drilled length: deviated/horizontal drill more metres than TVD.
+            _path_factor = {"Vertical": 1.0, "Deviated": 1.18,
+                            "Horizontal": 1.35}.get(well_type, 1.1)
+            est_meters = td_m * _path_factor
+            # Drilling days: a base rate-of-penetration proxy plus completion
+            # and trajectory complexity adders.
+            _base_days = est_meters / 90.0          # ~90 m/day blended ROP
+            _traj_adder = {"Vertical": 0, "Deviated": 8,
+                           "Horizontal": 18}.get(well_type, 5)
+            _compl_adder = {
+                "Open hole": 2, "Cased & perforated": 6,
+                "Slotted liner": 7, "Screens / gravel pack": 12,
+                "Frac-pack": 16}.get(completion, 6)
+            _casing_adder = (int(n_casing) - 2) * 4
+            est_days = round(_base_days + _traj_adder + _compl_adder
+                             + _casing_adder)
+            # Completion hardware $MM (tangibles) by type + lift + zonal.
+            _compl_cost = {
+                "Open hole": 1.5, "Cased & perforated": 3.0,
+                "Slotted liner": 3.5, "Screens / gravel pack": 6.0,
+                "Frac-pack": 8.0}.get(completion, 3.0)
+            _lift_cost = {"None": 0.0, "Gas lift": 1.5,
+                          "ESP": 2.5, "HSP": 3.0}.get(artificial, 0.0)
+            _zonal_cost = (3.5 if zonal.startswith("Smart")
+                           else (0.8 if zonal.startswith("Single") else 0.0))
+            est_tangibles = round(_compl_cost + _lift_cost + _zonal_cost, 1)
+            # Indicative total using the app's current rig + completion
+            # day-rates (so the number is consistent with the cost screen).
+            _rig_dr = float(st.session_state.get("rig_dayrate", 900.0))
+            _cmpl_dr = float(st.session_state.get("cmpl_dayrate", 350.0))
+            _drill_days = est_days * 0.65
+            _cmpl_days = est_days * 0.35
+            est_total_MM = round(
+                (_drill_days * _rig_dr + _cmpl_days * _cmpl_dr) / 1000.0
+                + est_tangibles, 1)
+            ec1, ec2, ec3 = st.columns(3)
+            ec1.metric("Est. drilled length",
+                       f"{est_meters:,.0f} m" if is_metric
+                       else f"{est_meters/0.3048:,.0f} ft")
+            ec2.metric("Est. days (D&C)", f"{est_days:,.0f}")
+            ec3.metric("Est. well cost", f"${est_total_MM:,.1f} MM")
+            st.caption(
+                f"Screening estimate: {est_meters:,.0f} m drilled × "
+                f"{_path_factor:.2f} path factor, {est_days} D&C days at "
+                f"${_rig_dr:,.0f}/${_cmpl_dr:,.0f} rig/completion day-rates, "
+                f"plus ${est_tangibles:,.1f} MM completion hardware "
+                f"({completion}"
+                + (f" + {artificial}" if artificial != "None" else "")
+                + (", smart" if zonal.startswith("Smart") else "")
+                + "). Not to be used as a sanction-grade AFE.")
+            if st.button("➡️ Use these as drilling-cost suggestions",
+                          key="wp_feed_costs",
+                          help="Writes the estimated days/well, metres/well "
+                               "and completion-tangibles into the Facilities "
+                               "& cost drilling inputs. You can still edit "
+                               "them there afterwards."):
+                st.session_state["dc_days_per_well"] = float(est_days)
+                st.session_state["dc_meters_per_well"] = float(
+                    est_meters if is_metric else est_meters / 0.3048)
+                st.session_state["well_tangibles"] = float(est_tangibles)
+                st.session_state["_stale"] = True
+                st.success(
+                    f"Drilling-cost inputs updated: {est_days} days/well, "
+                    f"{est_meters:,.0f} m/well, ${est_tangibles:,.1f} MM "
+                    f"tangibles. Open **Facilities & cost → drilling** to "
+                    f"review or override.")
         except Exception as _e:
             st.info(f"Could not render the well schematic: {_e}")
 
@@ -16956,7 +17045,13 @@ def concept_selector_section(default_start_date):
         try:
             base_payload = st.session_state.get("concept_base_payload")
             if not base_payload:
-                base_payload = collect_inputs_payload()
+                # Current sidebar inputs → run through the SAME normaliser the
+                # saved-case and YAML paths use, so all three base sources
+                # feed the engine identical structures (otherwise a live base
+                # case can give different resources than the same case saved
+                # then reloaded).
+                base_payload = fh.normalize_payload_tables(
+                    collect_inputs_payload())
         except Exception as e:
             st.error(f"Could not snapshot the base case: {e}")
             return

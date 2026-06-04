@@ -2883,6 +2883,39 @@ def normalize_payload_tables(payload: dict) -> dict:
             else:
                 fixed[tname] = tbl
         out["tables"] = fixed
+    # Canonicalise multi-segment decline tables the same way the YAML
+    # importer does, so a case loaded from the database / current sidebar
+    # feeds the engine the IDENTICAL structure as the same case imported
+    # from YAML. Without this, segments saved as list-of-row-dicts (or under
+    # a __dataframe__ marker) parse differently and the case produces
+    # different resources/economics depending on how it was loaded.
+    seg_in = out.get("segments")
+    if isinstance(seg_in, dict) and seg_in:
+        seg_fixed = {}
+        for wname, tbl in seg_in.items():
+            if isinstance(tbl, list):
+                seg_fixed[str(wname)] = _rows_to_dict_of_lists(
+                    [dict(r) for r in tbl if isinstance(r, dict)])
+            elif isinstance(tbl, dict):
+                if "__dataframe__" in tbl and len(tbl) == 1:
+                    inner = tbl["__dataframe__"]
+                    if isinstance(inner, list):
+                        seg_fixed[str(wname)] = _rows_to_dict_of_lists(
+                            [dict(r) for r in inner if isinstance(r, dict)])
+                    elif isinstance(inner, dict):
+                        seg_fixed[str(wname)] = inner
+                    else:
+                        seg_fixed[str(wname)] = tbl
+                else:
+                    seg_fixed[str(wname)] = tbl
+        out["segments"] = seg_fixed
+    # user_profiles are already {well: {index, columns}} dicts; pass through
+    # but drop any that lost their columns block.
+    up_in = out.get("user_profiles")
+    if isinstance(up_in, dict) and up_in:
+        out["user_profiles"] = {
+            str(w): v for w, v in up_in.items()
+            if isinstance(v, dict) and v.get("columns")}
     return out
 
 
@@ -3770,6 +3803,18 @@ def build_well_completion_svg(spec: dict) -> str:
         n = 24
         return [(x_start + lateral_len * k / n, y_lat) for k in range(n + 1)]
 
+    # The true total-depth point. For a vertical/deviated well it's straight
+    # below at td_y; for a HORIZONTAL well TD is at the END of the flat
+    # lateral (there is NO vertical hole continuing down past the reservoir
+    # top — that was the drawing bug). Everything that previously drew at
+    # (spine_point(td_y), td_y) now uses this point so the schematic shows a
+    # single coherent horizontal trajectory.
+    if is_horizontal:
+        _lat = lateral_path()
+        td_pt = _lat[-1] if _lat else (cx0 + build_dx, res_top_y)
+    else:
+        td_pt = (spine_point(td_y), td_y)
+
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" '
              f'height="{H}" viewBox="0 0 {W} {H}" '
              f'font-family="Helvetica,Arial,sans-serif">']
@@ -3816,6 +3861,13 @@ def build_well_completion_svg(spec: dict) -> str:
             shoe_depths.append(min(ref_shoes[i], max_depth * 0.95))
         else:
             shoe_depths.append(res_top)
+    # For a HORIZONTAL well the casing is set at/above the reservoir top and
+    # the lateral below is liner/open-hole — so the deepest casing shoe must
+    # not be drawn dropping vertically past the reservoir (the cause of the
+    # vertical-hole-plus-lateral double trajectory in the drawing). Cap every
+    # shoe at the reservoir top.
+    if is_horizontal:
+        shoe_depths = [min(sd, res_top) for sd in shoe_depths]
     shoe_labels = ['30"', '20"', '14"', '10¾"×9⅞"']
 
     # draw outer→inner so inner strings overlay
@@ -3979,17 +4031,26 @@ def build_well_completion_svg(spec: dict) -> str:
         return sx
 
     psx = draw_packer(pkr_y, "Production packer")
-    parts.append(f'<text x="{psx+ casing_hw[-1] + 8:.0f}" y="{pkr_y+4:.0f}" '
-                 f'font-size="9" fill="#222">Production packer</text>')
+    # For horizontal wells the heel packers/hanger cluster tightly, so push
+    # their text labels to the LEFT of the heel and stagger the y-positions
+    # to prevent the overprint seen at the lateral kick-off.
+    _lbl_x = (psx - casing_hw[-1] - 8) if is_horizontal \
+        else (psx + casing_hw[-1] + 8)
+    _anchor = "end" if is_horizontal else "start"
+    parts.append(f'<text x="{_lbl_x:.0f}" y="{pkr_y-8:.0f}" '
+                 f'font-size="9" fill="#222" text-anchor="{_anchor}">'
+                 f'Production packer</text>')
 
     # P/T gauge just above the packer
     ptg_y = pkr_y - 26
     pgx = spine_point(ptg_y)
     parts.append(f'<rect x="{pgx-5:.0f}" y="{ptg_y-5:.0f}" width="10" '
                  f'height="10" fill="#1565c0" stroke="#000"/>')
-    parts.append(f'<text x="{pgx + casing_hw[-1] + 8:.0f}" '
-                 f'y="{ptg_y+3:.0f}" font-size="9" fill="#222">P/T Gauge'
-                 f'</text>')
+    _ptg_x = (pgx - casing_hw[-1] - 8) if is_horizontal \
+        else (pgx + casing_hw[-1] + 8)
+    parts.append(f'<text x="{_ptg_x:.0f}" '
+                 f'y="{ptg_y+3:.0f}" font-size="9" fill="#222" '
+                 f'text-anchor="{_anchor}">P/T Gauge</text>')
 
     # ---- Middle completion packer w/ disappearing plug + liner hanger ----
     mid_y = (pkr_y + res_top_y) / 2
@@ -3998,8 +4059,13 @@ def build_well_completion_svg(spec: dict) -> str:
     msx = spine_point(mid_y)
     parts.append(f'<rect x="{msx-6:.0f}" y="{mid_y-4:.0f}" width="12" '
                  f'height="8" fill="#9ec3ff" stroke="#000"/>')
-    parts.append(f'<text x="{msx + casing_hw[-1] + 8:.0f}" '
-                 f'y="{mid_y+4:.0f}" font-size="9" fill="#222">'
+    # stagger this one further left/down for horizontal
+    _mid_x = (msx - casing_hw[-1] - 8) if is_horizontal \
+        else (msx + casing_hw[-1] + 8)
+    _mid_lbl_y = (mid_y + 18) if is_horizontal else (mid_y + 4)
+    parts.append(f'<text x="{_mid_x:.0f}" '
+                 f'y="{_mid_lbl_y:.0f}" font-size="9" fill="#222" '
+                 f'text-anchor="{_anchor}">'
                  f'Middle completion packer w/disappearing plug</text>')
     # liner hanger at reservoir top
     lh_y = res_top_y - 4
@@ -4007,9 +4073,12 @@ def build_well_completion_svg(spec: dict) -> str:
     parts.append(f'<path d="M {lsx-oh_hw-4:.0f} {lh_y:.0f} '
                  f'l 8 -8 M {lsx+oh_hw+4:.0f} {lh_y:.0f} l -8 -8" '
                  f'stroke="#000" stroke-width="1.5" fill="none"/>')
-    parts.append(f'<text x="{lsx + casing_hw[-1] + 8:.0f}" '
-                 f'y="{lh_y+14:.0f}" font-size="9" fill="#222">Liner hanger'
-                 f'</text>')
+    _lh_x = (lsx - casing_hw[-1] - 8) if is_horizontal \
+        else (lsx + casing_hw[-1] + 8)
+    _lh_lbl_y = (lh_y + 30) if is_horizontal else (lh_y + 14)
+    parts.append(f'<text x="{_lh_x:.0f}" '
+                 f'y="{_lh_lbl_y:.0f}" font-size="9" fill="#222" '
+                 f'text-anchor="{_anchor}">Liner hanger</text>')
 
     # ---- Lower completion across the reservoir ----
     comp_steps = 22
@@ -4046,13 +4115,27 @@ def build_well_completion_svg(spec: dict) -> str:
                              f'l -10 -3 l 2 6 Z" fill="#d62728"/>')
                 parts.append(f'<path d="M {sx+oh_hw:.0f} {yy:.0f} '
                              f'l 10 -3 l -2 6 Z" fill="#d62728"/>')
-        _lbl_y = (comp_pts[0][1] - 22) if is_horizontal else (res_top_y+td_y)/2
-        parts.append(f'<text x="{W-200}" y="{_lbl_y:.0f}" '
-                     f'font-size="10" fill="#222" font-weight="600">'
-                     f'7" cemented &amp; perforated liner</text>')
-        parts.append(f'<text x="{W-200}" y="{_lbl_y+14:.0f}" '
-                     f'font-size="9" fill="#555">'
-                     f'{"horizontal lateral" if is_horizontal else "in 8½ open hole"}</text>')
+        if is_horizontal and comp_pts:
+            # place the label above the MIDDLE of the lateral, clear of the
+            # heel-area packer/liner-hanger labels and the perforations.
+            _mid = comp_pts[len(comp_pts)//2]
+            _lx = _mid[0]
+            _lbl_y = _mid[1] - 30
+            parts.append(f'<text x="{_lx:.0f}" y="{_lbl_y:.0f}" '
+                         f'font-size="10" fill="#222" font-weight="600" '
+                         f'text-anchor="middle">'
+                         f'7" cemented &amp; perforated liner</text>')
+            parts.append(f'<text x="{_lx:.0f}" y="{_lbl_y+13:.0f}" '
+                         f'font-size="9" fill="#555" text-anchor="middle">'
+                         f'horizontal lateral</text>')
+        else:
+            _lbl_y = (res_top_y + td_y) / 2
+            parts.append(f'<text x="{W-200}" y="{_lbl_y:.0f}" '
+                         f'font-size="10" fill="#222" font-weight="600">'
+                         f'7" cemented &amp; perforated liner</text>')
+            parts.append(f'<text x="{W-200}" y="{_lbl_y+14:.0f}" '
+                         f'font-size="9" fill="#555">'
+                         f'in 8½ open hole</text>')
     elif "gravel" in cl or "screens" in cl:
         # gravel-packed screens — hatched wide screen + gravel stipple
         scr_pts_l = [(sx-oh_hw-5, yy) for sx, yy in comp_pts]
@@ -4133,13 +4216,22 @@ def build_well_completion_svg(spec: dict) -> str:
                      f'fill="#b30">{artificial} pump</text>')
 
     # ---- TD marker ----
-    tsx = spine_point(td_y)
-    parts.append(f'<path d="M {tsx-oh_hw:.0f} {td_y:.0f} '
-                 f'L {tsx+oh_hw:.0f} {td_y:.0f}" stroke="#222" '
-                 f'stroke-width="2"/>')
-    parts.append(f'<text x="{tsx+oh_hw+6:.0f}" y="{td_y+4:.0f}" '
-                 f'font-size="10" font-weight="600" fill="#222">'
-                 f'8½" TD ({td:.0f} mMD)</text>')
+    tsx, tsy = td_pt
+    if is_horizontal:
+        # vertical tick at the toe of the lateral
+        parts.append(f'<path d="M {tsx:.0f} {tsy-oh_hw:.0f} '
+                     f'L {tsx:.0f} {tsy+oh_hw:.0f}" stroke="#222" '
+                     f'stroke-width="2"/>')
+        parts.append(f'<text x="{tsx-30:.0f}" y="{tsy+oh_hw+16:.0f}" '
+                     f'font-size="10" font-weight="600" fill="#222">'
+                     f'8½" TD ({td:.0f} mMD)</text>')
+    else:
+        parts.append(f'<path d="M {tsx-oh_hw:.0f} {tsy:.0f} '
+                     f'L {tsx+oh_hw:.0f} {tsy:.0f}" stroke="#222" '
+                     f'stroke-width="2"/>')
+        parts.append(f'<text x="{tsx+oh_hw+6:.0f}" y="{tsy+4:.0f}" '
+                     f'font-size="10" font-weight="600" fill="#222">'
+                     f'8½" TD ({td:.0f} mMD)</text>')
 
     parts.append("</svg>")
     return "".join(parts)
@@ -4604,9 +4696,19 @@ def build_development_concept(spec: dict) -> dict:
     cost_onshore_extra = 0.0
 
     if concept_type == "Subsea tie-in":
-        # Host facility modifications
-        cost_host_or_platform = _HOST_TIEIN_MOD
-        _push(0, cost_host_or_platform, "Host facility modifications (tie-in)")
+        # Host facility modifications. Two costing bases are offered and they
+        # must NOT both apply (that double-counted the host/topside mod):
+        #  - a LUMPED screening number (_HOST_TIEIN_MOD), used by default;
+        #  - a WEIGHT-based number (tonnes × $/tonne), entered further down.
+        # If the user supplied a topside-mod weight (>0 tonnes) we treat that
+        # as the authoritative host-mod cost and skip the lumped figure.
+        _topside_tonnes_basis = float(g("topside_mod_tonnes", 0.0)) > 0
+        if _topside_tonnes_basis:
+            cost_host_or_platform = 0.0
+        else:
+            cost_host_or_platform = _HOST_TIEIN_MOD
+            _push(0, cost_host_or_platform,
+                  "Host facility modifications (tie-in)")
         # Installation — the base multiplier (0.30 of subsea CAPEX) is
         # modulated by the chosen flowline-installation method and
         # tie-in method, which carry very different vessel-spread
