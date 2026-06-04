@@ -13083,6 +13083,9 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
             rig_cursor[rig] = rd + timedelta(days=mi)
     if not rig_cursor:
         rig_cursor["Rig-A"] = start_date
+    # Track first-well-per-rig so the maintenance gap is applied between
+    # wells (not before the first), matching the live scheduler.
+    _rig_first_done = {r: False for r in rig_cursor}
 
     wells = []
     _seg_defaulted = []   # wells that fell back to default segments
@@ -13147,9 +13150,21 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                 rig = pdata["rig"][i]
                 if rig not in rig_cursor:
                     rig_cursor[rig] = start_date
+                    _rig_first_done[rig] = False
                 spud = rig_cursor[rig]
                 drill = int(float(pdata["drill_days"][i]))
                 compl = int(float(pdata["completion_days"][i]))
+                # Maintenance gap before this well (not the rig's first) —
+                # mirror the live scheduler so spud dates and hence the
+                # production timing match between the two paths.
+                _maint_yr = rig_meta.get(rig, {}).get(
+                    "maintenance_days_per_year", 0)
+                if _rig_first_done.get(rig, False) and _maint_yr > 0:
+                    _well_span_yrs = (drill + compl) / 365.0
+                    _maint_gap = int(round(_maint_yr * _well_span_yrs))
+                    spud = spud + timedelta(days=_maint_gap)
+                    rig_cursor[rig] = spud
+                _rig_first_done[rig] = True
                 qi_p = to_field(float(pdata["qi_primary"][i]),
                                 "oil_rate" if is_oil else "gas_rate", units)
                 qi_s = to_field(float(pdata["qi_secondary"][i]),
@@ -13206,6 +13221,12 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                         if "fluid" in pdata else "auto",
                     ipr_mode=bool(pdata.get("ipr_mode", [False]*n)[i])
                         if "ipr_mode" in pdata else False,
+                    # NOTE: the live per-well editor stores these in DISPLAY
+                    # units (it seeds them via from_field and converts back
+                    # with to_field at WellSpec build), so the batch must
+                    # apply the SAME to_field conversion to match the live
+                    # path. (They are mis-named *_psi / *_ft but hold display
+                    # values in a metric case.)
                     wellhead_pressure_psi=to_field(float(pdata.get(
                         "wellhead_pressure_psi", [200.0]*n)[i]),
                         "pressure", units)
@@ -13279,6 +13300,15 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                     row["gas"] = to_field(gv, "gas_rate", units) / 1000.0
                 else:
                     row["gas"] = gv
+                # Production efficiency is part of the capacity schedule (the
+                # engine reads it per-row); carry it through so a non-default
+                # PE in the saved cap_df isn't silently dropped to the asm
+                # default.
+                if "prod_eff" in cap_data:
+                    try:
+                        row["prod_eff"] = float(cap_data["prod_eff"][i])
+                    except Exception:
+                        pass
                 cap_rows.append(row)
             except Exception:
                 continue
@@ -13465,9 +13495,15 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "rig_meta": rig_meta,
         # ---- Fiscal regime ----
         "fiscal_regime": _regime,
-        "ncs_cit_rate": float(scalar.get("ncs_cit_rate", 0.22)),
-        "ncs_spt_rate": float(scalar.get("ncs_spt_rate", 0.718)),
-        "ncs_uplift_rate": float(scalar.get("ncs_uplift_rate", 0.1769)),
+        # The live UI saves these under ncs_cit / ncs_spt / ncs_uplift (no
+        # _rate suffix); accept both so a saved/active case reproduces the
+        # live tax exactly instead of silently falling back to defaults.
+        "ncs_cit_rate": float(scalar.get("ncs_cit",
+                              scalar.get("ncs_cit_rate", 0.22))),
+        "ncs_spt_rate": float(scalar.get("ncs_spt",
+                              scalar.get("ncs_spt_rate", 0.718))),
+        "ncs_uplift_rate": float(scalar.get("ncs_uplift",
+                                 scalar.get("ncs_uplift_rate", 0.1769))),
         "ncs_depreciation_years": float(
             scalar.get("ncs_depreciation_years", 6.0)),
         "ncs_uplift_years": float(scalar.get("ncs_uplift_years", 4.0)),
