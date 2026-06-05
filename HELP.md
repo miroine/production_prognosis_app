@@ -94,6 +94,42 @@ Your matrix lives in the session while you work, but **save it to keep it durabl
 
 You can also **🧾 Download study (nested YAML)** from the results section — a complete audit trail (matrix + base case + every result's KPIs), ideal for version-tracking in git.
 
+### 3.4 Patch key reference — what you can put in a patch
+
+A **patch** is one or more `key: value` pairs typed in an option's *Patches* box, comma-separated (e.g. `oil_price_bbl: 55, disc: 0.10`). When that option runs, the pairs are written onto the base case's `scalar` block before the engine runs — so a patch means *"take the base case, but change these inputs."* Keys are the same names you see in an exported YAML's `scalar:` section; values are plain numbers, text, or `true`/`false`.
+
+**Two special keys** (underscore-prefixed) rewrite a whole table rather than set a scalar:
+
+| Special key | Value | What it does |
+|---|---|---|
+| `_n_producers_override` | integer | Truncates or replicates the producers table to N wells, keeping the base per-well design (rates, decline) and renumbering P-01…P-N. Sweeps drilling-programme size. |
+| `_facility_capex_override_MM` | number ($MM) | Rescales the whole facility CAPEX schedule to total this figure, preserving the relative timing/ordering of cost rows. Sweeps host-facility cost without rebuilding the SURF concept. |
+
+**Common scalar keys** used in screening sweeps:
+
+| Key | Meaning |
+|---|---|
+| `strategy` | Depletion / Water injection / Gas injection / WAG |
+| `oil_price_bbl` | Flat oil price, US$/bbl |
+| `gas_price_mmbtu` | Flat gas price, US$/MMBtu |
+| `opex_var_oil` | Variable OPEX on oil, $/bbl |
+| `opex_var_gas` | Variable OPEX on gas, $/Mscf |
+| `opex_fixed` | Fixed OPEX, $MM/yr |
+| `disc` | Discount rate as a fraction (0.08 = 8%) |
+| `tax_rate` | Flat tax rate as a fraction (NCS uses the `ncs_*` keys) |
+| `rf_target` | Target recovery factor as a fraction (0.52 = 52%) |
+| `ooip` / `ogip` | Oil / gas in place (the case's display units) |
+| `vrr` / `inj_eff` | Voidage replacement ratio / injection sweep (injection strategies) |
+| `well_cost_mode` / `rig_dayrate` | `'rig_rate'` to cost wells from day-rates; rig day-rate in $k/day |
+| `horizon` | Forecast horizon, years |
+
+**Notes:**
+- **Don't** patch `units`, `fluid` or `start_date` — those come from the base case; changing them mid-sweep mis-scales rates and shifts the timeline.
+- A patch changes only what you name; everything else stays at the base case.
+- If an option has a **linked case**, patches are ignored unless you tick *apply patches to linked case* — a linked case runs exactly as saved.
+- To discover every available key, export any case as YAML (**Field prognosis → Export current case as YAML**) and read the `scalar:` block; any key there works as a patch key.
+- Use **🧬 Export a single concept case as YAML** at the bottom of the results to see exactly what an option resolved to, and to reload it into the live view for comparison.
+
 ---
 
 ## 4. Tips & troubleshooting

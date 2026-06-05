@@ -11619,6 +11619,27 @@ def collect_inputs_payload() -> dict:
                 payload["scalar"][k] = v.isoformat()
             else:
                 payload["scalar"][k] = v
+    # CRITICAL: units, fluid and start_date must ALWAYS be present in the
+    # exported scalar. They drive unit interpretation of every rate/profile,
+    # the fluid system, and the timeline — if any is missing on import the
+    # app silently defaults (units→field, start_date→today), which corrupts
+    # a metric case's rates and shifts the schedule. Backfill them from the
+    # live session (with sane defaults) so a saved/live case round-trips
+    # losslessly, exactly like an imported YAML does.
+    if "units" not in payload["scalar"]:
+        payload["scalar"]["units"] = str(
+            st.session_state.get("units", "field"))
+    if "fluid" not in payload["scalar"]:
+        payload["scalar"]["fluid"] = str(
+            st.session_state.get("fluid", "Oil with associated gas"))
+    if "start_date" not in payload["scalar"]:
+        _sd = st.session_state.get("start_date")
+        if isinstance(_sd, (date, datetime)):
+            payload["scalar"]["start_date"] = _sd.isoformat()
+        elif isinstance(_sd, str) and _sd:
+            payload["scalar"]["start_date"] = _sd
+        else:
+            payload["scalar"]["start_date"] = date.today().isoformat()
     # Under a Depletion strategy the live app passes an EMPTY injector
     # frame downstream (injection wells are not drilled or costed), so the
     # exported case must do the same — otherwise a reloaded/ batch run
@@ -16446,6 +16467,82 @@ def concept_selector_section(default_start_date):
             "**🧾 download the nested YAML** audit trail. A full walkthrough "
             "ships as `HELP.md` in the repo.")
 
+    with st.expander("🔑 Patch key reference — what you can put in a "
+                      "patch, and what it does", expanded=False):
+        st.markdown(
+            "A **patch** is one or more `key: value` pairs typed in an "
+            "option's *Patches* box (comma-separated, e.g. "
+            "`oil_price_bbl: 55, disc: 0.10`). When that option runs, the "
+            "pairs are written onto the base case's `scalar` block before "
+            "the engine runs — so a patch is just *“take the base case, but "
+            "change these inputs.”* Keys are the same names you see in the "
+            "exported YAML's `scalar:` section. Values are plain numbers, "
+            "text, or `true`/`false`.\n\n"
+            "Two **special keys** (underscore-prefixed) do more than set a "
+            "scalar — they rewrite a whole table:")
+        _special = pd.DataFrame({
+            "Special key": [
+                "_n_producers_override",
+                "_facility_capex_override_MM",
+            ],
+            "Value": ["integer (well count)", "number ($MM)"],
+            "What it does": [
+                "Truncates or replicates the producers table to N wells, "
+                "keeping the base per-well design (rates, decline) and "
+                "renumbering P-01…P-N. Use to sweep drilling-programme size.",
+                "Rescales the entire facility CAPEX schedule so it totals "
+                "this new figure, preserving the relative timing/ordering of "
+                "the cost rows. Use to sweep host-facility cost without "
+                "rebuilding the SURF concept.",
+            ],
+        })
+        st.dataframe(_special, use_container_width=True, hide_index=True)
+
+        st.markdown("**Common scalar keys** (most-used in screening sweeps):")
+        _common = pd.DataFrame({
+            "Key": [
+                "strategy", "oil_price_bbl", "gas_price_mmbtu",
+                "opex_var_oil", "opex_var_gas", "opex_fixed",
+                "disc", "tax_rate", "rf_target", "ooip", "ogip",
+                "vrr", "inj_eff", "well_cost_mode", "rig_dayrate",
+                "horizon",
+            ],
+            "Meaning": [
+                "Drainage strategy: Depletion / Water injection / "
+                "Gas injection / WAG",
+                "Flat oil price, US$/bbl",
+                "Flat gas price, US$/MMBtu",
+                "Variable OPEX on the oil stream, $/bbl",
+                "Variable OPEX on the gas stream, $/Mscf",
+                "Fixed OPEX, $MM per year",
+                "Discount rate as a fraction (0.08 = 8%)",
+                "Flat tax rate as a fraction (NCS regime uses ncs_* keys)",
+                "Target recovery factor as a fraction (0.52 = 52%)",
+                "Oil in place (display units of the case)",
+                "Gas in place (display units of the case)",
+                "Voidage replacement ratio (injection strategies)",
+                "Injection efficiency / sweep (fraction)",
+                "'rig_rate' to cost wells from day-rates, else lump-sum",
+                "Rig day-rate, $k/day (with well_cost_mode='rig_rate')",
+                "Forecast horizon, years",
+            ],
+        })
+        st.dataframe(_common, use_container_width=True, hide_index=True)
+
+        st.caption(
+            "Tips: (1) **Don't** patch `units`, `fluid` or `start_date` — "
+            "those come from the base case and changing them mid-sweep will "
+            "mis-scale rates. (2) A patch only changes what you name; "
+            "everything else stays at the base case. (3) If an option has a "
+            "**linked case**, patches are ignored unless you tick *apply "
+            "patches to linked case* — a linked case runs exactly as saved. "
+            "(4) To discover every available key, export any case as YAML "
+            "(Field prognosis → *Export current case as YAML*) and read the "
+            "`scalar:` block — any key there can be used as a patch key. "
+            "(5) Use the new **🧬 Export a single concept case as YAML** at "
+            "the bottom of the results to see exactly what a given option "
+            "resolved to.")
+
     # ---- Initialise state ----
     if "concept_dimensions" not in st.session_state:
         import copy
@@ -16799,8 +16896,10 @@ def concept_selector_section(default_start_date):
         "applied to the base case (e.g. `oil_price_bbl: 55`). Special "
         "keys: `_n_producers_override` (replicates/truncates the producers "
         "table to N wells), `_facility_capex_override_MM` (rescales the "
-        "facility CAPEX schedule to a new total). Click **Apply edits** "
-        "in each dimension to commit name/label/patch changes.")
+        "facility CAPEX schedule to a new total). See the **🔑 Patch key "
+        "reference** expander near the top of the page for the complete "
+        "key list, meanings and examples. Click **Apply edits** in each "
+        "dimension to commit name/label/patch changes.")
     # Assign a stable id to every dimension and option so widget keys
     # don't shift when a middle item is deleted. Without this, Streamlit
     # binds widget state to positional index; deleting dimension N makes
@@ -16975,12 +17074,17 @@ def concept_selector_section(default_start_date):
                         "Patches (optional)", value=cur_patch_str,
                         key=f"concept_opt_{_oid}_patches",
                         label_visibility="collapsed",
-                        placeholder="oil_price_bbl: 55",
-                        help="Optional key:value overrides. If NO case is "
-                             "linked, these modify the base case. If a case "
-                             "IS linked, they are IGNORED unless you tick "
-                             "'apply patches to linked case' below — a "
-                             "linked case runs exactly as saved by default.")
+                        placeholder="oil_price_bbl: 55, disc: 0.10",
+                        help="Optional comma-separated key:value overrides "
+                             "applied to the base case, e.g. "
+                             "`strategy: WAG, vrr: 1.05` or "
+                             "`_n_producers_override: 6`. See the "
+                             "**🔑 Patch key reference** expander near the top "
+                             "for the full key list and the two special "
+                             "table-rewriting keys. If NO case is linked these "
+                             "modify the base case; if a case IS linked they "
+                             "are IGNORED unless you tick 'apply patches to "
+                             "linked case' below.")
                     # When a case is linked, let the user explicitly opt in
                     # to applying the patches on top of it. Default OFF so a
                     # linked case reproduces its Field-prognosis result
@@ -17191,6 +17295,24 @@ def concept_selector_section(default_start_date):
                 # then reloaded).
                 base_payload = fh.normalize_payload_tables(
                     collect_inputs_payload())
+            # A base case loaded from the DB by an older version may be
+            # missing units / fluid / start_date. Backfill from the live
+            # session so the swept cases (and their exports) are never run or
+            # saved without these unit-critical scalars.
+            if isinstance(base_payload, dict):
+                base_payload.setdefault("scalar", {})
+                _bsc = base_payload["scalar"]
+                if not _bsc.get("units"):
+                    _bsc["units"] = st.session_state.get("units", "field")
+                if not _bsc.get("fluid"):
+                    _bsc["fluid"] = st.session_state.get(
+                        "fluid", "Oil with associated gas")
+                if not _bsc.get("start_date"):
+                    _sd0 = st.session_state.get("start_date")
+                    if isinstance(_sd0, (date, datetime)):
+                        _bsc["start_date"] = _sd0.isoformat()
+                    elif isinstance(_sd0, str) and _sd0:
+                        _bsc["start_date"] = _sd0
         except Exception as e:
             st.error(f"Could not snapshot the base case: {e}")
             return
@@ -18164,6 +18286,32 @@ def concept_selector_section(default_start_date):
                         # Strip transient run-meta so the file looks like a
                         # clean saved case, then stamp the option identity.
                         _rp.pop("_meta", None)
+                        # GUARANTEE the unit-critical scalars are present, so
+                        # the exported case loads losslessly into the live
+                        # view. If the base case lost them, backfill from the
+                        # run result (which knows the case's units/fluid) and
+                        # the live session, never leaving them unset (which
+                        # would default the live import to field units / today
+                        # and corrupt a metric case).
+                        _rp.setdefault("scalar", {})
+                        if not _rp["scalar"].get("units"):
+                            _rp["scalar"]["units"] = (
+                                _chosen.get("units")
+                                or st.session_state.get("units", "field"))
+                        if not _rp["scalar"].get("fluid"):
+                            _rp["scalar"]["fluid"] = (
+                                _chosen.get("fluid")
+                                or st.session_state.get(
+                                    "fluid", "Oil with associated gas"))
+                        if not _rp["scalar"].get("start_date"):
+                            _sd = st.session_state.get("start_date")
+                            if isinstance(_sd, (date, datetime)):
+                                _rp["scalar"]["start_date"] = _sd.isoformat()
+                            elif isinstance(_sd, str) and _sd:
+                                _rp["scalar"]["start_date"] = _sd
+                            else:
+                                _rp["scalar"]["start_date"] = \
+                                    date.today().isoformat()
                         _meta_out = {
                             "name": (_chosen.get("name")
                                      or f"{_chosen.get('dim')}_"
