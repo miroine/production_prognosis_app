@@ -6458,7 +6458,12 @@ def economics_section(units, start_date):
             )
 
     # ---- Well cost (fixed vs rig-rate bottom-up) ----
-    with _eco_block("⚒️ Well cost model (rig-rate or fixed $MM/well)"):
+    with _eco_block("⛏️ Drilling — well cost model (rig-rate or fixed "
+                    "$MM/well)"):
+        st.caption(
+            "Part of the **Drilling** section (the Well Planner below, in "
+            "Facilities & cost, designs the well and can feed its days / "
+            "metres / tangibles straight into these fields).")
         well_cost_mode = st.radio(
             "Method", ["rig_rate", "fixed"],
             format_func=lambda x: "Rig-rate (bottom-up)" if x == "rig_rate" else "Fixed $MM / well (legacy)",
@@ -7019,10 +7024,14 @@ def economics_section(units, start_date):
                  "trajectory path factor). Used for the benchmark "
                  "cross-plots.")
 
-        # ---- Well Planner — design the well here, next to its cost ----
-        # Placed right by the drilling inputs so the planned trajectory and
-        # completion can feed suggested days/metres/tangibles straight into
-        # the cost fields above (via its "use as suggestions" button).
+        # ---- Drilling — Well Planner (design the well next to its cost) ----
+        st.markdown("### ⛏️ Drilling — well design & planning")
+        st.caption(
+            "The **Drilling** section pairs the well-cost model (in the "
+            "Economy group above) with the Well Planner here. Design the "
+            "trajectory + completion, then click *“use these as drilling-cost "
+            "suggestions”* to push days / metres / tangibles into the cost "
+            "model.")
         well_planner_section(
             units, st.session_state.get("fluid", "Oil with associated gas"))
 
@@ -8005,6 +8014,21 @@ def economics_section(units, start_date):
                 st.caption("Items under 2.5% of total are grouped as 'Other' "
                            "to keep the chart readable.")
 
+            # ==================================================================
+            # 📊 BENCHMARKING — independent of the concept DESIGN controls
+            # above. Groups CAPEX-per-subsea-well + the NCS/UKCS cross-plots
+            # into one clearly separated subsection so the user reads it as a
+            # benchmarking workspace, not part of designing the concept.
+            # ==================================================================
+            st.divider()
+            st.markdown("## 📊 Benchmarking")
+            st.caption(
+                "Compare this concept's costs against NCS / UKCS reference "
+                "data. This is a read-only benchmarking workspace — it does "
+                "not change the concept design above. Use the anonymise "
+                "toggle + CSV export (in the cross-plots) to share "
+                "confidential-safe views.")
+
             # ---- NCS / UKCS cost benchmarking ----
             st.markdown("**Cost benchmarking — NCS / UKCS reference data**")
             # Reserves basis: prefer the engine's in-place × RF if available,
@@ -8626,6 +8650,163 @@ def economics_section(units, start_date):
                             "The decision at the top is the biggest cost "
                             "lever for this concept.")
 
+            # ---- CAPEX Monte-Carlo (cost-uncertainty distribution) ----
+            # Where the sensitivity above is one-at-a-time, this samples all
+            # cost drivers together (with user distributions + correlations)
+            # so the user sees the full P10/P50/P90 spread of total CAPEX.
+            with st.expander("🎲 CAPEX Monte-Carlo (cost-uncertainty "
+                             "distribution)", expanded=False):
+                st.caption(
+                    "Probabilistic development CAPEX. Each cost driver below "
+                    "is given an uncertainty distribution (as a multiplier on "
+                    "its share of the base CAPEX); optionally correlate them, "
+                    "then run to get the P10 / P50 / P90 cost range. "
+                    "Complements the one-at-a-time sensitivity above.")
+                _base_capex_mc = float(
+                    concept["totals"]["grand_total"])
+                # Driver shares from the concept's own CAPEX rows.
+                try:
+                    _rows_mc = concept.get("capex_rows", [])
+                    _tot_mc = sum(float(r.get("amount_MMUSD", 0))
+                                  for r in _rows_mc) or 1.0
+                    def _share_of(keys):
+                        return sum(float(r.get("amount_MMUSD", 0))
+                                   for r in _rows_mc
+                                   if any(kk in str(r.get("label", "")).lower()
+                                          for kk in keys)) / _tot_mc
+                    _sh_wells = max(0.0, 1.0 - (
+                        _share_of(["template", "manifold", "tree", "jumper",
+                                   "control module", "riser", "flowline",
+                                   "umbilical", "meg", "hipps", "flow meter"])
+                        + _share_of(["host", "installation", "hook",
+                                     "commission", "tie-in", "topside"])))
+                    _sh_surf = _share_of(["template", "manifold", "tree",
+                                          "jumper", "control module", "riser",
+                                          "flowline", "umbilical", "meg",
+                                          "hipps", "flow meter"])
+                    _sh_top = _share_of(["host", "installation", "hook",
+                                         "commission", "tie-in", "topside"])
+                except Exception:
+                    _sh_wells, _sh_surf, _sh_top = 0.34, 0.45, 0.21
+
+                # Default driver table (editable)
+                _mc_default = pd.DataFrame([
+                    {"Driver": "Wells", "Share %": round(_sh_wells * 100, 1),
+                     "Distribution": "triangular",
+                     "Low ×": 0.85, "Likely/Mean ×": 1.0, "High ×": 1.40,
+                     "SD (frac)": 0.15},
+                    {"Driver": "SURF / subsea",
+                     "Share %": round(_sh_surf * 100, 1),
+                     "Distribution": "triangular",
+                     "Low ×": 0.90, "Likely/Mean ×": 1.0, "High ×": 1.35,
+                     "SD (frac)": 0.15},
+                    {"Driver": "Topside / host",
+                     "Share %": round(_sh_top * 100, 1),
+                     "Distribution": "lognormal",
+                     "Low ×": 0.90, "Likely/Mean ×": 1.0, "High ×": 1.60,
+                     "SD (frac)": 0.25},
+                ])
+                _mc_tbl = st.data_editor(
+                    _mc_default, key="dc_mc_drivers", hide_index=True,
+                    use_container_width=True,
+                    column_config={
+                        "Distribution": st.column_config.SelectboxColumn(
+                            options=["triangular", "normal",
+                                     "lognormal", "uniform"]),
+                    },
+                    help="Share % = how much of the total base CAPEX this "
+                         "driver scales. Multipliers (×) are relative to the "
+                         "base (1.0 = no change). Triangular uses Low/Likely/"
+                         "High; normal & lognormal use Likely/Mean + SD; "
+                         "uniform uses Low/High.")
+
+                st.markdown("**Correlation matrix (pairwise ρ)**")
+                _names_mc = list(_mc_tbl["Driver"])
+                _corr_default = pd.DataFrame(
+                    np.eye(len(_names_mc)), columns=_names_mc, index=_names_mc)
+                # seed a mild positive default Wells–SURF–Topside coupling
+                for _i in range(len(_names_mc)):
+                    for _j in range(len(_names_mc)):
+                        if _i != _j:
+                            _corr_default.iloc[_i, _j] = 0.3
+                _corr_tbl = st.data_editor(
+                    _corr_default, key="dc_mc_corr",
+                    use_container_width=True,
+                    help="Pairwise correlation between cost drivers "
+                         "(−1…+1). Positive means they tend to overrun "
+                         "together (common on NCS — a hot market lifts rig, "
+                         "fabrication and vessel rates at once). The diagonal "
+                         "is fixed at 1.")
+
+                _mc_n = st.select_slider(
+                    "Monte-Carlo draws", options=[1000, 5000, 10000, 50000],
+                    value=10000, key="dc_mc_n")
+                if st.button("Run CAPEX Monte-Carlo", key="dc_mc_run"):
+                    try:
+                        params = []
+                        for _, _r in _mc_tbl.iterrows():
+                            params.append({
+                                "name": str(_r["Driver"]),
+                                "dist": str(_r["Distribution"]).lower(),
+                                "share": float(_r["Share %"]) / 100.0,
+                                "low": float(_r["Low ×"]),
+                                "mode": float(_r["Likely/Mean ×"]),
+                                "high": float(_r["High ×"]),
+                                "mean": float(_r["Likely/Mean ×"]),
+                                "sd": float(_r["SD (frac)"]),
+                            })
+                        _C = _corr_tbl.values.astype(float)
+                        mc = fh.capex_monte_carlo(
+                            _base_capex_mc, params, corr_matrix=_C,
+                            n_draws=int(_mc_n))
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("P10 (low)", f"${mc['p10']:,.0f}MM")
+                        m2.metric("P50 (median)", f"${mc['p50']:,.0f}MM")
+                        m3.metric("P90 (high)", f"${mc['p90']:,.0f}MM")
+                        m4.metric("Mean ± SD",
+                                  f"${mc['mean']:,.0f}MM",
+                                  f"± {mc['std']:,.0f}")
+                        _p1090 = mc['p90'] - mc['p10']
+                        st.caption(
+                            f"P10–P90 spread **${_p1090:,.0f}MM** "
+                            f"({100*_p1090/max(mc['p50'],1):.0f}% of P50). "
+                            f"Deterministic base "
+                            f"${_base_capex_mc:,.0f}MM sits at the "
+                            f"{100.0*(mc['draws'] < _base_capex_mc).mean():.0f}"
+                            f"th percentile of the distribution.")
+                        fig_mc = go.Figure()
+                        fig_mc.add_trace(go.Histogram(
+                            x=mc["draws"], nbinsx=60,
+                            marker_color="#2a6f97", opacity=0.85,
+                            name="CAPEX draws"))
+                        for _lbl, _val, _col in (
+                                ("P10", mc["p10"], "#2a9d8f"),
+                                ("P50", mc["p50"], "#1d3557"),
+                                ("P90", mc["p90"], "#d62828")):
+                            fig_mc.add_vline(
+                                x=_val, line_dash="dash", line_color=_col,
+                                annotation_text=f"{_lbl} ${_val:,.0f}MM",
+                                annotation_position="top")
+                        fig_mc.update_layout(
+                            title="Development CAPEX — Monte-Carlo "
+                                  "distribution",
+                            xaxis_title="Total CAPEX ($MM)",
+                            yaxis_title="Frequency", height=380,
+                            margin=dict(l=10, r=10, t=50, b=40),
+                            showlegend=False)
+                        st.plotly_chart(fh.apply_plot_template(fig_mc),
+                                        use_container_width=True)
+                        # downloadable draws
+                        st.download_button(
+                            "⬇️ Download CAPEX draws (CSV)",
+                            data=pd.DataFrame(
+                                {"capex_MM": mc["draws"]}
+                            ).to_csv(index=False).encode("utf-8"),
+                            file_name="capex_monte_carlo_draws.csv",
+                            mime="text/csv", key="dc_mc_dl")
+                    except Exception as _mce:
+                        st.error(f"Monte-Carlo failed: {_mce}")
+
         # Stash the spec so the schedule builder can use it
         st.session_state["_dc_spec"] = dc_spec
 
@@ -8959,42 +9140,52 @@ def economics_section(units, start_date):
     # is applied to BOTH the facility CAPEX schedule AND the per-well
     # CAPEX (whether fixed or rig-rate computed), since the same
     # estimating bias applies to both.
-    cont_c1, cont_c2 = st.columns([1, 2])
-    contingency_pct = cont_c1.slider(
-        "CAPEX contingency (%)", 0, 100, 25, 5,
-        key="capex_contingency_pct", on_change=mark_stale,
-        help=(
-            "Multiplier applied to both facility CAPEX and well CAPEX "
-            "to cover scope growth, schedule slip, fabrication inflation "
-            "and execution risk. Applied as `(1 + pct/100)` to every "
-            "spend line.\n\n"
-            "**Benchmark recommendations** (AACE International + NCS / "
-            "UKCS post-mortems):\n"
-            "- **10-15%** — Class 2 detailed FEED / FID-ready estimate "
-            "(mature scope, locked technology, firm contracts).\n"
-            "- **20-30%** — Class 3 FEED estimate (typical NCS "
-            "subsea tie-in or brownfield with mostly known scope).\n"
-            "- **30-40%** — Class 4 concept-select estimate "
-            "(greenfield development, several technology choices "
-            "still open).\n"
-            "- **40-60%** — Class 5 screening / pre-concept estimate "
-            "(very early phase, high HPHT or deepwater technology "
-            "risk, frontier basin).\n\n"
-            "**Real-world calibration**: Johan Sverdrup phase 1 came "
-            "in ~30% under the original PDO estimate (rare); Goliat "
-            "and Yme came in 50-100% OVER; Mariner came in ~25% over. "
-            "The NCS average for FPSO / semi-sub developments since "
-            "2010 is +35% vs the PDO submission. Use 25-35% as a "
-            "screening default."))
-    if contingency_pct > 0:
-        cont_c2.caption(
-            f"💡 With {contingency_pct}% contingency, every $100MM of "
-            f"CAPEX in the schedule below (and every well CAPEX) is "
-            f"booked as **${100 * (1 + contingency_pct/100):.0f}MM** in "
-            f"the cashflow. Total facility-CAPEX uplift: "
-            f"**${fac_df['amount_MMUSD'].sum() * contingency_pct/100:,.0f}MM** "
-            f"on top of the **${fac_df['amount_MMUSD'].sum():,.0f}MM** "
-            f"base.")
+    cont_c1, cont_c2, cont_c3 = st.columns(3)
+    contingency_wells_pct = cont_c1.slider(
+        "Wells contingency (%)", 0, 100,
+        int(st.session_state.get("capex_contingency_wells_pct",
+            st.session_state.get("capex_contingency_pct", 25))), 5,
+        key="capex_contingency_wells_pct", on_change=mark_stale,
+        help="Contingency applied to WELL CAPEX only (rig spread, "
+             "completion, tangibles, fixed $MM/well). Drilling risk — "
+             "stuck pipe, sidetracks, weather, rig availability — typically "
+             "warrants 15–30% at concept select.")
+    contingency_surf_pct = cont_c2.slider(
+        "SURF / subsea contingency (%)", 0, 100,
+        int(st.session_state.get("capex_contingency_surf_pct",
+            st.session_state.get("capex_contingency_pct", 25))), 5,
+        key="capex_contingency_surf_pct", on_change=mark_stale,
+        help="Contingency applied to SUBSEA / SURF facility lines "
+             "(templates, trees, manifolds, flowlines, umbilicals, risers, "
+             "control systems, flow assurance). Mostly fabricated scope with "
+             "moderate estimating bias — 20–35% typical.")
+    contingency_topside_pct = cont_c3.slider(
+        "Topside / host contingency (%)", 0, 100,
+        int(st.session_state.get("capex_contingency_topside_pct",
+            st.session_state.get("capex_contingency_pct", 30))), 5,
+        key="capex_contingency_topside_pct", on_change=mark_stale,
+        help="Contingency applied to TOPSIDE / HOST lines (host "
+             "modifications, topside weight, installation, hook-up & "
+             "commissioning, tie-in). Brownfield interfaces and offshore "
+             "hook-up carry the highest execution risk — 30–50% typical.")
+    # Legacy single value kept in sync (= the SURF figure) so older code paths
+    # and the Monte-Carlo base still have a sensible scalar to read.
+    contingency_pct = contingency_surf_pct
+    st.session_state["capex_contingency_pct"] = contingency_surf_pct
+    if (contingency_wells_pct or contingency_surf_pct
+            or contingency_topside_pct):
+        try:
+            _fac_sum = float(fac_df["amount_MMUSD"].sum())
+        except Exception:
+            _fac_sum = 0.0
+        st.caption(
+            f"💡 Contingency is now split by category — Wells "
+            f"**{contingency_wells_pct}%**, SURF/subsea "
+            f"**{contingency_surf_pct}%**, Topside/host "
+            f"**{contingency_topside_pct}%**. Each facility line is upgraded "
+            f"by the rate matching its category; well CAPEX uses the wells "
+            f"rate. Base facility CAPEX (pre-contingency): "
+            f"**${_fac_sum:,.0f}MM**.")
 
     # ---- CO₂ emissions & carbon fees (Scope 1 + Scope 3) ----
     with st.expander("🌍 CO₂ emissions & carbon fees", expanded=False):
@@ -9089,8 +9280,42 @@ def economics_section(units, start_date):
     # input the engine sees: facility schedule, fixed $MM/well, and the
     # rig-rate / completion / tangibles components (since the engine
     # rebuilds capex_well from these when well_cost_mode == "rig_rate").
-    _cont_mult = 1.0 + float(
-        st.session_state.get("capex_contingency_pct", 25)) / 100.0
+    # Apply per-category contingency. Well CAPEX uses the wells rate; each
+    # facility line uses the SURF rate or the Topside/host rate depending on
+    # which category its label classifies into. Read from session_state so
+    # the values are available even before the widgets have rendered this
+    # session (e.g. immediately after loading a saved case).
+    _cont_wells = 1.0 + float(
+        st.session_state.get("capex_contingency_wells_pct",
+            st.session_state.get("capex_contingency_pct", 25))) / 100.0
+    _cont_surf = 1.0 + float(
+        st.session_state.get("capex_contingency_surf_pct",
+            st.session_state.get("capex_contingency_pct", 25))) / 100.0
+    _cont_topside = 1.0 + float(
+        st.session_state.get("capex_contingency_topside_pct",
+            st.session_state.get("capex_contingency_pct", 30))) / 100.0
+    # Legacy uniform multiplier (used by the Monte-Carlo base + any older
+    # path) — keep equal to the SURF figure.
+    _cont_mult = _cont_surf
+
+    def _row_contingency(label):
+        """Pick the contingency multiplier for a facility row by category."""
+        try:
+            cat = fh.stea_investment_category(str(label or ""))
+        except Exception:
+            cat = ""
+        _c = str(cat).lower()
+        if ("topside" in _c or "onshore" in _c or "host" in _c
+                or "transport" in _c):
+            return _cont_topside
+        # Installation / hook-up / tie-in → topside/host execution risk
+        _l = str(label or "").lower()
+        if any(k in _l for k in ("host facility", "installation", "hook-up",
+                                  "hook up", "commissioning", "tie-in",
+                                  "tie in", "topside")):
+            return _cont_topside
+        return _cont_surf
+
     fac_df_with_cont = fac_df.copy()
     # Strip abandonment/cessation/P&A rows — booked separately via aban_cost,
     # so keeping them in facilities would double-count cessation. Guard
@@ -9105,16 +9330,27 @@ def economics_section(units, start_date):
     except Exception:
         # Never let CAPEX hygiene crash the run — fall back to the raw table.
         fac_df_with_cont = fac_df.copy()
-    if "amount_MMUSD" in fac_df_with_cont.columns:
-        fac_df_with_cont["amount_MMUSD"] = (
-            fac_df_with_cont["amount_MMUSD"].astype(float) * _cont_mult)
-    capex_well_with_cont = float(capex_well) * _cont_mult
-    rig_day_rate_with_cont = float(rig_day_rate_kUSD) * _cont_mult
-    cmpl_day_rate_with_cont = float(completion_day_rate_kUSD) * _cont_mult
-    well_tangibles_with_cont = float(well_tangibles_MM) * _cont_mult
+    if ("amount_MMUSD" in fac_df_with_cont.columns
+            and len(fac_df_with_cont) > 0):
+        try:
+            _labels = (fac_df_with_cont["label"].tolist()
+                       if "label" in fac_df_with_cont.columns
+                       else [""] * len(fac_df_with_cont))
+            _mults = [_row_contingency(_lb) for _lb in _labels]
+            fac_df_with_cont["amount_MMUSD"] = [
+                float(_a) * _m for _a, _m in zip(
+                    fac_df_with_cont["amount_MMUSD"].astype(float).tolist(),
+                    _mults)]
+        except Exception:
+            fac_df_with_cont["amount_MMUSD"] = (
+                fac_df_with_cont["amount_MMUSD"].astype(float) * _cont_surf)
+    capex_well_with_cont = float(capex_well) * _cont_wells
+    rig_day_rate_with_cont = float(rig_day_rate_kUSD) * _cont_wells
+    cmpl_day_rate_with_cont = float(completion_day_rate_kUSD) * _cont_wells
+    well_tangibles_with_cont = float(well_tangibles_MM) * _cont_wells
     # Abandonment is a CAPEX-like spend at the end of life and carries
-    # similar estimating bias — apply the same contingency multiplier.
-    aban_cost_with_cont = float(aban_cost) * _cont_mult
+    # similar estimating bias — apply the topside/host (execution) rate.
+    aban_cost_with_cont = float(aban_cost) * _cont_topside
 
     # ---- Study / pre-sanction costs → dated CAPEX rows --------------------
     # Phase feasibility/concept, FEED and other-study spend evenly across the
@@ -11830,6 +12066,8 @@ def collect_inputs_payload() -> dict:
         "well_cost_mode", "rig_dayrate", "cmpl_dayrate",
         "well_tangibles", "well_intangibles_pct",
         "capex_contingency_pct",
+        "capex_contingency_wells_pct", "capex_contingency_surf_pct",
+        "capex_contingency_topside_pct",
         # CO2 / carbon economics + money basis (so a saved case round-trips
         # to identical economics in both the main app and the batch runner)
         "co2_price", "co2_factor_gas_combust",
@@ -12127,6 +12365,28 @@ def restore_inputs_payload(payload: dict) -> None:
                 st.session_state[f"user_profile_{wname}"] = val
         except Exception:
             continue
+
+    # ---- Sync the development-concept subsea well count to the producer
+    # table ----
+    # When a case is loaded its SURF/template well count (dc_n_subsea_wells)
+    # should follow the number of producers it actually carries, not stay at
+    # whatever default the widget last held. Without this, a 3-producer case
+    # loads with the facility still sized for the default (e.g. 4) wells.
+    # Only override when the loaded payload did NOT explicitly carry a
+    # subsea-well count (so an intentional mismatch the user saved is kept).
+    try:
+        _pdf = st.session_state.get("producers_df")
+        if _pdf is not None and len(_pdf) > 0:
+            if "name" in _pdf.columns:
+                _n_prod = int((_pdf["name"].astype(str).str.strip()
+                               != "").sum())
+            else:
+                _n_prod = int(len(_pdf))
+            _saved_scalar = payload.get("scalar", {}) or {}
+            if _n_prod > 0 and "dc_n_subsea_wells" not in _saved_scalar:
+                st.session_state["dc_n_subsea_wells"] = _n_prod
+    except Exception:
+        pass
 
     st.session_state["stale"] = True
     st.session_state["results"] = None

@@ -4363,6 +4363,104 @@ def topside_modification_advice(surf_concept: dict) -> list:
     return advice
 
 
+def capex_monte_carlo(base_value: float,
+                       params: list,
+                       corr_matrix=None,
+                       n_draws: int = 5000,
+                       seed: int = 42) -> dict:
+    """Monte-Carlo a total CAPEX from uncertain multiplicative drivers.
+
+    Each entry in `params` is a dict describing one uncertain input applied
+    as a MULTIPLIER on its share of the base CAPEX. Distributions supported:
+    triangular (low/mode/high multipliers), normal & lognormal (mean + sd as
+    a fraction), uniform (low/high). `corr_matrix` is an optional NxN array of
+    pairwise correlations (Gaussian copula via Cholesky) in the same order as
+    `params`. Returns the draws array plus P10/P50/P90/mean/std.
+    """
+    import numpy as _np
+    from math import erf as _erf
+
+    rng = _np.random.default_rng(seed)
+    k = len(params)
+    if k == 0 or base_value <= 0:
+        return {"draws": _np.array([base_value]), "p10": base_value,
+                "p50": base_value, "p90": base_value,
+                "mean": base_value, "std": 0.0, "base": base_value}
+
+    if corr_matrix is not None:
+        C = _np.array(corr_matrix, dtype=float)
+        C = 0.5 * (C + C.T)
+        _np.fill_diagonal(C, 1.0)
+        C = _np.clip(C, -0.999, 0.999)
+        _np.fill_diagonal(C, 1.0)
+        try:
+            L = _np.linalg.cholesky(C)
+        except _np.linalg.LinAlgError:
+            w, V = _np.linalg.eigh(C)
+            w = _np.clip(w, 1e-6, None)
+            C = V @ _np.diag(w) @ V.T
+            d = _np.sqrt(_np.diag(C))
+            C = C / _np.outer(d, d)
+            L = _np.linalg.cholesky(C)
+    else:
+        L = _np.eye(k)
+
+    Z = rng.standard_normal(size=(n_draws, k)) @ L.T
+    U = 0.5 * (1.0 + _np.vectorize(lambda x: _erf(x / _np.sqrt(2.0)))(Z))
+    U = _np.clip(U, 1e-6, 1 - 1e-6)
+
+    def _inv_marginal(p_unif, prm):
+        dist = str(prm.get("dist", "triangular")).lower()
+        if dist == "uniform":
+            lo = float(prm.get("low", 0.8)); hi = float(prm.get("high", 1.2))
+            return lo + (hi - lo) * p_unif
+        if dist in ("normal", "gaussian"):
+            mean = float(prm.get("mean", 1.0)); sd = float(prm.get("sd", 0.1))
+            from scipy.special import erfinv as _erfinv
+            return mean + sd * _np.sqrt(2.0) * _erfinv(2.0 * p_unif - 1.0)
+        if dist == "lognormal":
+            mean = float(prm.get("mean", 1.0)); sd = float(prm.get("sd", 0.1))
+            from scipy.special import erfinv as _erfinv
+            sigma = sd
+            mu = _np.log(max(mean, 1e-9))
+            z = _np.sqrt(2.0) * _erfinv(2.0 * p_unif - 1.0)
+            return _np.exp(mu + sigma * z)
+        lo = float(prm.get("low", 0.8))
+        mode = float(prm.get("mode", 1.0))
+        hi = float(prm.get("high", 1.3))
+        if hi <= lo:
+            return _np.full_like(p_unif, mode)
+        fc = (mode - lo) / (hi - lo)
+        out = _np.where(
+            p_unif < fc,
+            lo + _np.sqrt(_np.clip(p_unif * (hi - lo) * (mode - lo), 0, None)),
+            hi - _np.sqrt(_np.clip((1 - p_unif) * (hi - lo) * (hi - mode),
+                                   0, None)))
+        return out
+
+    shares = _np.array([float(p.get("share", 0.0)) for p in params])
+    shares = _np.clip(shares, 0.0, None)
+    share_sum = float(shares.sum())
+    fixed_part = base_value * max(0.0, 1.0 - share_sum)
+
+    mult = _np.empty((n_draws, k))
+    for j, prm in enumerate(params):
+        mult[:, j] = _inv_marginal(U[:, j], prm)
+
+    modelled = (mult * (base_value * shares)[None, :]).sum(axis=1)
+    totals = fixed_part + modelled
+
+    return {
+        "draws": totals,
+        "p10": float(_np.percentile(totals, 10)),
+        "p50": float(_np.percentile(totals, 50)),
+        "p90": float(_np.percentile(totals, 90)),
+        "mean": float(_np.mean(totals)),
+        "std": float(_np.std(totals)),
+        "base": float(base_value),
+    }
+
+
 def build_development_concept(spec: dict) -> dict:
     """Build a development concept from a spec dict.
 
