@@ -11619,6 +11619,24 @@ def collect_inputs_payload() -> dict:
                 payload["scalar"][k] = v.isoformat()
             else:
                 payload["scalar"][k] = v
+    # Backfill from the durable snapshot of the last loaded case for any
+    # scalar key not currently present in session_state. This is what makes
+    # "Current sidebar inputs" a COMPLETE base case even on a page where the
+    # Field-prognosis scalar widgets haven't rendered (e.g. the Concept
+    # Selector). Live session values always take precedence; the snapshot
+    # only fills genuine gaps, so a case loaded in the live view is faithfully
+    # reflected when used as the concept base. Without this, the concept
+    # export came out with only the handful of rendered keys + defaults
+    # (wrong units/fluid/prices).
+    _snap = st.session_state.get("_loaded_scalar_snapshot")
+    if isinstance(_snap, dict):
+        for k, v in _snap.items():
+            if k not in payload["scalar"] or payload["scalar"][k] in (
+                    None, ""):
+                if isinstance(v, (date, datetime)):
+                    payload["scalar"][k] = v.isoformat()
+                else:
+                    payload["scalar"][k] = v
     # CRITICAL: units, fluid and start_date must ALWAYS be present in the
     # exported scalar. They drive unit interpretation of every rate/profile,
     # the fluid system, and the timeline — if any is missing on import the
@@ -11720,6 +11738,20 @@ def restore_inputs_payload(payload: dict) -> None:
     SelectboxColumn expect — otherwise Streamlit raises 'ColumnDataKind' errors.
     """
     DATE_KEYS = {"start_date"}
+    # Keep a durable copy of the full scalar block. Widget-backed session keys
+    # only exist on a run where their widget renders, so when the user loads a
+    # case in Field prognosis and then switches to the Concept Selector, the
+    # Field-prognosis scalar widgets are NOT on screen and collect_inputs_payload
+    # would miss most keys — producing a base case with full tables but an
+    # almost-empty scalar (wrong units/fluid/prices). This durable snapshot
+    # lets collect_inputs_payload backfill every scalar the loaded case had,
+    # so "Current sidebar inputs" stays a complete, faithful base on any page.
+    try:
+        _sc = dict(payload.get("scalar", {}) or {})
+        if _sc:
+            st.session_state["_loaded_scalar_snapshot"] = _sc
+    except Exception:
+        pass
     for k, v in payload.get("scalar", {}).items():
         if k in DATE_KEYS and isinstance(v, str):
             try:
@@ -17296,19 +17328,25 @@ def concept_selector_section(default_start_date):
                 base_payload = fh.normalize_payload_tables(
                     collect_inputs_payload())
             # A base case loaded from the DB by an older version may be
-            # missing units / fluid / start_date. Backfill from the live
-            # session so the swept cases (and their exports) are never run or
-            # saved without these unit-critical scalars.
+            # missing units / fluid / start_date. Backfill from the durable
+            # loaded-case snapshot first (the case the user actually loaded),
+            # then the live session, so the swept cases (and their exports)
+            # are never run or saved without these unit-critical scalars and
+            # never silently flip to field/oil/today defaults.
             if isinstance(base_payload, dict):
                 base_payload.setdefault("scalar", {})
                 _bsc = base_payload["scalar"]
+                _snap2 = st.session_state.get("_loaded_scalar_snapshot") or {}
                 if not _bsc.get("units"):
-                    _bsc["units"] = st.session_state.get("units", "field")
+                    _bsc["units"] = (_snap2.get("units")
+                                     or st.session_state.get("units", "field"))
                 if not _bsc.get("fluid"):
-                    _bsc["fluid"] = st.session_state.get(
-                        "fluid", "Oil with associated gas")
+                    _bsc["fluid"] = (_snap2.get("fluid")
+                                     or st.session_state.get(
+                                         "fluid", "Oil with associated gas"))
                 if not _bsc.get("start_date"):
-                    _sd0 = st.session_state.get("start_date")
+                    _sd0 = _snap2.get("start_date") or st.session_state.get(
+                        "start_date")
                     if isinstance(_sd0, (date, datetime)):
                         _bsc["start_date"] = _sd0.isoformat()
                     elif isinstance(_sd0, str) and _sd0:
