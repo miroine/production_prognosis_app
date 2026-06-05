@@ -6886,6 +6886,21 @@ def economics_section(units, start_date):
                      "major issues — the builder will warn you.")
 
         st.markdown("**Wells & subsea hardware**")
+        # Count actual producers in the well table so the subsea-well count
+        # can default to (and be checked against) the real field, instead of
+        # silently sitting at a hard-coded 4 and drifting from the well table.
+        def _n_producers_in_table():
+            try:
+                _pdf = st.session_state.get("producers_df")
+                if _pdf is None or len(_pdf) == 0:
+                    return None
+                if "name" in _pdf.columns:
+                    return int((_pdf["name"].astype(str).str.strip() != "").sum())
+                return int(len(_pdf))
+            except Exception:
+                return None
+        _n_prod = _n_producers_in_table()
+        _subsea_default = int(_n_prod) if _n_prod else 4
         ws1, ws2, ws3, ws4 = st.columns(4)
         n_templates = ws1.number_input(
             "Subsea templates / manifolds", min_value=0, value=1, step=1,
@@ -6893,11 +6908,19 @@ def economics_section(units, start_date):
             help="Subsea structures that host and tie together multiple "
                  "wells. Cost depends on the slot count chosen below.")
         n_subsea_wells = ws2.number_input(
-            "Wells on wet (subsea) trees", min_value=0, value=4, step=1,
+            "Wells on wet (subsea) trees", min_value=0,
+            value=_subsea_default, step=1,
             key="dc_n_subsea_wells",
             help="Wells completed with subsea xmas trees on the seabed "
                  "(~$9MM/tree). Standard for tie-ins and floating hosts. "
-                 "Must fit within the template slot capacity.")
+                 "Must fit within the template slot capacity. Defaults to "
+                 "the number of producers in your well table.")
+        if _n_prod is not None and int(n_subsea_wells) != int(_n_prod):
+            ws2.caption(
+                f"⚠️ {int(n_subsea_wells)} subsea wells set, but the well "
+                f"table has {int(_n_prod)} producer(s) — the facility (trees, "
+                f"jumpers, meters, slots) will be sized for {int(n_subsea_wells)}, "
+                f"not {int(_n_prod)}. Align them unless this is deliberate.")
         n_dry_wells = ws3.number_input(
             "Wells on dry (surface) trees", min_value=0, value=0, step=1,
             key="dc_n_dry_wells",
@@ -11524,6 +11547,12 @@ def collect_inputs_payload() -> dict:
         "multi_res_enable",
         # New price keys (always $/bbl and $/MMBtu)
         "oil_price_bbl", "gas_price_mmbtu", "opex_var_bbl",
+        # Phase-specific variable OPEX (the actual live widget keys). These
+        # were missing from the export, so the variable OPEX you set in the
+        # live app never reached the saved YAML and the batch/concept reload
+        # fell back to a default. Export both so a reloaded case reproduces
+        # the live OPEX exactly.
+        "opex_var_oil", "opex_var_gas",
         "tariff_oil_bbl", "tariff_gas_mmbtu",
         # Old price keys retained for backward compatibility on load
         "oil_price", "gas_price", "opex_var",
@@ -13439,9 +13468,17 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
     # opex_var_gas (keyed by the primary phase), NOT opex_var_bbl/opex_var.
     # Read the phase-matched key first so the batch reproduces the live
     # variable-OPEX charge; fall back to the legacy keys for old payloads.
-    _fluid_l = str(scalar.get("fluid", "")).lower()
-    _is_gas_primary = ("gas" in _fluid_l and "condensate" not in _fluid_l) \
-        or _fluid_l.startswith("gas")
+    # Use the authoritative FLUID_SYSTEMS primary phase (NOT a substring
+    # guess): "Gas with condensate" is gas-PRIMARY, so it must read the
+    # opex_var_gas widget value exactly like the live path. The old
+    # substring test ("gas" in name and "condensate" not in name) wrongly
+    # classified gas-condensate as oil and read the wrong OPEX key.
+    _fluid_name = str(scalar.get("fluid", "Oil with associated gas"))
+    try:
+        _is_gas_primary = FLUID_SYSTEMS.get(
+            _fluid_name, {}).get("primary") == "gas"
+    except Exception:
+        _is_gas_primary = False
     _opex_phase_key = "opex_var_gas" if _is_gas_primary else "opex_var_oil"
     if _opex_phase_key in scalar and scalar.get(_opex_phase_key) is not None:
         opex_var_f = float(scalar.get(_opex_phase_key))
@@ -15352,7 +15389,8 @@ def batch_mode_section(units, fluid):
     else:
         st.success(f"All {n_ok} cases ran successfully.")
 
-    # Results table
+    # Results table — full KPI set mirroring the live Summary KPI table so a
+    # batch case can be compared line-for-line with the live Field prognosis.
     rows = []
     for r in results:
         k = r.get("kpis", {})
@@ -15360,9 +15398,20 @@ def batch_mode_section(units, fluid):
             "Case": r["name"],
             "Status": "✅ OK" if r["ok"] else "❌ FAILED",
             "Error": r.get("error") or "",
-            "NPV ($MM)": k.get("npv_MM"),
-            "Breakeven oil ($/bbl)": k.get("breakeven_oil"),
+            "NPV after-tax ($MM)": k.get("npv_MM"),
+            "NPV pre-tax ($MM)": k.get("npv_pretax_MM"),
+            "Fiscal take ($MM)": k.get("tax_MM"),
+            "IRR": k.get("irr"),
             "Payback (yrs)": k.get("payback_yrs"),
+            "Breakeven oil ($/bbl)": k.get("breakeven_oil"),
+            "CAPEX total ($MM)": k.get("capex_total_MM"),
+            "↳ Wells ($MM)": k.get("capex_well_MM"),
+            "↳ Facilities ($MM)": k.get("capex_facility_MM"),
+            "↳ Abandonment ($MM)": k.get("capex_abandonment_MM"),
+            "Revenue ($MM)": k.get("revenue_MM"),
+            "OPEX ($MM)": k.get("opex_MM"),
+            "CO₂ cost ($MM)": k.get("co2_cost_MM"),
+            "Resources (MMboe)": k.get("resources_mmboe"),
             "Cum oil (MMstb)": k.get("cum_oil_MMstb"),
             "Cum gas (Bscf)": k.get("cum_gas_Bscf"),
             "Final RF": k.get("final_rf"),
@@ -15370,10 +15419,15 @@ def batch_mode_section(units, fluid):
         })
     batch_df = pd.DataFrame(rows)
     fmt = {
-        "NPV ($MM)": "{:,.0f}", "Breakeven oil ($/bbl)": "{:,.1f}",
-        "Payback (yrs)": "{:,.1f}", "Cum oil (MMstb)": "{:,.2f}",
-        "Cum gas (Bscf)": "{:,.2f}", "Final RF": "{:.1%}",
-        "Peak rate": "{:,.0f}",
+        "NPV after-tax ($MM)": "{:,.0f}", "NPV pre-tax ($MM)": "{:,.0f}",
+        "Fiscal take ($MM)": "{:,.0f}", "IRR": "{:.1%}",
+        "Payback (yrs)": "{:,.1f}", "Breakeven oil ($/bbl)": "{:,.1f}",
+        "CAPEX total ($MM)": "{:,.0f}", "↳ Wells ($MM)": "{:,.0f}",
+        "↳ Facilities ($MM)": "{:,.0f}", "↳ Abandonment ($MM)": "{:,.0f}",
+        "Revenue ($MM)": "{:,.0f}", "OPEX ($MM)": "{:,.0f}",
+        "CO₂ cost ($MM)": "{:,.0f}", "Resources (MMboe)": "{:,.1f}",
+        "Cum oil (MMstb)": "{:,.2f}", "Cum gas (Bscf)": "{:,.2f}",
+        "Final RF": "{:.1%}", "Peak rate": "{:,.0f}",
     }
     # Only format columns that have at least one non-null value
     fmt = {c: f for c, f in fmt.items()
@@ -15384,25 +15438,42 @@ def batch_mode_section(units, fluid):
     except Exception:
         st.dataframe(batch_df, use_container_width=True, hide_index=True)
 
-    # Exports — build API-style payloads via the helper
+    # Exports — build API-style payloads via the helper, now carrying the
+    # FULL KPI set (same metrics as the live Summary KPI table) so a batch
+    # case can be reconciled against the live run field-by-field.
     headless_like = [
         {"name": r["name"], "ok": r["ok"], "error": r.get("error"),
          "kpis": {
-             "npv_MM": r["kpis"].get("npv_MM"),
-             "irr": None,
+             "npv_after_tax_MM": r["kpis"].get("npv_MM"),
+             "npv_pre_tax_MM": r["kpis"].get("npv_pretax_MM"),
+             "fiscal_take_MM": r["kpis"].get("tax_MM"),
+             "irr": r["kpis"].get("irr"),
              "payback_yrs": r["kpis"].get("payback_yrs"),
-             "cum_oil": r["kpis"].get("cum_oil_MMstb"),
-             "cum_gas": r["kpis"].get("cum_gas_Bscf"),
+             "breakeven_oil_bbl": r["kpis"].get("breakeven_oil"),
+             "capex_total_MM": r["kpis"].get("capex_total_MM"),
+             "capex_wells_MM": r["kpis"].get("capex_well_MM"),
+             "capex_facilities_MM": r["kpis"].get("capex_facility_MM"),
+             "capex_abandonment_MM": r["kpis"].get("capex_abandonment_MM"),
+             "revenue_MM": r["kpis"].get("revenue_MM"),
+             "revenue_oil_MM": r["kpis"].get("revenue_oil_MM"),
+             "revenue_gas_MM": r["kpis"].get("revenue_gas_MM"),
+             "revenue_ngl_MM": r["kpis"].get("revenue_ngl_MM"),
+             "opex_MM": r["kpis"].get("opex_MM"),
+             "co2_cost_MM": r["kpis"].get("co2_cost_MM"),
+             "co2_total_Mt": r["kpis"].get("co2_total_Mt"),
+             "resources_mmboe": r["kpis"].get("resources_mmboe"),
+             "cum_oil_MMstb": r["kpis"].get("cum_oil_MMstb"),
+             "cum_gas_Bscf": r["kpis"].get("cum_gas_Bscf"),
              "final_rf": r["kpis"].get("final_rf"),
              "peak_rate": r["kpis"].get("peak_primary_rate"),
          }}
         for r in results
     ]
-    exp1, exp2 = st.columns(2)
+    exp1, exp2, exp3 = st.columns(3)
     with exp1:
         try:
             csv_bytes = fh.batch_results_to_csv(headless_like).encode("utf-8")
-            st.download_button("⬇️ Download results as CSV", data=csv_bytes,
+            st.download_button("⬇️ Results CSV (full KPIs)", data=csv_bytes,
                                file_name="batch_results.csv", mime="text/csv",
                                use_container_width=True, key="batch_csv_dl")
         except Exception as exc:
@@ -15410,12 +15481,44 @@ def batch_mode_section(units, fluid):
     with exp2:
         try:
             json_bytes = fh.batch_results_to_json(headless_like).encode("utf-8")
-            st.download_button("⬇️ Download results as JSON (API format)",
+            st.download_button("⬇️ Results JSON (API format)",
                                data=json_bytes, file_name="batch_results.json",
                                mime="application/json",
                                use_container_width=True, key="batch_json_dl")
         except Exception as exc:
             st.error(f"JSON export failed: {exc}")
+    with exp3:
+        # Full Excel workbook: a Summary sheet (the KPI table above) plus one
+        # monthly-profile sheet per case — the same production/economics data
+        # the live Data tab shows, so the whole batch can be audited offline.
+        try:
+            import io as _io
+            xbuf = _io.BytesIO()
+            with pd.ExcelWriter(xbuf, engine="openpyxl") as _xw:
+                batch_df.to_excel(_xw, sheet_name="Summary", index=False)
+                for r in results:
+                    if not r.get("ok"):
+                        continue
+                    _dfd = r.get("df_disp")
+                    if _dfd is None:
+                        _dfd = r.get("df")
+                    if _dfd is None:
+                        continue
+                    # sanitise sheet name (Excel: ≤31 chars, no []:*?/\)
+                    _sn = "".join(c for c in str(r["name"])
+                                  if c not in "[]:*?/\\")[:28] or "case"
+                    try:
+                        _dfd.to_excel(_xw, sheet_name=_sn, index=False)
+                    except Exception:
+                        pass
+            st.download_button(
+                "⬇️ Full workbook (Excel)", data=xbuf.getvalue(),
+                file_name="batch_full_workbook.xlsx",
+                mime="application/vnd.openxmlformats-officedocument."
+                     "spreadsheetml.sheet",
+                use_container_width=True, key="batch_xlsx_dl")
+        except Exception as exc:
+            st.error(f"Excel export failed: {exc}")
     st.caption(
         "The JSON export is structured as an API-style response "
         "(`schema_version`, `generated_at`, `n_cases`, `n_ok`, `cases[]` with "
@@ -17443,6 +17546,11 @@ def concept_selector_section(default_start_date):
                     "picks": [(dim_name, label)],
                     "ok": res.get("ok", False),
                     "error": res.get("error"),
+                    # The fully-resolved payload that was fed to the engine
+                    # for THIS concept option (base + patches). Stored so the
+                    # user can export the exact single-case YAML and reload it
+                    # into the live view to reconcile any difference.
+                    "resolved_payload": case_payload,
                 }
                 results_new[key] = rec_payload
                 # Only cache genuinely successful results — never poison the
@@ -18017,6 +18125,81 @@ def concept_selector_section(default_start_date):
                 dl4.caption(f"JSON export unavailable: {_je}")
         except Exception as _e:
             dl2.info(f"YAML export unavailable: {_e}")
+
+        # ---- Per-concept single-case YAML export ----
+        # Each swept option carries its fully-resolved payload (base case +
+        # that option's patches). Let the user export any single one as a
+        # standalone YAML — identical in shape to a saved/live case — so they
+        # can inspect exactly how the concept was built and reload it into the
+        # live Field-prognosis view to reconcile any difference.
+        _exportable = [(k, r) for k, r in results.items()
+                       if r.get("resolved_payload")]
+        if _exportable:
+            with st.expander("🧬 Export a single concept case as YAML "
+                             "(inspect / reload into live)", expanded=False):
+                st.caption(
+                    "Pick any concept alternative below to download the exact "
+                    "single-case YAML that was run for it — base case plus "
+                    "that option's patches, fully resolved. Load it via "
+                    "**Field prognosis → Upload case** (or Batch mode) to see "
+                    "precisely how it was built and to compare against the "
+                    "live numbers.")
+                _opt_labels = []
+                _opt_map = {}
+                for _k, _r in _exportable:
+                    _lab = (f"{_r.get('dim', '?')} = {_r.get('label', '?')}"
+                            f"   (NPV "
+                            + (f"${_r.get('npv_MM'):,.0f}MM"
+                               if _r.get('npv_MM') is not None else "—")
+                            + ")")
+                    _opt_labels.append(_lab)
+                    _opt_map[_lab] = _r
+                _pick = st.selectbox(
+                    "Concept alternative", _opt_labels,
+                    key="concept_single_yaml_pick")
+                _chosen = _opt_map.get(_pick)
+                if _chosen is not None:
+                    try:
+                        _rp = dict(_chosen["resolved_payload"])
+                        # Strip transient run-meta so the file looks like a
+                        # clean saved case, then stamp the option identity.
+                        _rp.pop("_meta", None)
+                        _meta_out = {
+                            "name": (_chosen.get("name")
+                                     or f"{_chosen.get('dim')}_"
+                                        f"{_chosen.get('label')}"),
+                            "description":
+                                f"Concept Selector export — "
+                                f"{_chosen.get('dim')} = {_chosen.get('label')}",
+                        }
+                        _single_yaml = fh.payload_to_yaml(_rp, _meta_out)
+                        _safe = "".join(
+                            c if c.isalnum() or c in "-_" else "_"
+                            for c in str(_meta_out["name"]))[:40] or "concept"
+                        st.download_button(
+                            "📥 Download this concept case (YAML)",
+                            data=_single_yaml.encode("utf-8"),
+                            file_name=f"{_safe}.yaml",
+                            mime="text/yaml",
+                            use_container_width=True,
+                            key="concept_single_yaml_dl")
+                        # Show a short preview of the scalar block so the user
+                        # can eyeball the key inputs without leaving the app.
+                        try:
+                            _sc = _rp.get("scalar", {})
+                            _preview = {kk: _sc.get(kk) for kk in (
+                                "fluid", "strategy", "ooip", "ogip",
+                                "rf_target", "oil_price_bbl", "gas_price_mmbtu",
+                                "opex_var_oil", "opex_var_gas", "opex_fixed",
+                                "disc", "fiscal_regime") if kk in _sc}
+                            st.caption("Key scalar inputs in this case:")
+                            st.json(_preview, expanded=False)
+                        except Exception:
+                            pass
+                    except Exception as _ye:
+                        st.warning(f"Could not build YAML for this option: "
+                                   f"{_ye}")
+
         # Errors expander
         errs = [(r["name"], r["error"]) for r in results.values()
                 if not r.get("ok") and r.get("error")]

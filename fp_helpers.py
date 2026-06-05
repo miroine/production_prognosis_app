@@ -3201,22 +3201,25 @@ def parse_batch_yaml(yaml_text: str) -> list[tuple[dict, dict]]:
 
 
 def batch_results_to_csv(batch_results: list[dict]) -> str:
-    """Flatten a list of run_case_headless results into a KPI summary CSV."""
+    """Flatten a list of batch results into a KPI summary CSV.
+
+    Generic over whatever KPI keys are present, so the full live-equivalent
+    KPI set (NPV after/pre-tax, fiscal take, CAPEX breakdown, revenue split,
+    OPEX, CO2, resources, …) is exported without needing this function to
+    enumerate every metric.
+    """
     rows = []
     for r in batch_results:
-        k = r.get("kpis", {})
-        rows.append({
+        k = r.get("kpis", {}) or {}
+        row = {
             "case": r.get("name", ""),
             "status": "OK" if r.get("ok") else "FAILED",
             "error": r.get("error") or "",
-            "npv_MM": k.get("npv_MM"),
-            "irr": k.get("irr"),
-            "payback_yrs": k.get("payback_yrs"),
-            "cum_oil_MMstb": k.get("cum_oil"),
-            "cum_gas_Bscf": k.get("cum_gas"),
-            "final_rf": k.get("final_rf"),
-            "peak_primary_rate": k.get("peak_rate"),
-        })
+        }
+        # Append every KPI key in the order it appears.
+        for kk, vv in k.items():
+            row[kk] = vv
+        rows.append(row)
     return pd.DataFrame(rows).to_csv(index=False)
 
 
