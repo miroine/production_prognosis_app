@@ -8706,6 +8706,12 @@ def economics_section(units, start_date):
                      "Low ×": 0.90, "Likely/Mean ×": 1.0, "High ×": 1.60,
                      "SD (frac)": 0.25},
                 ])
+                st.caption(
+                    "Share % = how much of the total base CAPEX this driver "
+                    "scales. Multipliers (×) are relative to the base "
+                    "(1.0 = no change). Triangular uses Low/Likely/High; "
+                    "normal & lognormal use Likely/Mean + SD; uniform uses "
+                    "Low/High.")
                 _mc_tbl = st.data_editor(
                     _mc_default, key="dc_mc_drivers", hide_index=True,
                     use_container_width=True,
@@ -8713,14 +8719,14 @@ def economics_section(units, start_date):
                         "Distribution": st.column_config.SelectboxColumn(
                             options=["triangular", "normal",
                                      "lognormal", "uniform"]),
-                    },
-                    help="Share % = how much of the total base CAPEX this "
-                         "driver scales. Multipliers (×) are relative to the "
-                         "base (1.0 = no change). Triangular uses Low/Likely/"
-                         "High; normal & lognormal use Likely/Mean + SD; "
-                         "uniform uses Low/High.")
+                    })
 
                 st.markdown("**Correlation matrix (pairwise ρ)**")
+                st.caption(
+                    "Pairwise correlation between cost drivers (−1…+1). "
+                    "Positive means they tend to overrun together (common on "
+                    "NCS — a hot market lifts rig, fabrication and vessel "
+                    "rates at once). The diagonal is fixed at 1.")
                 _names_mc = list(_mc_tbl["Driver"])
                 _corr_default = pd.DataFrame(
                     np.eye(len(_names_mc)), columns=_names_mc, index=_names_mc)
@@ -8731,12 +8737,7 @@ def economics_section(units, start_date):
                             _corr_default.iloc[_i, _j] = 0.3
                 _corr_tbl = st.data_editor(
                     _corr_default, key="dc_mc_corr",
-                    use_container_width=True,
-                    help="Pairwise correlation between cost drivers "
-                         "(−1…+1). Positive means they tend to overrun "
-                         "together (common on NCS — a hot market lifts rig, "
-                         "fabrication and vessel rates at once). The diagonal "
-                         "is fixed at 1.")
+                    use_container_width=True)
 
                 _mc_n = st.select_slider(
                     "Monte-Carlo draws", options=[1000, 5000, 10000, 50000],
@@ -12109,9 +12110,9 @@ def collect_inputs_payload() -> dict:
         "dc_manhours", "dc_gas_lift", "dc_n_gas_lift_wells",
         "dc_heating_type", "dc_heated_km", "dc_hpht_choice",
         "dc_hipps", "dc_n_hipps", "dc_mpfm", "dc_n_mpfm",
-        "dc_days_per_well", "dc_meters_per_well",
+        "dc_days_per_well", "dc_meters_per_well", "dc_n_subsea_wells",
         "study_feasibility", "study_feed", "study_other",
-        "study_phase_years",
+        "study_phase_years", "link_study_to_capex",
         # Cost-input currency (input side — converts NOK costs to USD)
         "cost_input_currency", "usd_to_nok",
     ]
@@ -13976,15 +13977,50 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         pass
     if not fac_rows:
         fac_rows = [{"date": pd.Timestamp(start_date), "amount_MMUSD": 0.0, "label": ""}]
-    # Apply the CAPEX contingency multiplier exactly as the main app does
-    # (the stored fac_df / well-cost inputs are PRE-contingency). Without
-    # this the Concept Selector under-counts CAPEX vs Field prognosis and
-    # the two give different NPVs for the same case.
-    _cont_mult = 1.0 + float(scalar.get("capex_contingency_pct", 25)) / 100.0
+    # Apply the CAPEX contingency exactly as the main app does (the stored
+    # fac_df / well-cost inputs are PRE-contingency). The live UI splits
+    # contingency into Wells / SURF / Topside-host and applies the matching
+    # rate per facility row by STEA category; we mirror that here so the
+    # Concept Selector / batch runner give the SAME CAPEX (and NPV) as Field
+    # prognosis for the same case. Falls back to the legacy uniform
+    # capex_contingency_pct when the split keys are absent (old saved cases).
+    _legacy_cont = float(scalar.get("capex_contingency_pct", 25))
+    _cont_wells_mult = 1.0 + float(
+        scalar.get("capex_contingency_wells_pct", _legacy_cont)) / 100.0
+    _cont_surf_mult = 1.0 + float(
+        scalar.get("capex_contingency_surf_pct", _legacy_cont)) / 100.0
+    _cont_topside_mult = 1.0 + float(
+        scalar.get("capex_contingency_topside_pct", _legacy_cont)) / 100.0
+
+    def _payload_row_contingency(label):
+        try:
+            cat = fh.stea_investment_category(str(label or ""))
+        except Exception:
+            cat = ""
+        _c = str(cat).lower()
+        _l = str(label or "").lower()
+        if ("topside" in _c or "onshore" in _c or "host" in _c
+                or "transport" in _c
+                or any(k in _l for k in (
+                    "host facility", "installation", "hook-up", "hook up",
+                    "commissioning", "tie-in", "tie in", "topside"))):
+            return _cont_topside_mult
+        return _cont_surf_mult
+
     fac_df_cont = pd.DataFrame(fac_rows)
-    if "amount_MMUSD" in fac_df_cont.columns:
-        fac_df_cont["amount_MMUSD"] = (
-            fac_df_cont["amount_MMUSD"].astype(float) * _cont_mult)
+    if ("amount_MMUSD" in fac_df_cont.columns and len(fac_df_cont) > 0):
+        try:
+            _labels = (fac_df_cont["label"].tolist()
+                       if "label" in fac_df_cont.columns
+                       else [""] * len(fac_df_cont))
+            _mults = [_payload_row_contingency(_lb) for _lb in _labels]
+            fac_df_cont["amount_MMUSD"] = [
+                float(_a) * _m for _a, _m in zip(
+                    fac_df_cont["amount_MMUSD"].astype(float).tolist(),
+                    _mults)]
+        except Exception:
+            fac_df_cont["amount_MMUSD"] = (
+                fac_df_cont["amount_MMUSD"].astype(float) * _cont_surf_mult)
     facility_capex = CapexSchedule(df=fac_df_cont)
 
     aban_gas = float(scalar.get("aban_gas", 0.5))
@@ -14096,13 +14132,13 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "gas_price": gas_price_f,
         "opex_var":  opex_var_f,
         "opex_fixed": float(scalar.get("opex_fixed", 20)) * 1e6,
-        "capex_per_well": float(scalar.get("capex_well", 15)) * _cont_mult,
+        "capex_per_well": float(scalar.get("capex_well", 15)) * _cont_wells_mult,
         "discount_rate": float(scalar.get("disc", 0.10)),
         "tax_rate":      float(scalar.get("tax_rate", 0.30)),
         "royalty_rate":  float(scalar.get("royalty", 0.10)),
         "tariff_oil": tariff_oil_f,
         "tariff_gas": tariff_gas_f,
-        "abandonment_cost_MM": float(scalar.get("aban_cost", 80)) * _cont_mult,
+        "abandonment_cost_MM": float(scalar.get("aban_cost", 80)) * _cont_topside_mult,
         "facility_capex": facility_capex,
         "ngl_yield_bbl_per_mmscf": float(scalar.get("ngl_yield", 0.0)),
         "ngl_price_bbl": float(scalar.get("ngl_price", 25.0)),
@@ -14129,14 +14165,14 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "psc_govt_participation": float(scalar.get("psc_gov_part", 0.0)),
         "psc_psc_tax_rate": float(scalar.get("psc_tax", 0.30)),
         "psc_signature_bonus_MM": float(scalar.get("psc_sig_bonus", 0.0)),
-        # ---- Well cost model (rig-rate components carry contingency) ----
+        # ---- Well cost model (rig-rate components carry WELLS contingency) ----
         "well_cost_mode": str(scalar.get("well_cost_mode", "rig_rate")),
         "rig_day_rate_kUSD": float(
-            scalar.get("rig_dayrate", 500.0)) * _cont_mult,
+            scalar.get("rig_dayrate", 500.0)) * _cont_wells_mult,
         "completion_day_rate_kUSD": float(
-            scalar.get("cmpl_dayrate", 350.0)) * _cont_mult,
+            scalar.get("cmpl_dayrate", 350.0)) * _cont_wells_mult,
         "well_tangibles_MM": float(
-            scalar.get("well_tangibles", 4.0)) * _cont_mult,
+            scalar.get("well_tangibles", 4.0)) * _cont_wells_mult,
         "well_intangibles_pct": float(
             scalar.get("well_intangibles_pct", 0.10)),
         # ---- Money basis ----
