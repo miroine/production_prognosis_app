@@ -6286,6 +6286,27 @@ def _apply_button(buffer_df: pd.DataFrame, committed_df: pd.DataFrame,
 def economics_section(units, start_date):
     st.subheader("💰 Economics")
 
+    # Apply any drilling-cost suggestions staged by the Well Planner's
+    # "use these as drilling-cost suggestions" button. The button can't write
+    # the dc_days_per_well / dc_meters_per_well / well_tangibles widget keys
+    # directly (those number_inputs render below it, so Streamlit blocks a
+    # post-instantiation write), so it stashes pending values and reruns; we
+    # apply them HERE, before those widgets are created on the new run.
+    _pending_msg = None
+    for _pk, _wk in (("_pending_dc_days_per_well", "dc_days_per_well"),
+                     ("_pending_dc_meters_per_well", "dc_meters_per_well"),
+                     ("_pending_well_tangibles", "well_tangibles")):
+        if _pk in st.session_state:
+            try:
+                st.session_state[_wk] = float(st.session_state[_pk])
+            except Exception:
+                pass
+            del st.session_state[_pk]
+    if "_pending_drilling_msg" in st.session_state:
+        _pending_msg = st.session_state.pop("_pending_drilling_msg")
+    if _pending_msg:
+        st.success(_pending_msg)
+
     # ---- Collapsible "Economy" section ----
     # Groups every economic assumption (prices, OPEX, NGL, well-cost model,
     # discounting/tax/tariffs, study costs, fiscal regime) under one toggle so
@@ -17001,16 +17022,25 @@ def well_planner_section(units, fluid):
                                "and completion-tangibles into the Facilities "
                                "& cost drilling inputs. You can still edit "
                                "them there afterwards."):
-                st.session_state["dc_days_per_well"] = float(est_days)
-                st.session_state["dc_meters_per_well"] = float(
+                # Streamlit forbids writing a widget-backed session key after
+                # that widget has instantiated this run — and the drilling
+                # number_inputs (dc_days_per_well, dc_meters_per_well,
+                # well_tangibles) render ABOVE this button. So stage the values
+                # in separate "pending" keys and rerun; they're applied to the
+                # widget keys at the top of economics_section BEFORE those
+                # widgets are created (see _apply_pending_drilling_suggestions).
+                st.session_state["_pending_dc_days_per_well"] = float(est_days)
+                st.session_state["_pending_dc_meters_per_well"] = float(
                     est_meters if is_metric else est_meters / 0.3048)
-                st.session_state["well_tangibles"] = float(est_tangibles)
-                st.session_state["_stale"] = True
-                st.success(
+                st.session_state["_pending_well_tangibles"] = float(
+                    est_tangibles)
+                st.session_state["_pending_drilling_msg"] = (
                     f"Drilling-cost inputs updated: {est_days} days/well, "
                     f"{est_meters:,.0f} m/well, ${est_tangibles:,.1f} MM "
                     f"tangibles. Open **Facilities & cost → drilling** to "
                     f"review or override.")
+                st.session_state["_stale"] = True
+                st.rerun()
         except Exception as _e:
             st.info(f"Could not render the well schematic: {_e}")
 
