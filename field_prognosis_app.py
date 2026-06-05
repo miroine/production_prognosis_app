@@ -6286,6 +6286,47 @@ def _apply_button(buffer_df: pd.DataFrame, committed_df: pd.DataFrame,
 def economics_section(units, start_date):
     st.subheader("💰 Economics")
 
+    # ---- Collapsible "Economy" section ----
+    # Groups every economic assumption (prices, OPEX, NGL, well-cost model,
+    # discounting/tax/tariffs, study costs, fiscal regime) under one toggle so
+    # the user can fold the whole block away. Streamlit forbids nested
+    # expanders, so a section-level checkbox provides the collapse behaviour
+    # without illegal nesting.
+    _show_economy = st.checkbox(
+        "▾ Expand economy assumptions (prices, OPEX, fiscal, discounting, "
+        "study costs)", value=True, key="_show_economy",
+        help="One-click fold/unfold of the whole economics group below. When "
+             "ticked, every economy block opens; untick to collapse them all "
+             "into their headers. Your inputs are kept either way — you can "
+             "still open any single block by clicking its header.")
+    if _show_economy:
+        st.caption(
+            "All monetary assumptions live here: price deck, OPEX, NGL, the "
+            "well-cost model, discount rate / tax / tariffs / abandonment, "
+            "pre-sanction study costs and the fiscal regime. Untick the box "
+            "above to fold this whole group away.")
+
+    # Child "expander" replacement: inside the Economy group each former
+    # expander becomes a bold sub-header + a plain container (Streamlit
+    # forbids nesting expanders, and we want one master collapse). When the
+    # Economy section is hidden the body still executes — so every economics
+    # variable stays defined for compute_economics — but its widgets are
+    # routed into an empty, unrendered placeholder so nothing shows.
+    import contextlib as _contextlib
+
+    # Each economics block is a real expander. The master "Show economy
+    # assumptions" toggle controls whether they default expanded or collapsed,
+    # giving a one-click fold/unfold of the whole group without breaking the
+    # economics data flow (every widget always renders, so all downstream
+    # variables stay defined for compute_economics). Streamlit forbids nesting
+    # expanders, so this per-block approach is the robust way to "collapse the
+    # section".
+    @_contextlib.contextmanager
+    def _eco_block(label, expanded=None):
+        _exp = _show_economy if expanded is None else expanded
+        with st.expander(label, expanded=_exp):
+            yield
+
     with st.expander("ℹ️ Economic assumptions help", expanded=False):
         st.markdown(
             "- **Prices** are flat over the horizon (extend code for price decks).\n"
@@ -6304,7 +6345,7 @@ def economics_section(units, start_date):
     # natural-gas heating-value factor of 1.0 Mcf/MMBtu (a close screening
     # approximation; real values vary 0.95-1.10 with composition).
     MMBTU_PER_MCF = 1.0   # screening factor; engine treats gas_price as $/Mscf
-    with st.expander("💵 Prices & OPEX", expanded=False):
+    with _eco_block("💵 Prices & OPEX"):
         c1, c2, c3, c4 = st.columns(4)
         oil_price_bbl = c1.number_input(
             "Oil price ($/bbl)", value=75.0,
@@ -6365,7 +6406,7 @@ def economics_section(units, start_date):
     opex_var = float(opex_var_bbl)
 
     # ---- NGL (Natural Gas Liquids) ----
-    with st.expander("💎 NGL (Natural Gas Liquids) stream", expanded=False):
+    with _eco_block("💎 NGL (Natural Gas Liquids) stream"):
         st.markdown(
             "NGL = propane / butane / pentane+ extracted from the produced gas at "
             "a midstream plant. Modelled as a per-MMscf yield, priced per barrel. "
@@ -6417,8 +6458,7 @@ def economics_section(units, start_date):
             )
 
     # ---- Well cost (fixed vs rig-rate bottom-up) ----
-    with st.expander("⚒️ Well cost model (rig-rate or fixed $MM/well)",
-                     expanded=False):
+    with _eco_block("⚒️ Well cost model (rig-rate or fixed $MM/well)"):
         well_cost_mode = st.radio(
             "Method", ["rig_rate", "fixed"],
             format_func=lambda x: "Rig-rate (bottom-up)" if x == "rig_rate" else "Fixed $MM / well (legacy)",
@@ -6487,8 +6527,7 @@ def economics_section(units, start_date):
             well_tangibles_MM = 4.0
             well_intangibles_pct = 0.10
 
-    with st.expander("📊 Discount rate, tax, royalty, tariffs, abandonment",
-                     expanded=False):
+    with _eco_block("📊 Discount rate, tax, royalty, tariffs, abandonment"):  # noqa
         c2, c3, c4 = st.columns(3)
         disc = c2.slider("Discount rate", 0.0, 0.30, 0.10, 0.01,
                          key="disc", on_change=mark_stale)
@@ -6521,8 +6560,7 @@ def economics_section(units, start_date):
     # production. They are booked in the years leading up to production start
     # and flow through the economics (and the STEA 'Cost profiles' studies
     # rows + 'FEED studies (DG2-DG3)' investment row).
-    with st.expander("📚 Study & pre-sanction costs (Feasibility → FEED)",
-                     expanded=False):
+    with _eco_block("📚 Study & pre-sanction costs (Feasibility → FEED)"):
         st.caption(
             "Pre-sanction study spend incurred before first production. "
             "Feasibility & concept (DG1→DG2) and FEED (DG2→DG3) are entered "
@@ -6558,66 +6596,87 @@ def economics_section(units, start_date):
         _tot_study = (cost_input_to_usd(study_feas)
                       + cost_input_to_usd(study_feed)
                       + cost_input_to_usd(study_other))
+        # Option to roll the pre-sanction study spend into the total
+        # development-concept CAPEX (and show it as its own line in the CAPEX
+        # plot). When off, study spend still flows through NPV/STEA as before
+        # but is reported separately from concept CAPEX.
+        link_study = st.checkbox(
+            "🔗 Include study & pre-sanction cost in total development "
+            "concept CAPEX (adds a dedicated line to the CAPEX plot)",
+            value=st.session_state.get("link_study_to_capex", False),
+            key="link_study_to_capex",
+            help="On: the feasibility + FEED + other study spend is added to "
+                 "the development-concept CAPEX total and appears as its own "
+                 "'Pre-sanction studies (DG1–DG3)' bar in the concept CAPEX "
+                 "plot. Off: study spend still hits NPV and STEA but is not "
+                 "counted inside the concept CAPEX figure.")
         if _tot_study and _tot_study > 0:
             st.caption(f"Total pre-sanction study spend: "
                        f"${_tot_study:,.0f} MM "
                        f"(phased over {study_years} yr before first "
-                       f"production).")
+                       f"production)"
+                       + (" — included in concept CAPEX." if link_study
+                          else " — reported separately from concept CAPEX.")
+                       + "")
 
     # ---- Economic limit / cessation timing ----
-    st.markdown("**Cessation timing**")
-    cutoff_mode_label = st.radio(
-        "When does the field cease production?",
-        ["Full forecast horizon", "Economic limit (smart cut-off)"],
-        horizontal=True, key="economic_cutoff_mode_label", on_change=mark_stale,
-        help="Full forecast horizon: produce until the end of the forecast "
-             "period; cessation cost booked at the last producing month "
-             "(legacy behaviour).\n\n"
-             "Economic limit: the engine finds the month after which monthly "
-             "operating cashflow (revenue − royalty − tariff − OPEX) stays "
-             "negative, shuts the field in there, and books cessation at that "
-             "month. This is the self-consistent way to define field life — "
-             "you don't keep producing at a loss.",
-    )
-    economic_cutoff_mode = ("economic"
-                            if cutoff_mode_label.startswith("Economic")
-                            else "horizon")
-    economic_cutoff_persistence = 6
-    if economic_cutoff_mode == "economic":
-        economic_cutoff_persistence = st.slider(
-            "Consecutive negative-CF months before cessation",
-            1, 24, 6, 1, key="economic_cutoff_persistence",
+    with _eco_block("⏹️ Cessation timing"):
+        cutoff_mode_label = st.radio(
+            "When does the field cease production?",
+            ["Full forecast horizon", "Economic limit (smart cut-off)"],
+            horizontal=True, key="economic_cutoff_mode_label",
             on_change=mark_stale,
-            help="How many consecutive months of negative operating cashflow "
-                 "are required before declaring the economic limit. A higher "
-                 "value rides through transient dips (e.g. a maintenance "
-                 "month or a price trough); 6–12 months is typical.")
+            help="Full forecast horizon: produce until the end of the forecast "
+                 "period; cessation cost booked at the last producing month "
+                 "(legacy behaviour).\n\n"
+                 "Economic limit: the engine finds the month after which "
+                 "monthly operating cashflow (revenue − royalty − tariff − "
+                 "OPEX) stays negative, shuts the field in there, and books "
+                 "cessation at that month. This is the self-consistent way to "
+                 "define field life — you don't keep producing at a loss.",
+        )
+        economic_cutoff_mode = ("economic"
+                                if cutoff_mode_label.startswith("Economic")
+                                else "horizon")
+        economic_cutoff_persistence = 6
+        if economic_cutoff_mode == "economic":
+            economic_cutoff_persistence = st.slider(
+                "Consecutive negative-CF months before cessation",
+                1, 24, 6, 1, key="economic_cutoff_persistence",
+                on_change=mark_stale,
+                help="How many consecutive months of negative operating "
+                     "cashflow are required before declaring the economic "
+                     "limit. A higher value rides through transient dips "
+                     "(e.g. a maintenance month or a price trough); 6–12 "
+                     "months is typical.")
 
     # ---- Money basis (nominal vs real) ----
-    st.markdown("**Money basis**")
-    mb_col1, mb_col2 = st.columns([2, 1])
-    money_basis = mb_col1.radio(
-        "All cashflows in", ["Real (today's $)", "Nominal (escalated $)"],
-        horizontal=True, key="money_basis_label", on_change=mark_stale,
-        help="**Real**: costs and revenues remain in today's $. The discount "
-             "rate above is then a REAL discount rate (e.g. 7-10% typical).\n\n"
-             "**Nominal**: future cashflows are escalated by inflation each "
-             "year. The discount rate above is then a NOMINAL discount rate "
-             "(e.g. 10-13% typical). The two approaches give equivalent NPVs "
-             "if the discount rates and inflation are consistent — most "
-             "screening work uses real $.")
-    money_basis_for_engine = ("nominal"
-                               if money_basis.startswith("Nominal")
-                               else "real")
-    inflation_rate = 0.0
-    if money_basis_for_engine == "nominal":
-        inflation_rate = mb_col2.number_input(
-            "Inflation rate (%/yr)", min_value=0.0, max_value=15.0, value=2.5,
-            step=0.5, key="inflation_rate", on_change=mark_stale,
-            help="Annual inflation applied to every monthly cashflow "
-                 "(compounded monthly). 2-3% is typical for developed "
-                 "economies; 5-10% may be appropriate for high-inflation "
-                 "environments.") / 100.0
+    with _eco_block("💱 Money basis (real vs nominal)"):
+        mb_col1, mb_col2 = st.columns([2, 1])
+        money_basis = mb_col1.radio(
+            "All cashflows in", ["Real (today's $)", "Nominal (escalated $)"],
+            horizontal=True, key="money_basis_label", on_change=mark_stale,
+            help="**Real**: costs and revenues remain in today's $. The "
+                 "discount rate above is then a REAL discount rate (e.g. "
+                 "7-10% typical).\n\n"
+                 "**Nominal**: future cashflows are escalated by inflation "
+                 "each year. The discount rate above is then a NOMINAL "
+                 "discount rate (e.g. 10-13% typical). The two approaches give "
+                 "equivalent NPVs if the discount rates and inflation are "
+                 "consistent — most screening work uses real $.")
+        money_basis_for_engine = ("nominal"
+                                   if money_basis.startswith("Nominal")
+                                   else "real")
+        inflation_rate = 0.0
+        if money_basis_for_engine == "nominal":
+            inflation_rate = mb_col2.number_input(
+                "Inflation rate (%/yr)", min_value=0.0, max_value=15.0,
+                value=2.5, step=0.5, key="inflation_rate",
+                on_change=mark_stale,
+                help="Annual inflation applied to every monthly cashflow "
+                     "(compounded monthly). 2-3% is typical for developed "
+                     "economies; 5-10% may be appropriate for high-inflation "
+                     "environments.") / 100.0
 
     # ---- Cost-input currency (input side — costs can be entered in NOK and
     # the engine converts them to USD for the calculation; all RESULTS are
@@ -6731,35 +6790,35 @@ def economics_section(units, start_date):
     st.session_state.setdefault("_cost_rate_prev", float(nok_to_usd_rate))
 
     # ---- Fiscal regime (Tax/Royalty / PSC / NCS) ----
-    st.markdown("**Fiscal regime**")
-    regime = st.radio(
-        "Regime", ["Tax/Royalty", "PSC", "NCS (Norwegian shelf)"],
-        horizontal=True, key="fiscal_regime", on_change=mark_stale,
-        help="Tax/Royalty: simple regime — royalty on gross revenue, tax on positive pre-tax CF.\n\n"
-             "PSC: Production Sharing Contract — cost recovery, profit-oil "
-             "split between contractor and government, contractor tax on its "
-             "profit-oil share, optional carried-government participation.\n\n"
-             "NCS: Norwegian Continental Shelf — Corporate Income Tax (22%) "
-             "+ Special Petroleum Tax (71.8%) = ~78% effective on petroleum "
-             "profits, with an 'uplift' allowance (17.69% of capex booked in "
-             "the year of spend, deductible from the SPT base only) "
-             "compensating for non-deductibility of financing in SPT.",
-    )
-    # Normalize regime label for the engine
-    if regime == "NCS (Norwegian shelf)":
-        regime_for_engine = "NCS"
-    else:
-        regime_for_engine = regime
-    psc_cost_recovery_ceiling = 0.50
-    psc_profit_oil_share_contractor = 0.40
-    psc_govt_participation = 0.0
-    psc_psc_tax_rate = 0.30
-    psc_signature_bonus_MM = 0.0
-    ncs_cit_rate = 0.22
-    ncs_spt_rate = 0.718
-    ncs_uplift_rate = 0.1769
-    if regime == "NCS (Norwegian shelf)":
-        with st.expander("NCS parameters", expanded=True):
+    with _eco_block("🏛️ Fiscal regime (Tax/Royalty · PSC · NCS)"):
+        regime = st.radio(
+            "Regime", ["Tax/Royalty", "PSC", "NCS (Norwegian shelf)"],
+            horizontal=True, key="fiscal_regime", on_change=mark_stale,
+            help="Tax/Royalty: simple regime — royalty on gross revenue, tax on positive pre-tax CF.\n\n"
+                 "PSC: Production Sharing Contract — cost recovery, profit-oil "
+                 "split between contractor and government, contractor tax on its "
+                 "profit-oil share, optional carried-government participation.\n\n"
+                 "NCS: Norwegian Continental Shelf — Corporate Income Tax (22%) "
+                 "+ Special Petroleum Tax (71.8%) = ~78% effective on petroleum "
+                 "profits, with an 'uplift' allowance (17.69% of capex booked in "
+                 "the year of spend, deductible from the SPT base only) "
+                 "compensating for non-deductibility of financing in SPT.",
+        )
+        # Normalize regime label for the engine
+        if regime == "NCS (Norwegian shelf)":
+            regime_for_engine = "NCS"
+        else:
+            regime_for_engine = regime
+        psc_cost_recovery_ceiling = 0.50
+        psc_profit_oil_share_contractor = 0.40
+        psc_govt_participation = 0.0
+        psc_psc_tax_rate = 0.30
+        psc_signature_bonus_MM = 0.0
+        ncs_cit_rate = 0.22
+        ncs_spt_rate = 0.718
+        ncs_uplift_rate = 0.1769
+        if regime == "NCS (Norwegian shelf)":
+            st.markdown("*NCS parameters*")
             nc1, nc2, nc3 = st.columns(3)
             ncs_cit_rate = nc1.slider(
                 "Corporate income tax (CIT)", 0.10, 0.40, 0.22, 0.01,
@@ -6784,8 +6843,8 @@ def economics_section(units, start_date):
                 f"**{(ncs_cit_rate + ncs_spt_rate)*100:.0f}%**. "
                 f"Uplift of {ncs_uplift_rate*100:.2f}% × capex offsets the "
                 f"SPT base.")
-    if regime == "PSC":
-        with st.expander("PSC parameters", expanded=True):
+        if regime == "PSC":
+            st.markdown("*PSC parameters*")
             pc1, pc2, pc3 = st.columns(3)
             psc_cost_recovery_ceiling = pc1.slider(
                 "Cost recovery ceiling", 0.10, 1.00, 0.50, 0.05,
@@ -6936,19 +6995,29 @@ def economics_section(units, start_date):
         # Drilling metrics used for the NCS/UKCS benchmark cross-plots
         # (well cost vs days, vs meters). These don't change the CAPEX
         # estimate — they only place the project on the benchmark scatters.
+        st.caption(
+            "💡 Days & metres per well below feed the benchmark cross-plots. "
+            "Rather than guessing them, design the well in the **Well "
+            "Planner** just below and click *“use these as drilling-cost "
+            "suggestions”* — it writes the days, metres and completion "
+            "tangibles here from the planned trajectory + completion.")
         wsd1, wsd2 = st.columns(2)
         _ = wsd1.number_input(
-            "Days per well (for benchmarking)", min_value=1.0,
+            "Days per well (from Well Planner / editable)", min_value=1.0,
             value=60.0, step=1.0, key="dc_days_per_well",
             help="Average drilling + completion duration per well, in days. "
+                 "Best set via the Well Planner's cost-suggestion button "
+                 "(below), which derives it from the trajectory + completion. "
                  "Used to plot this project on the 'well cost vs days' and "
-                 "'days vs meters' benchmark cross-plots. Does not affect the "
-                 "cost estimate itself.")
+                 "'days vs meters' benchmark cross-plots.")
         _ = wsd2.number_input(
-            "Meters drilled per well (for benchmarking)", min_value=0.0,
+            "Meters drilled per well (from Well Planner / editable)",
+            min_value=0.0,
             value=4200.0, step=100.0, key="dc_meters_per_well",
-            help="Average measured depth drilled per well, in metres. Used "
-                 "for the benchmark cross-plots only.")
+            help="Average measured depth drilled per well, in metres. Best "
+                 "set via the Well Planner below (drilled length = TVD × "
+                 "trajectory path factor). Used for the benchmark "
+                 "cross-plots.")
 
         # ---- Well Planner — design the well here, next to its cost ----
         # Placed right by the drilling inputs so the planned trajectory and
@@ -7849,10 +7918,25 @@ def economics_section(units, start_date):
                 st.rerun()
 
             t = concept["totals"]
+            _study_link_usd = 0.0
+            try:
+                if st.session_state.get("link_study_to_capex", False):
+                    _study_link_usd = (
+                        cost_input_to_usd(
+                            float(st.session_state.get("study_feasibility", 0.0)))
+                        + cost_input_to_usd(
+                            float(st.session_state.get("study_feed", 0.0)))
+                        + cost_input_to_usd(
+                            float(st.session_state.get("study_other", 0.0))))
+            except Exception:
+                _study_link_usd = 0.0
+            _grand_with_study = t['grand_total'] + _study_link_usd
             st.caption(
                 f"**CAPEX excl. cessation: ${t['capex_excl_cessation']:,.0f}MM**  •  "
                 f"Cessation / P&A: ${t['cessation']:,.0f}MM  •  "
-                f"**Grand total: ${t['grand_total']:,.0f}MM**"
+                + (f"Pre-sanction studies: ${_study_link_usd:,.0f}MM  •  "
+                   if _study_link_usd > 0 else "")
+                + f"**Grand total: ${_grand_with_study:,.0f}MM**"
             )
             if cost_overrides:
                 # Show how the overrides shift the total vs benchmark
@@ -7875,6 +7959,24 @@ def economics_section(units, start_date):
             pie_df = pd.DataFrame(concept["capex_rows"])[
                 ["label", "amount_MMUSD"]].rename(
                 columns={"amount_MMUSD": "amount"})
+            # Item C/F: if the user linked pre-sanction study spend into the
+            # concept CAPEX, surface it as its own line in the plot + total.
+            try:
+                if st.session_state.get("link_study_to_capex", False):
+                    _study_usd = (
+                        cost_input_to_usd(
+                            float(st.session_state.get("study_feasibility", 0.0)))
+                        + cost_input_to_usd(
+                            float(st.session_state.get("study_feed", 0.0)))
+                        + cost_input_to_usd(
+                            float(st.session_state.get("study_other", 0.0))))
+                    if _study_usd and _study_usd > 0:
+                        pie_df = pd.concat([pie_df, pd.DataFrame([{
+                            "label": "Pre-sanction studies (DG1–DG3)",
+                            "amount": float(_study_usd)}])],
+                            ignore_index=True)
+            except Exception:
+                pass
             tot_amt = pie_df["amount"].sum()
             if tot_amt > 0:
                 threshold = 0.025 * tot_amt   # group anything < 2.5% as Other
@@ -8070,6 +8172,32 @@ def economics_section(units, start_date):
                              "that isn't a true analog).")
                     pf = peers_r[peers_r["name"].isin(kept)].copy()
 
+                    # --- Confidentiality: hide real field names ---
+                    # When ticked, every peer field is relabelled Field A,
+                    # Field B, … (stable A–Z order) so the cross-plots can be
+                    # shared externally without disclosing the analog set.
+                    _anon = st.checkbox(
+                        "🔒 Hide field names (anonymise as Field A, B, C…)",
+                        value=st.session_state.get("bm_anonymise", False),
+                        key="bm_anonymise",
+                        help="Replaces real peer-field names with anonymous "
+                             "labels in every plot and export — for sharing "
+                             "outside the asset team when the analog set is "
+                             "confidential.")
+                    if _anon and len(pf) > 0:
+                        pf = pf.reset_index(drop=True)
+                        _alias = {}
+                        for _i, _nm in enumerate(pf["name"].tolist()):
+                            _lab = ""
+                            _q = _i
+                            while True:
+                                _lab = chr(ord("A") + _q % 26) + _lab
+                                _q = _q // 26 - 1
+                                if _q < 0:
+                                    break
+                            _alias[_nm] = f"Field {_lab}"
+                        pf["name"] = pf["name"].map(_alias)
+
                     # --- The user's own project points ---
                     # Average well cost (MNOK) from the concept day-rates /
                     # tangibles if available, else from CAPEX-per-well.
@@ -8094,6 +8222,75 @@ def economics_section(units, start_date):
                         "dc_days_per_well", 60.0) or 60.0)
                     _mine_meters = float(st.session_state.get(
                         "dc_meters_per_well", 4200.0) or 4200.0)
+
+                    # --- Derive THIS project's subsea-facility / umbilical /
+                    # pipeline unit costs from the concept's own CAPEX rows, so
+                    # they plot as a red diamond against the peer cloud (item
+                    # F: subsea facility, umbilical and pipeline costs come
+                    # from the chosen concept, not entered separately).
+                    _mine_subsea_kNOK_well = None
+                    _mine_umb_len_m = None
+                    _mine_umb_unit = None
+                    _mine_pipe_len_m = None
+                    _mine_pipe_unit = None
+                    try:
+                        _rows_c = concept.get("capex_rows", [])
+                        _sum_lbl = lambda kw: sum(
+                            float(r.get("amount_MMUSD", 0))
+                            for r in _rows_c
+                            if any(k in str(r.get("label", "")).lower()
+                                   for k in kw))
+                        # Subsea production system $ → kNOK per well
+                        _subsea_MM = _sum_lbl([
+                            "xmas tree", "manifold", "template", "jumper",
+                            "control module", "riser base", "flow meter",
+                            "hipps"])
+                        if _np_prod > 0 and _subsea_MM > 0:
+                            _mine_subsea_kNOK_well = (
+                                _subsea_MM * _rate * 1000.0 / _np_prod)
+                        # Umbilical: length (m) and unit kNOK/m
+                        _umb_km = float(dc_spec.get("umbilical_km", 0) or 0)
+                        _umb_MM = _sum_lbl(["umbilical"])
+                        if _umb_km > 0:
+                            _mine_umb_len_m = _umb_km * 1000.0
+                            if _umb_MM > 0:
+                                _mine_umb_unit = (
+                                    _umb_MM * _rate * 1000.0
+                                    / (_umb_km * 1000.0))
+                        # Infield pipeline / flowline: length (m), unit kNOK/m
+                        _pipe_km = float(dc_spec.get("flowline_km", 0) or 0)
+                        _pipe_MM = _sum_lbl(["flowline", "pipeline", "spool"])
+                        if _pipe_km > 0:
+                            _mine_pipe_len_m = _pipe_km * 1000.0
+                            if _pipe_MM > 0:
+                                _mine_pipe_unit = (
+                                    _pipe_MM * _rate * 1000.0
+                                    / (_pipe_km * 1000.0))
+                    except Exception:
+                        pass
+                    # Respects the anonymise toggle, so a confidential-safe
+                    # file can be shared externally.
+                    try:
+                        _own_row = {c: None for c in pf.columns}
+                        if "name" in _own_row:
+                            _own_row["name"] = "This project"
+                        for _c, _v in (("well_cost_MNOK", _mine_well_MNOK),
+                                       ("days_per_well", _mine_days),
+                                       ("meters_per_well", _mine_meters)):
+                            if _c in _own_row:
+                                _own_row[_c] = _v
+                        _exp_out = pd.concat(
+                            [pf, pd.DataFrame([_own_row])], ignore_index=True)
+                        st.download_button(
+                            "⬇️ Export benchmark dataset (CSV)",
+                            data=_exp_out.to_csv(index=False).encode("utf-8"),
+                            file_name=("benchmark_fields_anonymised.csv"
+                                       if _anon else "benchmark_fields.csv"),
+                            mime="text/csv", key="bm_export_csv",
+                            help="Download the peer cloud plus your project's "
+                                 "point; respects the anonymise toggle.")
+                    except Exception:
+                        pass
 
                     def _scatter(xcol, ycol, xlabel, ylabel, title,
                                   mine_x=None, mine_y=None, logfit=False):
@@ -8176,7 +8373,7 @@ def economics_section(units, start_date):
                             "Number of wells",
                             "Subsea facility unit cost (kNOK/well)",
                             "Subsea facility unit cost vs number of wells",
-                            _np_prod, None, logfit=True),
+                            _np_prod, _mine_subsea_kNOK_well, logfit=True),
                             use_container_width=True)
                     cpc, cpd = st.columns(2)
                     with cpc:
@@ -8184,14 +8381,16 @@ def economics_section(units, start_date):
                             "umb_length_m", "umb_unit_kNOK_m",
                             "Total umbilical length (m)",
                             "Umbilical unit cost (kNOK/m)",
-                            "Umbilical unit cost vs length"),
+                            "Umbilical unit cost vs length",
+                            _mine_umb_len_m, _mine_umb_unit),
                             use_container_width=True)
                     with cpd:
                         st.plotly_chart(_scatter(
                             "pipe_length_m", "pipe_unit_kNOK_m",
                             "Infield pipeline length (m)",
                             "Infield pipeline unit cost (kNOK/m)",
-                            "Infield pipeline unit cost vs length"),
+                            "Infield pipeline unit cost vs length",
+                            _mine_pipe_len_m, _mine_pipe_unit),
                             use_container_width=True)
                     st.caption(
                         "Peer points are screening-level NCS/UKCS anchors "
@@ -8254,10 +8453,32 @@ def economics_section(units, start_date):
                              expanded=False):
                 st.caption(
                     "How sensitive is the development CAPEX to the concept "
-                    "choices? Each row re-runs the concept with one "
-                    "decision changed, holding everything else fixed. Use "
-                    "it to see which decision — host type, water depth, "
-                    "well count, tie-back length — drives the cost.")
+                    "choices? Each selected element is re-run with one "
+                    "decision changed, holding everything else fixed. Pick "
+                    "which elements to test and the ± swing, then run.")
+
+                # User control: which elements to sensitise + the swing %.
+                _all_elems = [
+                    "Water depth class", "Subsea well count",
+                    "Tie-back distance", "Flowline diameter",
+                    "Template slots", "HPHT tier", "Manhours / topside mod",
+                    "Umbilical length", "Number of risers",
+                ]
+                _sel_elems = st.multiselect(
+                    "Elements to sensitise", _all_elems,
+                    default=["Water depth class", "Subsea well count",
+                             "Tie-back distance", "HPHT tier"],
+                    key="dc_sens_elements",
+                    help="Choose which concept decisions to perturb. Each "
+                         "produces an up/down bar in the tornado.")
+                _swing = st.slider(
+                    "± swing applied to numeric elements (%)",
+                    5, 75, 25, 5, key="dc_sens_swing_pct",
+                    help="The percentage step applied to numeric decisions "
+                         "(well count, tie-back, flowline diameter, "
+                         "umbilical length, risers). Categorical decisions "
+                         "(water-depth class, HPHT) step by one tier.")
+                _frac = _swing / 100.0
                 if st.button("Run concept sensitivity",
                              key="dc_concept_sens"):
                     base_capex = concept["totals"]["grand_total"]
@@ -8272,13 +8493,12 @@ def economics_section(units, start_date):
                         except Exception:
                             return base_capex
 
-                    # Define the perturbations to test
                     perturbations = []
-                    # water depth one class deeper / shallower
                     _wd_order = ["Shallow (<150 m)", "Mid (150-600 m)",
                                  "Deep (600-1500 m)",
                                  "Ultra-deep (>1500 m)"]
-                    if water_depth_class in _wd_order:
+                    if "Water depth class" in _sel_elems \
+                            and water_depth_class in _wd_order:
                         _wi = _wd_order.index(water_depth_class)
                         if _wi > 0:
                             perturbations.append(
@@ -8288,38 +8508,84 @@ def economics_section(units, start_date):
                             perturbations.append(
                                 ("Water depth one class deeper",
                                  {"water_depth_class": _wd_order[_wi+1]}))
-                    # well count +/- 25%
-                    _nw = int(dc_spec.get("n_subsea_wells", 0))
-                    if _nw > 0:
-                        perturbations.append(
-                            ("Subsea wells +25%",
-                             {"n_subsea_wells": int(round(_nw * 1.25))}))
-                        perturbations.append(
-                            ("Subsea wells -25%",
-                             {"n_subsea_wells": max(1,
-                                                    int(round(_nw*0.75)))}))
-                    # tie-back distance +/- 30%
-                    _hd = float(dc_spec.get("host_distance_km", 0))
-                    if _hd > 0:
-                        perturbations.append(
-                            ("Tie-back +30% longer",
-                             {"host_distance_km": _hd * 1.3,
-                              "flowline_km": float(
-                                  dc_spec.get("flowline_km", _hd)) * 1.3,
-                              "umbilical_km": float(
-                                  dc_spec.get("umbilical_km", _hd)) * 1.3}))
-                        perturbations.append(
-                            ("Tie-back -30% shorter",
-                             {"host_distance_km": _hd * 0.7,
-                              "flowline_km": float(
-                                  dc_spec.get("flowline_km", _hd)) * 0.7,
-                              "umbilical_km": float(
-                                  dc_spec.get("umbilical_km", _hd)) * 0.7}))
-                    # HPHT tier up
-                    if dc_spec.get("hpht_tier", "Standard") == "Standard":
-                        perturbations.append(
-                            ("HPHT conditions (vs standard)",
-                             {"hpht_tier": "HPHT"}))
+                    if "Subsea well count" in _sel_elems:
+                        _nw = int(dc_spec.get("n_subsea_wells", 0))
+                        if _nw > 0:
+                            perturbations.append(
+                                (f"Subsea wells +{_swing}%",
+                                 {"n_subsea_wells":
+                                  int(round(_nw * (1 + _frac)))}))
+                            perturbations.append(
+                                (f"Subsea wells -{_swing}%",
+                                 {"n_subsea_wells":
+                                  max(1, int(round(_nw * (1 - _frac))))}))
+                    if "Tie-back distance" in _sel_elems:
+                        _hd = float(dc_spec.get("host_distance_km", 0))
+                        _fl = float(dc_spec.get("flowline_km", _hd))
+                        _um = float(dc_spec.get("umbilical_km", _hd))
+                        if _hd > 0 or _fl > 0:
+                            perturbations.append(
+                                (f"Tie-back +{_swing}% longer",
+                                 {"host_distance_km": _hd * (1 + _frac),
+                                  "flowline_km": _fl * (1 + _frac),
+                                  "umbilical_km": _um * (1 + _frac)}))
+                            perturbations.append(
+                                (f"Tie-back -{_swing}% shorter",
+                                 {"host_distance_km": _hd * (1 - _frac),
+                                  "flowline_km": _fl * (1 - _frac),
+                                  "umbilical_km": _um * (1 - _frac)}))
+                    if "Flowline diameter" in _sel_elems:
+                        _fd = float(dc_spec.get("flowline_diam", 0) or 0)
+                        if _fd > 0:
+                            perturbations.append(
+                                (f"Flowline diameter +{_swing}%",
+                                 {"flowline_diam": _fd * (1 + _frac)}))
+                            perturbations.append(
+                                (f"Flowline diameter -{_swing}%",
+                                 {"flowline_diam": _fd * (1 - _frac)}))
+                    if "Template slots" in _sel_elems:
+                        _nt = int(dc_spec.get("n_templates", 0) or 0)
+                        if _nt > 0:
+                            perturbations.append(
+                                ("Templates +1",
+                                 {"n_templates": _nt + 1}))
+                            if _nt > 1:
+                                perturbations.append(
+                                    ("Templates -1",
+                                     {"n_templates": _nt - 1}))
+                    if "Umbilical length" in _sel_elems:
+                        _um = float(dc_spec.get("umbilical_km", 0) or 0)
+                        if _um > 0:
+                            perturbations.append(
+                                (f"Umbilical +{_swing}%",
+                                 {"umbilical_km": _um * (1 + _frac)}))
+                            perturbations.append(
+                                (f"Umbilical -{_swing}%",
+                                 {"umbilical_km": _um * (1 - _frac)}))
+                    if "Number of risers" in _sel_elems:
+                        _nr = int(dc_spec.get("n_risers", 0) or 0)
+                        if _nr > 0:
+                            perturbations.append(
+                                ("Risers +1", {"n_risers": _nr + 1}))
+                            if _nr > 1:
+                                perturbations.append(
+                                    ("Risers -1", {"n_risers": _nr - 1}))
+                    if "Manhours / topside mod" in _sel_elems:
+                        _mh = float(dc_spec.get("offshore_manhours", 0) or 0)
+                        _tt = float(dc_spec.get("topside_mod_tonnes", 0) or 0)
+                        if _mh > 0:
+                            perturbations.append(
+                                (f"Offshore manhours +{_swing}%",
+                                 {"offshore_manhours": _mh * (1 + _frac)}))
+                        if _tt > 0:
+                            perturbations.append(
+                                (f"Topside mod tonnes +{_swing}%",
+                                 {"topside_mod_tonnes": _tt * (1 + _frac)}))
+                    if "HPHT tier" in _sel_elems:
+                        if dc_spec.get("hpht_tier", "Standard") == "Standard":
+                            perturbations.append(
+                                ("HPHT conditions (vs standard)",
+                                 {"hpht_tier": "HPHT"}))
 
                     for label, override in perturbations:
                         capex = _capex_of(override)
