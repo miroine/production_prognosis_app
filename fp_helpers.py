@@ -3664,10 +3664,19 @@ def stea_investment_category(label: str) -> str:
     if ("other studies" in s or "g&g" in s or "g&a" in s
             or "seismic" in s or "country office" in s):
         return "Other studies"
-    # Transport / export system
-    if any(k in s for k in ("export pipeline", "export line", "transport",
-                            "loading buoy", "tie-in spool", "spool",
-                            "pipeline to shore", "trunkline")):
+    # Installation / hook-up / commissioning and tie-in connection scope are
+    # execution costs tied to the host/subsea build, NOT export transport.
+    # Classify them before the transport check so a "Rigid spool" connector or
+    # a "tie-in spool" isn't mis-bucketed as a transport/export pipeline.
+    if any(k in s for k in ("installation", "hook-up", "hook up",
+                            "commissioning", "tie-in spool", "tie-in",
+                            "tie in", "host connection")):
+        return "Topside"
+    # Transport / export system — genuine export infrastructure only.
+    if any(k in s for k in ("export pipeline", "export line", "export riser",
+                            "loading buoy", "offloading", "pipeline to shore",
+                            "trunkline", "gas export", "oil export",
+                            "transport")):
         return "Transport system"
     # Onshore scope (power-from-shore, onshore CPF, onshore terminal)
     if any(k in s for k in ("onshore", "power from shore", "power-from-shore",
