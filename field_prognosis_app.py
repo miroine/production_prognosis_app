@@ -13345,9 +13345,18 @@ def build_stea_workbook(cases):
     if gmin < anchor_year:
         anchor_year = gmin
 
+    _used_titles = {}
     for c, annual in annuals:
-        title = str(c.get("name", "case"))[:31]
-        ws = wb.create_sheet(title=title or "case")
+        title = str(c.get("name", "case"))[:31] or "case"
+        # openpyxl rejects duplicate sheet names — disambiguate by suffixing
+        # " (2)", " (3)", … while keeping within the 31-char limit.
+        if title in _used_titles:
+            _used_titles[title] += 1
+            _suf = f" ({_used_titles[title]})"
+            title = title[:31 - len(_suf)] + _suf
+        else:
+            _used_titles[title] = 1
+        ws = wb.create_sheet(title=title)
         # Header row
         ws.cell(row=1, column=2, value="Name")
         ws.cell(row=1, column=3, value="Price name")
@@ -16506,6 +16515,8 @@ def _concept_doc_to_matrix(doc):
                 "label": o.get("label", f"Option {oi+1}"),
                 "description": o.get("description", ""),
                 "patches": o.get("patches", {}) or {},
+                "manual_mode": o.get("manual_mode", False),
+                "manual_kpis": o.get("manual_kpis", {}) or {},
             })
             if o.get("swept", True):
                 sel.add(oi)
@@ -17289,6 +17300,95 @@ def concept_selector_section(default_start_date):
         else:
             st.info("**Base case:** current sidebar inputs (live).")
 
+    # ---- Import KPIs from CSV (manual / external options) -----------------
+    # Lets the user bring in KPI values for options from a spreadsheet (study
+    # report figures, a partner's estimate, another tool) instead of running
+    # an engine case. Rows are matched to options by their label; matched
+    # options are switched to manual mode and coloured/ranked with everyone
+    # else.
+    with st.expander("📥 Import option KPIs from CSV (manual / external "
+                      "cases — no YAML needed)", expanded=False):
+        st.caption(
+            "Upload a CSV with one row per option. The **label** column is "
+            "matched (case-insensitive) to an option's label in any "
+            "dimension; matched options are switched to *manual KPI* mode and "
+            "their values flow into the garden colours and every ranking. "
+            "Recognised columns (all optional except label): "
+            "`label, npv_MM, npv_pretax_MM, capex_total_MM, capex_facility_MM, "
+            "capex_well_MM, breakeven_oil, cum_primary, final_rf, irr, "
+            "payback_yrs, co2_total_Mt, resources_mmboe`. "
+            "Tip: download the template below to get the exact headers.")
+        # Downloadable template
+        _tmpl_cols = ["label", "npv_MM", "npv_pretax_MM", "capex_total_MM",
+                      "capex_facility_MM", "capex_well_MM", "breakeven_oil",
+                      "cum_primary", "final_rf", "irr", "payback_yrs",
+                      "co2_total_Mt", "resources_mmboe"]
+        _tmpl_rows = []
+        for _d in dimensions:
+            for _o in _d.get("options", []):
+                _tmpl_rows.append({"label": _o.get("label", "")})
+        _tmpl_df = pd.DataFrame(_tmpl_rows or [{"label": "Option A"}],
+                                columns=_tmpl_cols)
+        st.download_button(
+            "⬇️ Download CSV template (pre-filled with your option labels)",
+            data=_tmpl_df.to_csv(index=False).encode("utf-8"),
+            file_name="concept_kpi_template.csv", mime="text/csv",
+            key="concept_kpi_tmpl")
+        _kpi_csv = st.file_uploader(
+            "Upload KPI CSV", type=["csv"], key="concept_kpi_csv_upload")
+        if _kpi_csv is not None and st.button(
+                "Apply CSV KPIs to matching options",
+                key="concept_kpi_csv_apply"):
+            try:
+                _imp = pd.read_csv(_kpi_csv)
+                _imp.columns = [str(c).strip() for c in _imp.columns]
+                if "label" not in _imp.columns:
+                    st.error("CSV must have a 'label' column matching your "
+                             "option labels.")
+                else:
+                    _num_cols = [c for c in _tmpl_cols if c != "label"]
+                    # Build a label → kpis map (lower-cased labels)
+                    _lab_map = {}
+                    for _, _row in _imp.iterrows():
+                        _lab = str(_row.get("label", "")).strip().lower()
+                        if not _lab:
+                            continue
+                        _kp = {}
+                        for _c in _num_cols:
+                            if _c in _imp.columns:
+                                try:
+                                    _v = float(_row[_c])
+                                    if _v not in (0.0,) and pd.notna(_v):
+                                        _kp[_c] = _v
+                                except (ValueError, TypeError):
+                                    pass
+                        if _kp:
+                            _lab_map[_lab] = _kp
+                    # Apply to matching options across all dimensions
+                    _matched = 0
+                    for _d in dimensions:
+                        for _o in _d.get("options", []):
+                            _lab = str(_o.get("label", "")).strip().lower()
+                            if _lab in _lab_map:
+                                _o["manual_mode"] = True
+                                _o["manual_kpis"] = dict(_lab_map[_lab])
+                                _matched += 1
+                    if _matched:
+                        st.session_state["concept_dimensions"] = dimensions
+                        st.success(
+                            f"Applied imported KPIs to {_matched} option(s). "
+                            f"They're now in manual mode — tick them and run "
+                            f"to see them coloured/ranked. Unmatched labels: "
+                            f"{', '.join(sorted(set(_lab_map) - {str(o.get('label','')).strip().lower() for d in dimensions for o in d.get('options', [])})) or 'none'}.")
+                        st.rerun()
+                    else:
+                        st.warning(
+                            "No CSV labels matched any option labels. Check "
+                            "the spelling, or download the template above "
+                            "which is pre-filled with your exact labels.")
+            except Exception as _e:
+                st.error(f"Could not read CSV: {_e}")
+
     # ---- Study library: save / load / import the whole matrix ----
     with st.expander("💾 Study library — save, load & import concept "
                       "matrices", expanded=False):
@@ -17727,6 +17827,99 @@ def concept_selector_section(default_start_date):
                             + ("**with** the patches above."
                                if _apply_flag else
                                "**exactly as saved** (no modifications)."))
+                    # ---- Manual / imported KPI entry ----
+                    # Lets the user supply KPI values directly (typed or from
+                    # a CSV) instead of running an engine case — useful to
+                    # benchmark a concept against figures from a study report
+                    # or another tool. When enabled, this option is NOT run
+                    # through the engine; its KPIs flow straight into the
+                    # colouring and ranking alongside computed options.
+                    _mk_cur = opt.get("manual_kpis") or {}
+                    _mk_on = st.checkbox(
+                        "✍️ Enter KPIs manually for this option "
+                        "(skip engine — use typed / imported values)",
+                        value=bool(opt.get("manual_mode", False)),
+                        key=f"concept_opt_{_oid}_manualmode",
+                        help="Tick to supply NPV / CAPEX / break-even / "
+                             "production etc. directly instead of running a "
+                             "case. These values are used in the garden "
+                             "colours and every ranking exactly like computed "
+                             "options. Handy for dropping in numbers from a "
+                             "study report, a partner's estimate, or another "
+                             "tool — no YAML needed.")
+                    opt["manual_mode"] = _mk_on
+                    if _mk_on:
+                        mkc1, mkc2, mkc3 = st.columns(3)
+                        _mk_new = {}
+                        _mk_new["npv_MM"] = mkc1.number_input(
+                            "NPV after-tax ($MM)",
+                            value=float(_mk_cur.get("npv_MM", 0.0) or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_npv")
+                        _mk_new["npv_pretax_MM"] = mkc2.number_input(
+                            "NPV pre-tax ($MM)",
+                            value=float(_mk_cur.get("npv_pretax_MM", 0.0)
+                                        or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_npvpt")
+                        _mk_new["capex_total_MM"] = mkc3.number_input(
+                            "CAPEX total ($MM)",
+                            value=float(_mk_cur.get("capex_total_MM", 0.0)
+                                        or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_capex")
+                        _mk_new["capex_facility_MM"] = mkc1.number_input(
+                            "CAPEX facilities ($MM)",
+                            value=float(_mk_cur.get("capex_facility_MM", 0.0)
+                                        or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_capfac")
+                        _mk_new["capex_well_MM"] = mkc2.number_input(
+                            "CAPEX wells ($MM)",
+                            value=float(_mk_cur.get("capex_well_MM", 0.0)
+                                        or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_capwell")
+                        _mk_new["breakeven_oil"] = mkc3.number_input(
+                            "Break-even ($/bbl or $/boe)",
+                            value=float(_mk_cur.get("breakeven_oil", 0.0)
+                                        or 0.0),
+                            step=1.0, key=f"concept_opt_{_oid}_mk_be")
+                        _mk_new["cum_primary"] = mkc1.number_input(
+                            "Total production (MMboe or display unit)",
+                            value=float(_mk_cur.get("cum_primary", 0.0)
+                                        or 0.0),
+                            step=1.0, key=f"concept_opt_{_oid}_mk_prod")
+                        _mk_new["final_rf"] = mkc2.number_input(
+                            "Recovery factor (fraction 0–1)",
+                            value=float(_mk_cur.get("final_rf", 0.0) or 0.0),
+                            min_value=0.0, max_value=1.0, step=0.01,
+                            key=f"concept_opt_{_oid}_mk_rf")
+                        _mk_new["irr"] = mkc3.number_input(
+                            "IRR (fraction, e.g. 0.18)",
+                            value=float(_mk_cur.get("irr", 0.0) or 0.0),
+                            step=0.01, key=f"concept_opt_{_oid}_mk_irr")
+                        _mk_new["payback_yrs"] = mkc1.number_input(
+                            "Payback (years)",
+                            value=float(_mk_cur.get("payback_yrs", 0.0)
+                                        or 0.0),
+                            step=0.5, key=f"concept_opt_{_oid}_mk_pb")
+                        _mk_new["co2_total_Mt"] = mkc2.number_input(
+                            "CO₂ total (Mt)",
+                            value=float(_mk_cur.get("co2_total_Mt", 0.0)
+                                        or 0.0),
+                            step=0.1, key=f"concept_opt_{_oid}_mk_co2")
+                        _mk_new["resources_mmboe"] = mkc3.number_input(
+                            "Resources (MMboe)",
+                            value=float(_mk_cur.get("resources_mmboe", 0.0)
+                                        or 0.0),
+                            step=1.0, key=f"concept_opt_{_oid}_mk_res")
+                        # Keep only non-zero entries so blanks don't override
+                        # a metric that other options compute (zero NPV would
+                        # otherwise drag the colour scale).
+                        opt["manual_kpis"] = {
+                            k: v for k, v in _mk_new.items()
+                            if v not in (0.0, 0, None)}
+                        st.caption(
+                            "These values are used as-is in the garden "
+                            "colours and all rankings. Leave a field at 0 to "
+                            "omit it. This option will show "
+                            "**“manual”** as its source.")
                     # store the patch draft alongside the label/desc draft
                     _opt_drafts[-1] = (opt, _draft_label, _draft_desc,
                                         _draft_patch_str)
@@ -18006,6 +18199,53 @@ def concept_selector_section(default_start_date):
                 _case_source += "  (patches ignored — linked case run as-is)"
             case_payload.setdefault("_meta", {})["name"] = name
             key = (dim_name, label)
+
+            # ---- Manual / imported KPI option (skip the engine) ----
+            # If the user supplied KPIs directly (typed or via CSV import),
+            # build the result record straight from them so they participate
+            # in colouring + ranking exactly like computed options. No engine
+            # run, no caching by payload signature.
+            if opt.get("manual_mode") and opt.get("manual_kpis"):
+                _mk = opt["manual_kpis"]
+                def _mkv(k):
+                    v = _mk.get(k)
+                    return float(v) if v not in (None, "") else None
+                results_new[key] = {
+                    "name": name, "dim": dim_name, "label": label,
+                    "npv_MM": _mkv("npv_MM"),
+                    "npv_pretax_MM": _mkv("npv_pretax_MM"),
+                    "cum_primary": _mkv("cum_primary"),
+                    "final_rf": _mkv("final_rf"),
+                    "irr": _mkv("irr"),
+                    "breakeven_oil": _mkv("breakeven_oil"),
+                    "capex_disc_MM": _mkv("capex_total_MM"),
+                    "capex_total_MM": _mkv("capex_total_MM"),
+                    "capex_well_MM": _mkv("capex_well_MM"),
+                    "capex_facility_MM": _mkv("capex_facility_MM"),
+                    "capex_abandonment_MM": _mkv("capex_abandonment_MM"),
+                    "revenue_MM": _mkv("revenue_MM"),
+                    "opex_MM": _mkv("opex_MM"),
+                    "tax_MM": _mkv("tax_MM"),
+                    "co2_cost_MM": _mkv("co2_cost_MM"),
+                    "payback_yrs": _mkv("payback_yrs"),
+                    "resources_mmboe": _mkv("resources_mmboe"),
+                    "co2_total_Mt": _mkv("co2_total_Mt"),
+                    "npv_p90": None, "npv_p10": None, "npv_mc_mean": None,
+                    "mc_draws": None, "profile": None,
+                    "fluid": st.session_state.get("fluid"),
+                    "units": st.session_state.get("units", "field"),
+                    "picks": [(dim_name, label)],
+                    "ok": True, "error": None,
+                    "manual": True,
+                    "source": "✍️ manual / imported KPIs",
+                    "case_source": "manual / imported KPIs",
+                    "resolved_payload": None,
+                }
+                done += 1
+                progress.progress(done / max(total, 1),
+                                   text=f"Running cases… {done}/{total} "
+                                        f"(cache hits: {cache_hits})")
+                continue
 
             try:
                 _payload_sig = json.dumps(case_payload, sort_keys=True,
@@ -18298,6 +18538,7 @@ def concept_selector_section(default_start_date):
                     "picks": [(dim_name, label)],
                     "ok": res.get("ok", False),
                     "error": res.get("error"),
+                    "source": _case_source,
                     # The fully-resolved payload that was fed to the engine
                     # for THIS concept option (base + patches). Stored so the
                     # user can export the exact single-case YAML and reload it
@@ -18575,8 +18816,11 @@ def concept_selector_section(default_start_date):
             use_container_width=True)
 
         # ---- STEA export (all swept cases, one sheet each) ----
+        # Quick "everything" button stays in the download row; a selectable
+        # variant lives in the expander just below for choosing which
+        # concepts go into the workbook (one STEA sheet each).
+        _stea_exportable = []   # (key, name, case_dict) for concepts with a profile
         try:
-            _stea_cases = []
             for _k, _r in results.items():
                 if not _r.get("ok") or _r.get("profile") is None:
                     continue
@@ -18585,14 +18829,15 @@ def concept_selector_section(default_start_date):
                 if not _nm and _picks:
                     _nm = "; ".join(f"{d}={l}" for d, l in _picks)
                 _nm = (_nm or "case")[:31]
-                _stea_cases.append({
+                _stea_exportable.append((_k, _nm, {
                     "name": _nm, "stea": _r.get("profile", {}).get("stea"),
                     "fac_df": _r.get("profile", {}).get("fac_df"),
                     "profile": _r.get("profile"),
                     "fluid": _r.get("fluid", fluid),
-                    "units": _r.get("units", "metric")})
-            if _stea_cases:
-                _stea_bytes = build_stea_workbook(_stea_cases)
+                    "units": _r.get("units", "metric")}))
+            if _stea_exportable:
+                _stea_bytes = build_stea_workbook(
+                    [c for _, _, c in _stea_exportable])
                 dl2.download_button(
                     "📤 Export to STEA (all cases)", data=_stea_bytes,
                     file_name="concept_cases_STEA.xlsx",
@@ -18602,7 +18847,9 @@ def concept_selector_section(default_start_date):
                     help="STEA-format workbook (one sheet per case): "
                          "production, cost and investment profiles by year, "
                          "matching the Atlantis STEA input template. Costs in "
-                         "MNOK, production in MSm³/GSm³/MTPA.")
+                         "MNOK, production in MSm³/GSm³/MTPA. Use the "
+                         "'choose concepts' panel below the buttons to export "
+                         "only selected concepts.")
         except Exception as _se:
             dl2.caption(f"STEA export unavailable: {_se}")
 
@@ -18772,6 +19019,10 @@ def concept_selector_section(default_start_date):
                                         "description": o.get(
                                             "description", ""),
                                         "patches": o.get("patches", {}),
+                                        "manual_mode": o.get(
+                                            "manual_mode", False),
+                                        "manual_kpis": o.get(
+                                            "manual_kpis", {}),
                                         "swept": (
                                             oi in selected.get(di, set())),
                                     }
@@ -18877,6 +19128,55 @@ def concept_selector_section(default_start_date):
                 dl4.caption(f"JSON export unavailable: {_je}")
         except Exception as _e:
             dl2.info(f"YAML export unavailable: {_e}")
+
+        # ---- STEA export — choose which concepts to include ----
+        # Same workbook as the "all cases" button but with a multiselect so
+        # the user picks exactly which concepts become sheets (one STEA sheet
+        # per chosen concept), mirroring the single-concept YAML selector.
+        if _stea_exportable:
+            with st.expander("📤 STEA export — choose which concepts to "
+                             "include (one sheet each)", expanded=False):
+                st.caption(
+                    "Build a STEA-format workbook from only the concepts you "
+                    "pick — one sheet per concept, identical in layout to the "
+                    "live-case STEA export (production / cost / investment "
+                    "profiles by year, costs in MNOK). Only concepts that ran "
+                    "through the engine appear here; manual / imported-KPI "
+                    "options have no monthly profile to export.")
+                # Use index-tagged display labels so concepts with identical
+                # names remain individually selectable.
+                _stea_labels = [f"{i+1}. {nm}"
+                                for i, (_, nm, _) in
+                                enumerate(_stea_exportable)]
+                _stea_choice = st.multiselect(
+                    "Concepts to include", _stea_labels,
+                    default=_stea_labels, key="concept_stea_pick",
+                    help="Each selected concept becomes one sheet in the "
+                         "workbook. Sheet names are the concept names "
+                         "(truncated to Excel's 31-character limit).")
+                _chosen_idx = {int(lbl.split(".", 1)[0]) - 1
+                               for lbl in _stea_choice}
+                _picked_cases = [c for i, (_, _nm, c) in
+                                 enumerate(_stea_exportable)
+                                 if i in _chosen_idx]
+                if _picked_cases:
+                    try:
+                        _sel_bytes = build_stea_workbook(_picked_cases)
+                        st.download_button(
+                            f"📤 Export {len(_picked_cases)} concept(s) to "
+                            f"STEA (.xlsx)", data=_sel_bytes,
+                            file_name="concept_selected_STEA.xlsx",
+                            mime=("application/vnd.openxmlformats-"
+                                  "officedocument.spreadsheetml.sheet"),
+                            key="concept_stea_sel_dl",
+                            help="STEA workbook with one sheet per selected "
+                                 "concept, matching the Atlantis STEA input "
+                                 "template.")
+                    except Exception as _sse:
+                        st.caption(f"STEA export unavailable: {_sse}")
+                else:
+                    st.info("Select at least one concept to enable the "
+                            "download.")
 
         # ---- Per-concept single-case YAML export ----
         # Each swept option carries its fully-resolved payload (base case +

@@ -130,6 +130,17 @@ A **patch** is one or more `key: value` pairs typed in an option's *Patches* box
 - To discover every available key, export any case as YAML (**Field prognosis → Export current case as YAML**) and read the `scalar:` block; any key there works as a patch key.
 - Use **🧬 Export a single concept case as YAML** at the bottom of the results to see exactly what an option resolved to, and to reload it into the live view for comparison.
 
+### 3.5 Manual & imported KPIs — benchmark against external numbers
+
+Sometimes you want a concept in the comparison whose numbers come from a study report, a partner's estimate, or another tool — not from running an engine case. Two ways to do that:
+
+- **Per option:** tick **✍️ Enter KPIs manually** under any option and type the values (NPV after/pre-tax, CAPEX total/facilities/wells, break-even, total production, recovery factor, IRR, payback, CO₂, resources). The option then skips the engine and uses your numbers directly. Leave a field at 0 to omit it.
+- **From CSV:** open **📥 Import option KPIs from CSV**, download the template (pre-filled with your exact option labels), fill in the columns you have, and upload it. Rows are matched to options by `label` (case-insensitive); matched options switch to manual mode. Unmatched labels are listed back to you.
+
+Recognised CSV columns (all optional except `label`): `npv_MM, npv_pretax_MM, capex_total_MM, capex_facility_MM, capex_well_MM, breakeven_oil, cum_primary, final_rf, irr, payback_yrs, co2_total_Mt, resources_mmboe`.
+
+Manual options are **coloured in the garden and ranked exactly like computed options**, and show *“✍️ manual / imported KPIs”* as their source. They round-trip through the Study library. Note they don't appear in the single-case YAML export or the per-month workbook profiles — they have no underlying case or time series by definition.
+
 ---
 
 ## 4. Tips & troubleshooting
