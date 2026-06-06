@@ -14051,6 +14051,60 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         except Exception:
             fac_df_cont["amount_MMUSD"] = (
                 fac_df_cont["amount_MMUSD"].astype(float) * _cont_surf_mult)
+
+    # ---- Study / pre-sanction costs → dated CAPEX rows (match live) -------
+    # The live path always folds feasibility/FEED/other study spend into the
+    # facility schedule (phased over study_phase_years before first
+    # production, NO contingency). The batch path previously omitted this, so
+    # batch facility CAPEX came out lower than live by the study total (the
+    # ~30 MUSD discrepancy). Replicate the live injection here so the two
+    # paths agree. Study scalars are in the case's cost_input_currency; the
+    # stored fac_df amounts are already USD, so convert study NOK→USD when
+    # needed to keep the schedule in one currency.
+    try:
+        _study_feas = float(scalar.get("study_feasibility", 0.0) or 0)
+        _study_feed = float(scalar.get("study_feed", 0.0) or 0)
+        _study_other = float(scalar.get("study_other", 0.0) or 0)
+        _study_yrs = int(scalar.get("study_phase_years", 4) or 4)
+        _cur = str(scalar.get("cost_input_currency", "USD"))
+        _u2n = float(scalar.get("usd_to_nok", 10.5) or 10.5)
+        _conv = (lambda v: v / _u2n) if _cur == "NOK" else (lambda v: v)
+        _study_items = [
+            (_study_feas, "Feasibility & conceptual studies"),
+            (_study_feed, "FEED studies (DG2-DG3)"),
+            (_study_other, "Other studies / G&G and admin"),
+        ]
+        _study_rows = []
+        if any(v > 0 for v, _ in _study_items) and _study_yrs > 0:
+            from datetime import timedelta as _tdelta
+            _start_ts = pd.Timestamp(start_date)
+            for _amt, _lbl in _study_items:
+                if _amt <= 0:
+                    continue
+                _per_yr = _conv(_amt) / _study_yrs
+                for _k in range(_study_yrs):
+                    _yr_offset = _study_yrs - _k
+                    _spend_date = (_start_ts
+                                   - _tdelta(days=int(365 * _yr_offset))
+                                   + _tdelta(days=180))
+                    _study_rows.append({
+                        "date": _spend_date.date()
+                        if hasattr(_spend_date, "date") else _spend_date,
+                        "amount_MMUSD": round(_per_yr, 3),
+                        "label": _lbl,
+                    })
+        if _study_rows:
+            _study_df = pd.DataFrame(_study_rows)
+            if (fac_df_cont is not None
+                    and "amount_MMUSD" in fac_df_cont.columns
+                    and len(fac_df_cont) > 0):
+                fac_df_cont = pd.concat([fac_df_cont, _study_df],
+                                        ignore_index=True)
+            else:
+                fac_df_cont = _study_df
+    except Exception:
+        pass
+
     facility_capex = CapexSchedule(df=fac_df_cont)
 
     aban_gas = float(scalar.get("aban_gas", 0.5))
