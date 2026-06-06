@@ -18873,20 +18873,85 @@ def concept_selector_section(default_start_date):
         # Quick "everything" button stays in the download row; a selectable
         # variant lives in the expander just below for choosing which
         # concepts go into the workbook (one STEA sheet each).
-        _stea_exportable = []   # (key, name, case_dict) for concepts with a profile
+        _stea_exportable = []   # (key, name, case_dict) for STEA-able concepts
+        _stea_skipped = 0
         try:
+            _run_units = st.session_state.get("units", "field")
             for _k, _r in results.items():
-                if not _r.get("ok") or _r.get("profile") is None:
+                if not _r.get("ok"):
                     continue
                 _picks = _r.get("picks") or []
                 _nm = _r.get("name")
                 if not _nm and _picks:
                     _nm = "; ".join(f"{d}={l}" for d, l in _picks)
                 _nm = (_nm or "case")[:31]
+                _prof = _r.get("profile")
+                # If the stored result has no profile (e.g. produced by an
+                # older run, or a manual/imported-KPI option), try to rebuild
+                # it from the resolved payload so the STEA export still works.
+                if (_prof is None or not _prof.get("stea")) and \
+                        _r.get("resolved_payload") and not _r.get("manual"):
+                    try:
+                        _rp = _r["resolved_payload"]
+                        _re = run_payload_case(
+                            _rp, default_start_date,
+                            default_units=_run_units)
+                        if _re.get("ok"):
+                            _dff = _re.get("df")
+                            _dffe = _re.get("df_e")
+                            _sc = {}
+                            _si = None
+                            if _dff is not None and len(_dff) > 0:
+                                if "date" in _dff.columns:
+                                    _si = [str(x) for x in _dff["date"].values]
+                                for _c in ("oil_rate", "gas_rate"):
+                                    if _c in _dff.columns:
+                                        _sc[_c] = [float(x) for x in
+                                                   _dff[_c].values]
+                            if _dffe is not None and len(_dffe) > 0:
+                                for _c in ("opex", "capex_well",
+                                           "capex_facility", "abandonment",
+                                           "ngl_rate", "co2_emissions_tonnes",
+                                           "gross_gas_rate", "gas_net_rate",
+                                           "gas_fuel_rate", "gas_flare_rate",
+                                           "rig_mob"):
+                                    if _c in _dffe.columns:
+                                        _sc[_c] = [float(x) for x in
+                                                   _dffe[_c].values]
+                            _facblk = None
+                            _fe = _re.get("econ")
+                            _fd = (_fe.facility_capex.df if (_fe is not None
+                                   and getattr(_fe, "facility_capex", None))
+                                   else None)
+                            if _fd is None:
+                                _fd = _rp.get("tables", {}).get("fac_df")
+                                if _fd is not None:
+                                    _fd = pd.DataFrame(_fd)
+                            if (_fd is not None and len(_fd) > 0
+                                    and "amount_MMUSD" in _fd.columns):
+                                _facblk = {
+                                    "date": [str(x) for x in
+                                             _fd["date"].values],
+                                    "amount_MMUSD": [float(x) for x in
+                                                     _fd["amount_MMUSD"]
+                                                     .values],
+                                    "label": [str(x) for x in
+                                              _fd.get("label",
+                                                      [""] * len(_fd))]}
+                            if _sc:
+                                _prof = {"index": _si,
+                                         "stea": {"index": _si,
+                                                  "columns": _sc},
+                                         "fac_df": _facblk}
+                    except Exception:
+                        _prof = None
+                if _prof is None or not _prof.get("stea"):
+                    _stea_skipped += 1
+                    continue
                 _stea_exportable.append((_k, _nm, {
-                    "name": _nm, "stea": _r.get("profile", {}).get("stea"),
-                    "fac_df": _r.get("profile", {}).get("fac_df"),
-                    "profile": _r.get("profile"),
+                    "name": _nm, "stea": _prof.get("stea"),
+                    "fac_df": _prof.get("fac_df"),
+                    "profile": _prof,
                     "fluid": _r.get("fluid", fluid),
                     "units": _r.get("units", "metric")}))
             if _stea_exportable:
@@ -18904,6 +18969,15 @@ def concept_selector_section(default_start_date):
                          "MNOK, production in MSm³/GSm³/MTPA. Use the "
                          "'choose concepts' panel below the buttons to export "
                          "only selected concepts.")
+            else:
+                # Always show SOMETHING in this slot so the user isn't left
+                # staring at an empty cell wondering where STEA went.
+                dl2.button("📤 Export to STEA (all cases)", disabled=True,
+                           use_container_width=True,
+                           help="No concept has an exportable production "
+                                "profile yet. Re-run the sweep (engine cases "
+                                "only — manual/imported-KPI options have no "
+                                "monthly profile to export).")
         except Exception as _se:
             dl2.caption(f"STEA export unavailable: {_se}")
 
