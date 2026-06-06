@@ -18952,7 +18952,9 @@ def concept_selector_section(default_start_date):
                     "name": _nm, "stea": _prof.get("stea"),
                     "fac_df": _prof.get("fac_df"),
                     "profile": _prof,
-                    "fluid": _r.get("fluid", fluid),
+                    "fluid": _r.get("fluid",
+                                    st.session_state.get(
+                                        "fluid", "Oil with associated gas")),
                     "units": _r.get("units", "metric")}))
             if _stea_exportable:
                 _stea_bytes = build_stea_workbook(
