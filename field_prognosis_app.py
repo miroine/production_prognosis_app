@@ -18390,22 +18390,27 @@ def concept_selector_section(default_start_date):
                             # Field-unit production + USD cost columns for the
                             # STEA export, so its unit conversion is exact and
                             # independent of the display-unit profile above.
+                            # IMPORTANT: source EVERY column from a single
+                            # dataframe so all arrays share one length + one
+                            # date index. df and df_e can differ in length
+                            # (df_e is truncated at the economic cut-off while
+                            # df runs the full horizon); mixing them produced
+                            # ragged columns that failed DataFrame() build and
+                            # left the STEA sheet empty. df_e carries both the
+                            # production and the cost columns, so prefer it.
                             try:
                                 _dff = res.get("df")
                                 _dffe = res.get("df_e")
+                                _src = _dffe if (_dffe is not None
+                                                 and len(_dffe) > 0) else _dff
                                 _stea_cols = {}
                                 _stea_idx = None
-                                if _dff is not None and len(_dff) > 0:
-                                    if "date" in _dff.columns:
+                                if _src is not None and len(_src) > 0:
+                                    if "date" in _src.columns:
                                         _stea_idx = [str(x) for x in
-                                                     _dff["date"].values]
-                                    for _c in ("oil_rate", "gas_rate"):
-                                        if _c in _dff.columns:
-                                            _stea_cols[_c] = [
-                                                float(x) for x in
-                                                _dff[_c].values]
-                                if _dffe is not None and len(_dffe) > 0:
-                                    for _c in ("opex", "capex_well",
+                                                     _src["date"].values]
+                                    for _c in ("oil_rate", "gas_rate",
+                                               "opex", "capex_well",
                                                "capex_facility",
                                                "abandonment", "ngl_rate",
                                                "co2_emissions_tonnes",
@@ -18413,10 +18418,10 @@ def concept_selector_section(default_start_date):
                                                "gas_net_rate",
                                                "gas_fuel_rate",
                                                "gas_flare_rate", "rig_mob"):
-                                        if _c in _dffe.columns:
+                                        if _c in _src.columns:
                                             _stea_cols[_c] = [
                                                 float(x) for x in
-                                                _dffe[_c].values]
+                                                _src[_c].values]
                                 if _stea_cols:
                                     _profile["stea"] = {
                                         "index": _stea_idx or _date_idx,
@@ -18906,25 +18911,27 @@ def concept_selector_section(default_start_date):
                         if _re.get("ok"):
                             _dff = _re.get("df")
                             _dffe = _re.get("df_e")
+                            # Source all columns from one frame (df_e carries
+                            # both production + cost and is the truncated
+                            # economic frame); mixing df + df_e gives ragged
+                            # arrays and an empty sheet.
+                            _src = _dffe if (_dffe is not None
+                                             and len(_dffe) > 0) else _dff
                             _sc = {}
                             _si = None
-                            if _dff is not None and len(_dff) > 0:
-                                if "date" in _dff.columns:
-                                    _si = [str(x) for x in _dff["date"].values]
-                                for _c in ("oil_rate", "gas_rate"):
-                                    if _c in _dff.columns:
-                                        _sc[_c] = [float(x) for x in
-                                                   _dff[_c].values]
-                            if _dffe is not None and len(_dffe) > 0:
-                                for _c in ("opex", "capex_well",
-                                           "capex_facility", "abandonment",
-                                           "ngl_rate", "co2_emissions_tonnes",
+                            if _src is not None and len(_src) > 0:
+                                if "date" in _src.columns:
+                                    _si = [str(x) for x in _src["date"].values]
+                                for _c in ("oil_rate", "gas_rate", "opex",
+                                           "capex_well", "capex_facility",
+                                           "abandonment", "ngl_rate",
+                                           "co2_emissions_tonnes",
                                            "gross_gas_rate", "gas_net_rate",
                                            "gas_fuel_rate", "gas_flare_rate",
                                            "rig_mob"):
-                                    if _c in _dffe.columns:
+                                    if _c in _src.columns:
                                         _sc[_c] = [float(x) for x in
-                                                   _dffe[_c].values]
+                                                   _src[_c].values]
                             _facblk = None
                             _fe = _re.get("econ")
                             _fd = (_fe.facility_capex.df if (_fe is not None
