@@ -18862,7 +18862,7 @@ def concept_selector_section(default_start_date):
             except Exception as _te:
                 st.warning(f"Compare-cases view unavailable: {_te}")
 
-        dl1, dl2, dl3, dl4 = st.columns(4)
+        dl1, dl2, dl3, dl4, dl5 = st.columns(5)
         csv = df_res.to_csv(index=False).encode("utf-8")
         dl1.download_button(
             "📥 Download results (CSV)", data=csv,
@@ -19022,7 +19022,7 @@ def concept_selector_section(default_start_date):
 
             _buf = _io.BytesIO()
             wb.save(_buf)
-            dl2.download_button(
+            dl3.download_button(
                 "📊 Download full workbook (Excel)",
                 data=_buf.getvalue(),
                 file_name="concept_batch_full.xlsx",
@@ -19035,7 +19035,7 @@ def concept_selector_section(default_start_date):
                         if _mc_any else "")
                      + ". One sheet per case.")
         except Exception as _xe:
-            dl2.caption(f"Excel export unavailable: {_xe}")
+            dl3.caption(f"Excel export unavailable: {_xe}")
 
         # Build a nested, human-readable YAML capturing the WHOLE study:
         # the matrix definition (dimensions + options + their patches),
@@ -19148,7 +19148,7 @@ def concept_selector_section(default_start_date):
             yaml_bytes = _yaml.safe_dump(
                 export_doc, sort_keys=False, allow_unicode=True,
                 default_flow_style=False).encode("utf-8")
-            dl3.download_button(
+            dl4.download_button(
                 "🧾 Download study (nested YAML)", data=yaml_bytes,
                 file_name="concept_study.yaml",
                 mime="application/x-yaml",
@@ -19168,7 +19168,7 @@ def concept_selector_section(default_start_date):
                 import json as _json
                 json_bytes = _json.dumps(
                     export_doc, indent=2, default=str).encode("utf-8")
-                dl4.download_button(
+                dl5.download_button(
                     "🗂 Download study (JSON)", data=json_bytes,
                     file_name="concept_study.json",
                     mime="application/json",
@@ -19179,7 +19179,7 @@ def concept_selector_section(default_start_date):
                          "monthly production + cost/cashflow profiles for "
                          "every case.")
             except Exception as _je:
-                dl4.caption(f"JSON export unavailable: {_je}")
+                dl5.caption(f"JSON export unavailable: {_je}")
         except Exception as _e:
             dl2.info(f"YAML export unavailable: {_e}")
 
