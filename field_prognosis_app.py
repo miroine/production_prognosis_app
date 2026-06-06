@@ -13346,8 +13346,15 @@ def build_stea_workbook(cases):
         anchor_year = gmin
 
     _used_titles = {}
+    import re as _re_sheet
     for c, annual in annuals:
-        title = str(c.get("name", "case"))[:31] or "case"
+        # Excel forbids these characters in a sheet title: / \ ? * [ ] :
+        # and the title can't start/end with an apostrophe or be blank. The
+        # concept names come from user labels (e.g. "Drainage = X / Y"), so
+        # replace any illegal character with a hyphen before truncating.
+        _raw = str(c.get("name", "case"))
+        _clean = _re_sheet.sub(r'[/\\?*\[\]:]', '-', _raw).strip().strip("'")
+        title = (_clean[:31] or "case")
         # openpyxl rejects duplicate sheet names — disambiguate by suffixing
         # " (2)", " (3)", … while keeping within the 31-char limit.
         if title in _used_titles:
