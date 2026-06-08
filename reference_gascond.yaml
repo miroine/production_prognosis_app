@@ -1,0 +1,308 @@
+schema_version: '1.0'
+meta:
+  name: test_3_wells
+  description: ''
+  expected_results:
+    npv_after_tax_MM: 88.5
+    final_rf: 0.7552
+    capex_total_MM: 1305.6
+    stamped_at: '2026-06-05T12:08:01'
+scalar:
+  units: metric
+  fluid: Gas with condensate
+  strategy: Depletion
+  start_date: '2029-12-02'
+  horizon: 14
+  ooip: 8.0
+  ogip: 15.0
+  rf_target: 0.52
+  auto_scale_rf: false
+  p_init: 805.0
+  t_res: 160.0
+  api: 35.0
+  gas_grav: 0.7
+  rs_init: 700.0
+  p_bub: 420.0
+  ct_rock: 4.0e-06
+  sw_init: 0.2
+  aq_active: false
+  aq_model: Pot
+  aq_vol: 500.0
+  aq_pi: 20.0
+  aq_pini: 3500.0
+  gc_active: false
+  gc_size: 0.2
+  gc_pi: 3500.0
+  aban_basis: Field total
+  aban_oil: 50.0
+  aban_gas: 1000.0
+  aban_wc: 0.95
+  prod_eff: 0.95
+  gas_export: 0.95
+  gas_inj_frac: 0.0
+  gas_fuel: 0.03
+  gas_flare: 0.02
+  multi_res_enable: false
+  oil_price_bbl: 75.0
+  gas_price_mmbtu: 10.0
+  opex_var_gas: 0.9
+  tariff_oil_bbl: 2.0
+  tariff_gas_mmbtu: 0.3
+  opex_fixed: 5.0
+  disc: 0.08
+  tax_rate: 0.0
+  royalty: 0.0
+  aban_cost: 80.0
+  fiscal_regime: NCS (Norwegian shelf)
+  well_cost_mode: rig_rate
+  rig_dayrate: 900.0
+  cmpl_dayrate: 350.0
+  well_tangibles: 4.0
+  well_intangibles_pct: 0.1
+  capex_contingency_pct: 30
+  co2_price: 80.0
+  co2_factor_gas_combust: 53.0
+  co2_factor_flare_inefficiency: 0.02
+  co2_factor_oil_routine: 0.5
+  co2_scope3_enabled: false
+  co2_scope3_factor_oil: 430.0
+  co2_scope3_factor_gas: 53.0
+  co2_scope3_price: 0.0
+  money_basis_label: Nominal (escalated $)
+  inflation_rate: 2.5
+  ncs_cit: 0.22
+  ncs_spt: 0.718
+  ncs_uplift: 0.1769
+  ngl_yield: 22.0
+  ngl_price: 25.0
+  ngl_opex: 5.0
+  ngl_shrink: 0.0
+  economic_cutoff_mode_label: Economic limit (smart cut-off)
+  economic_cutoff_persistence: 6
+  well_pi_default: 50.0
+  min_bhp_default: 100.0
+  retrograde_enabled: false
+  cgr_from_inplace: false
+  dc_template_type: 4-slot (4 wells)
+  dc_use_template_detail: false
+  dc_field_architecture: Cluster (manifold)
+  dc_hydrate_mgmt: MEG (mono-ethylene glycol) with reclamation
+  dc_riser_type: Steel catenary riser (SCR)
+  dc_n_boosting: 0
+  dc_flowline_km: 15.0
+  dc_flowline_diam: 10.0
+  dc_flowline_insulation: None
+  dc_flowline_material: Carbon steel
+  dc_umbilical_km: 16.0
+  dc_export_km: 0.0
+  dc_export_diam: 16.0
+  dc_n_riser_bases: 1
+  dc_n_ssiv: 0
+  dc_n_jumpers: 4
+  dc_n_scm: 4
+  dc_n_risers: 1
+  dc_flowline_install: Reeling (reel-lay)
+  dc_tiein_method: Rigid spool + diverless connector
+  dc_topside_tonnes: 0.0
+  dc_topside_rate_k: 60.0
+  dc_manhour_rate: 220.0
+  dc_manhours: 0.0
+  dc_gas_lift: false
+  dc_heating_type: None
+  dc_hpht_choice: HPHT
+  dc_hipps: true
+  dc_n_hipps: 1
+  dc_mpfm: true
+  dc_n_mpfm: 3
+  dc_days_per_well: 60.0
+  dc_meters_per_well: 4400.0
+  study_feasibility: 0.0
+  study_feed: 0.0
+  study_other: 0.0
+  study_phase_years: 4
+  cost_input_currency: USD
+  usd_to_nok: 10.5
+tables:
+  rigs_df:
+  - rig: Rig-A
+    start_date: '2029-01-01'
+    move_in_days: 30
+    move_out_days: 15
+    maintenance_days_per_year: 10
+    day_rate_kUSD: 350.0
+  producers_df:
+  - name: P-01
+    rig: Rig-A
+    drill_days: 100
+    completion_days: 25
+    qi_primary: 3000.0
+    qi_secondary: 1500.0
+    decline_model: Multi-segment
+    di_annual: 0.2
+    b_factor: 0.6
+    wc_initial: 0.0
+    wc_final: 0.1
+    wc_ramp_months: 60
+    scale_factor: 0.7
+    uptime: 0.94
+    derive_qi_from_pi: false
+    well_pi_override: 0.0
+    fluid: auto
+    ipr_mode: true
+    wellhead_pressure_psi: 200.0
+    tubing_depth_ft: 14435.696
+    fluid_gradient_psi_per_ft: 0.004420671057866584
+    friction_psi_per_kbpd: 5.0
+  - name: P-02
+    rig: Rig-A
+    drill_days: 100
+    completion_days: 25
+    qi_primary: 3000.0
+    qi_secondary: 1500.0
+    decline_model: Multi-segment
+    di_annual: 0.2
+    b_factor: 0.6
+    wc_initial: 0.0
+    wc_final: 0.1
+    wc_ramp_months: 60
+    scale_factor: 0.5
+    uptime: 0.94
+    derive_qi_from_pi: false
+    well_pi_override: 0.0
+    fluid: auto
+    ipr_mode: true
+    wellhead_pressure_psi: 200.0
+    tubing_depth_ft: 14435.696
+    fluid_gradient_psi_per_ft: 0.004420671057866584
+    friction_psi_per_kbpd: 5.0
+  - name: P-03
+    rig: Rig-A
+    drill_days: 100
+    completion_days: 25
+    qi_primary: 3000.0
+    qi_secondary: 1500.0
+    decline_model: Multi-segment
+    di_annual: 0.2
+    b_factor: 0.6
+    wc_initial: 0.0
+    wc_final: 0.1
+    wc_ramp_months: 60
+    scale_factor: 1.0
+    uptime: 0.94
+    derive_qi_from_pi: false
+    well_pi_override: 0.0
+    fluid: auto
+    ipr_mode: true
+    wellhead_pressure_psi: 200.0
+    tubing_depth_ft: 14435.696
+    fluid_gradient_psi_per_ft: 0.004420671057866584
+    friction_psi_per_kbpd: 5.0
+  injectors_df: []
+  cap_df:
+  - start_date: '2028-01-01'
+    oil: 7949.378358612357
+    gas: 6000.0
+    water: 12719.005373779772
+    liquid: 19078.508060669657
+    prod_eff: 0.95
+    water_inj: 0.0
+    gas_inj: 0.0
+  fac_df:
+  - date: '2027-04-03'
+    amount_MMUSD: 87.5
+    label: 1 × 4-slot (4 wells) template/manifold [HPHT]
+  - date: '2027-05-04'
+    amount_MMUSD: 56.2
+    label: 1 × HIPPS pressure-protection skid [HPHT]
+  - date: '2027-05-04'
+    amount_MMUSD: 12.0
+    label: 3 × subsea multiphase flow meter [HPHT]
+  - date: '2027-05-04'
+    amount_MMUSD: 48.8
+    label: 3 × wet (subsea) xmas trees [HPHT]
+  - date: '2029-03-25'
+    amount_MMUSD: 28.5
+    label: Flowline 15 km × 10" Carbon steel ($1.90MM/km)
+  - date: '2029-03-07'
+    amount_MMUSD: 7.5
+    label: 1 × riser base / FRB ($7.5MM each)
+  - date: '2029-04-21'
+    amount_MMUSD: 4.8
+    label: 4 × subsea jumper ($1.2MM each)
+  - date: '2027-05-04'
+    amount_MMUSD: 10.0
+    label: 4 × subsea control module ($2.5MM each)
+  - date: '2029-04-03'
+    amount_MMUSD: 33.6
+    label: Umbilical 16 km ($2.1MM/km)
+  - date: '2027-06-03'
+    amount_MMUSD: 24.0
+    label: 1 × Steel catenary riser (SCR) ($24MM each)
+  - date: '2027-05-04'
+    amount_MMUSD: 91.4
+    label: MEG reclamation package + dosing line
+  - date: '2029-03-16'
+    amount_MMUSD: 9.0
+    label: Central production manifold (cluster)
+  - date: '2029-05-10'
+    amount_MMUSD: 65.0
+    label: Host facility modifications (tie-in)
+  - date: '2029-09-02'
+    amount_MMUSD: 66.7
+    label: Installation + hook-up + commissioning (Reeling (reel-lay), Rigid spool
+      + diverless connector)
+  - date: '2029-05-10'
+    amount_MMUSD: 10.2
+    label: Tie-in spool + host connection
+  - date: '2043-10-30'
+    amount_MMUSD: 92.1
+    label: Cessation / P&A / restoration
+segments:
+  P-01:
+  - months: 24
+    model: Plateau
+    di: 0.0
+    b: 0.0
+    mult: 1.0
+  - months: 60
+    model: Hyperbolic
+    di: 0.25
+    b: 0.6
+    mult: 1.0
+  - months: 120
+    model: Exponential
+    di: 0.12
+    b: 0.0
+    mult: 1.0
+  P-03:
+  - months: 24
+    model: Plateau
+    di: 0.0
+    b: 0.0
+    mult: 1.0
+  - months: 60
+    model: Hyperbolic
+    di: 0.25
+    b: 0.6
+    mult: 1.0
+  - months: 120
+    model: Exponential
+    di: 0.12
+    b: 0.0
+    mult: 1.0
+  P-02:
+  - months: 24
+    model: Plateau
+    di: 0.0
+    b: 0.0
+    mult: 1.0
+  - months: 60
+    model: Hyperbolic
+    di: 0.25
+    b: 0.6
+    mult: 1.0
+  - months: 120
+    model: Exponential
+    di: 0.12
+    b: 0.0
+    mult: 1.0

@@ -1,0 +1,48 @@
+name: FieldVista CI
+
+# Runs the test suites on every push and pull request so a broken commit
+# can't reach Streamlit Cloud unnoticed. Gates on:
+#   - both source files parsing (syntax)
+#   - test_v2.py        (engine smoke test — "ALL OK")
+#   - test_units.py     (unit-conversion audit — 43 checks)
+#   - test_parity.py    (golden-master + live-vs-batch parity)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Syntax check (all source files)
+        run: |
+          python -c "import ast; [ast.parse(open(f).read()) for f in ['field_prognosis_app.py','fp_helpers.py','fp_core.py','fp_economics.py']]; print('syntax OK')"
+
+      - name: Pure-module import check (must be Streamlit-free)
+        run: |
+          python -c "import fp_core, fp_economics; print('pure modules import without Streamlit')"
+
+      - name: Engine smoke test
+        run: python test_v2.py
+
+      - name: Unit-conversion audit
+        run: python test_units.py
+
+      - name: Golden-master + parity test
+        run: python test_parity.py

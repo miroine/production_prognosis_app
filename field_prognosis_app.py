@@ -42,6 +42,79 @@ from plotly.subplots import make_subplots
 
 # Local helpers (case persistence, breakeven, PDF, CSS)
 import fp_helpers as fh
+# Pure economics mapping (Streamlit-free; see module docstring)
+import fp_economics as _fp_econ
+
+# =============================================================================
+# Build stamp — so the running version is unambiguous in the UI
+# =============================================================================
+APP_VERSION = "4.5"
+
+
+def _build_stamp() -> str:
+    """Return a short 'version · git-sha · build-date' string.
+
+    The git SHA is read from the environment (set by CI / Streamlit Cloud) or
+    by shelling out to git when running from a checkout; falls back gracefully
+    to the file mtime so the stamp is always populated. This makes "is the new
+    code actually deployed?" a one-glance answer instead of a guess.
+    """
+    import os as _os
+    import subprocess as _sp
+    sha = (_os.environ.get("GIT_SHA")
+           or _os.environ.get("STREAMLIT_GIT_SHA") or "")
+    if not sha:
+        try:
+            sha = _sp.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=_os.path.dirname(_os.path.abspath(__file__)),
+                stderr=_sp.DEVNULL, timeout=2).decode().strip()
+        except Exception:
+            sha = ""
+    try:
+        import datetime as _dt
+        _mtime = _os.path.getmtime(_os.path.abspath(__file__))
+        built = _dt.datetime.utcfromtimestamp(_mtime).strftime(
+            "%Y-%m-%d %H:%M UTC")
+    except Exception:
+        built = "?"
+    parts = [f"v{APP_VERSION}"]
+    if sha:
+        parts.append(sha)
+    parts.append(built)
+    return " · ".join(parts)
+
+
+def _diag(context: str, exc: Exception) -> None:
+    """Surface a caught exception when diagnostics mode is on.
+
+    Several hard-to-find bugs in this app were *masked* by broad
+    `try/except: pass` blocks (e.g. a ragged-DataFrame error that silently
+    produced an empty STEA sheet). Routing those except-blocks through this
+    helper means: in normal use nothing changes, but when the user ticks
+    "🔧 Diagnostics" in the sidebar the underlying error is shown inline and
+    written to the in-session diagnostics log — turning a silent failure into
+    an actionable message. Call from inside an `except` block:
+
+        try:
+            ...
+        except Exception as e:
+            _diag("STEA profile build", e)
+    """
+    try:
+        import traceback as _tb
+        msg = f"{context}: {type(exc).__name__}: {exc}"
+        log = st.session_state.setdefault("_diag_log", [])
+        log.append(msg)
+        if st.session_state.get("_diagnostics_on"):
+            st.warning(f"🔧 {msg}")
+            with st.expander("traceback", expanded=False):
+                st.code("".join(_tb.format_exception(
+                    type(exc), exc, exc.__traceback__)))
+    except Exception:
+        # diagnostics must never itself raise
+        pass
+
 
 # =============================================================================
 # Page config
@@ -56,49 +129,15 @@ st.set_page_config(
 # =============================================================================
 # Units & conversions
 # =============================================================================
-UNIT_LABELS = {
-    "field": {
-        "oil_rate": "stb/d", "gas_rate": "Mscf/d", "water_rate": "stb/d",
-        "oil_vol": "MMstb", "gas_vol": "Bscf", "water_vol": "MMstb",
-        "pressure": "psi", "temp": "°F", "depth": "ft",
-        "gor": "scf/stb", "bo": "rb/stb", "bg": "rb/scf",
-        "price_oil": "$/bbl", "price_gas": "$/Mscf",
-    },
-    "metric": {
-        "oil_rate": "Sm³/d", "gas_rate": "kSm³/d", "water_rate": "Sm³/d",
-        "oil_vol": "MSm³", "gas_vol": "GSm³", "water_vol": "MSm³",
-        "pressure": "bar", "temp": "°C", "depth": "m",
-        "gor": "Sm³/Sm³", "bo": "m³/Sm³", "bg": "m³/Sm³",
-        "price_oil": "$/Sm³", "price_gas": "$/kSm³",
-    },
-}
+# These foundational primitives now live in fp_core (pure, Streamlit-free) so
+# that logic modules can import them without pulling in this UI module. They
+# are re-exported here under their original names, so every existing call site
+# (to_field/from_field/ulabel/FLUID_SYSTEMS/…) keeps working unchanged.
+from fp_core import (  # noqa: E402
+    UNIT_LABELS, M2F, to_field, from_field, ulabel,
+    DAYS_PER_MONTH, MONTHS_PER_YEAR, MMBTU_PER_MCF, FLUID_SYSTEMS,
+)
 
-M2F = {
-    "oil_rate":  6.2898,
-    "gas_rate":  35.3147,
-    "water_rate": 6.2898,
-    "oil_vol":   6.2898,
-    "gas_vol":   35.3147,
-    "water_vol": 6.2898,
-    "pressure":  14.5038,
-    "depth":     3.28084,
-    "gor":       5.6146,
-    "price_oil": 1.0/6.2898,
-    "price_gas": 1.0/35.3147,
-}
-
-def to_field(value, kind, units):
-    if units == "field" or value is None: return value
-    if kind == "temp": return value * 9/5 + 32
-    return value * M2F.get(kind, 1.0)
-
-def from_field(value, kind, units):
-    if units == "field" or value is None: return value
-    if kind == "temp": return (value - 32) * 5/9
-    return value / M2F.get(kind, 1.0)
-
-def ulabel(kind, units):
-    return UNIT_LABELS[units][kind]
 
 
 def cost_unit(kind="MM"):
@@ -673,15 +712,8 @@ class FieldAssumptions:
 # =============================================================================
 # Constants
 # =============================================================================
-DAYS_PER_MONTH = 30.4375
-MONTHS_PER_YEAR = 12
-
-FLUID_SYSTEMS = {
-    "Oil with associated gas": {"primary": "oil", "secondary": "gas"},
-    "Gas with condensate":     {"primary": "gas", "secondary": "condensate"},
-    "Black oil (no gas)":      {"primary": "oil", "secondary": None},
-    "Dry gas":                 {"primary": "gas", "secondary": None},
-}
+# DAYS_PER_MONTH, MONTHS_PER_YEAR, FLUID_SYSTEMS are imported from fp_core
+# above. The lists/dicts below are UI-only and stay here.
 DECLINE_MODELS = ["Exponential", "Hyperbolic", "Harmonic", "Multi-segment",
                   "User-defined profile"]
 # Standard subsea template types -> well-slot capacity. Mirrors the cost
@@ -3513,6 +3545,13 @@ def check_tables_for_changes():
 # =============================================================================
 def sidebar_inputs():
     st.sidebar.title("⚙️ Field Setup")
+    st.sidebar.caption(f"🏷️ {_build_stamp()}")
+    st.sidebar.checkbox(
+        "🔧 Diagnostics", key="_diagnostics_on", value=False,
+        help="Surface internal warnings and caught exceptions inline "
+             "(otherwise they're logged silently). Turn on if a chart, "
+             "export or table comes out empty or wrong — it shows the "
+             "underlying error instead of failing quietly.")
 
     units = st.sidebar.radio(
         "Unit system", ["field", "metric"], horizontal=True,
@@ -13675,6 +13714,24 @@ def run_payload_case(payload: dict, default_start_date,
 # =============================================================================
 # Scenario comparison
 # =============================================================================
+def _econ_dict_from_scalar(scalar: dict, units: str, *,
+                            cont_wells_mult: float = 1.0,
+                            cont_topside_mult: float = 1.0,
+                            facility_capex=None, rig_meta=None) -> dict:
+    """Single source of truth: map a case `scalar` block -> EconInputs kwargs.
+
+    Thin wrapper over fp_economics.econ_dict_from_scalar (the pure, Streamlit-
+    free implementation). Kept as a module-level name so existing call sites
+    and the parity test (which references app._econ_dict_from_scalar) are
+    unchanged; the actual mapping lives in the fp_economics module.
+    """
+    return _fp_econ.econ_dict_from_scalar(
+        scalar, units,
+        cont_wells_mult=cont_wells_mult,
+        cont_topside_mult=cont_topside_mult,
+        facility_capex=facility_capex, rig_meta=rig_meta)
+
+
 def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
                                 fluid: str) -> tuple[list, list, dict]:
     """Reconstruct (wells, reservoirs, econ_dict) from a saved case payload.
@@ -14156,144 +14213,15 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "ff_params": scalar.get("ff_params", {}) or {},
     }
 
-    # Backward compat: old saves stored oil_price/gas_price/opex_var/tariffs
-    # in the user's *display* units (e.g. $/Sm³ for metric users). New saves
-    # always use $/bbl and $/MMBtu. We prefer the new keys when present, and
-    # fall back to converting the old keys via the (saved) units.
-    MMBTU_PER_MCF = 1.0
-    if "oil_price_bbl" in scalar:
-        oil_price_f = float(scalar.get("oil_price_bbl", 75.0))
-    else:
-        # Old format: convert from display units
-        oil_price_f = to_field(float(scalar.get("oil_price", 75)), "price_oil", units)
-    if "gas_price_mmbtu" in scalar:
-        gas_price_f = float(scalar.get("gas_price_mmbtu", 3.5)) * MMBTU_PER_MCF
-    else:
-        gas_price_f = to_field(float(scalar.get("gas_price", 3.5)), "price_gas", units)
-    # Variable OPEX — the live path stores this under opex_var_oil /
-    # opex_var_gas (keyed by the primary phase), NOT opex_var_bbl/opex_var.
-    # Read the phase-matched key first so the batch reproduces the live
-    # variable-OPEX charge; fall back to the legacy keys for old payloads.
-    # Use the authoritative FLUID_SYSTEMS primary phase (NOT a substring
-    # guess): "Gas with condensate" is gas-PRIMARY, so it must read the
-    # opex_var_gas widget value exactly like the live path. The old
-    # substring test ("gas" in name and "condensate" not in name) wrongly
-    # classified gas-condensate as oil and read the wrong OPEX key.
-    _fluid_name = str(scalar.get("fluid", "Oil with associated gas"))
-    try:
-        _is_gas_primary = FLUID_SYSTEMS.get(
-            _fluid_name, {}).get("primary") == "gas"
-    except Exception:
-        _is_gas_primary = False
-    _opex_phase_key = "opex_var_gas" if _is_gas_primary else "opex_var_oil"
-    if _opex_phase_key in scalar and scalar.get(_opex_phase_key) is not None:
-        opex_var_f = float(scalar.get(_opex_phase_key))
-    elif "opex_var_oil" in scalar and scalar.get("opex_var_oil") is not None:
-        opex_var_f = float(scalar.get("opex_var_oil"))
-    elif "opex_var_gas" in scalar and scalar.get("opex_var_gas") is not None:
-        opex_var_f = float(scalar.get("opex_var_gas"))
-    elif "opex_var_bbl" in scalar:
-        opex_var_f = float(scalar.get("opex_var_bbl", 8.0))
-    else:
-        opex_var_f = to_field(float(scalar.get("opex_var", 8)),
-                              "price_oil", units)
-    if "tariff_oil_bbl" in scalar:
-        tariff_oil_f = float(scalar.get("tariff_oil_bbl", 2.0))
-    else:
-        tariff_oil_f = to_field(float(scalar.get("tariff_oil", 2)), "price_oil", units)
-    if "tariff_gas_mmbtu" in scalar:
-        tariff_gas_f = float(scalar.get("tariff_gas_mmbtu", 0.3)) * MMBTU_PER_MCF
-    else:
-        tariff_gas_f = to_field(float(scalar.get("tariff_gas", 0.3)), "price_gas", units)
-
-    # Fiscal regime — normalise the stored label to the engine token so a
-    # case saved with NCS (or PSC) actually applies that regime. Without
-    # this the regime was dropped and only the (often zero) flat tax_rate
-    # was used, making pre-tax NPV equal after-tax NPV.
-    _regime_raw = str(scalar.get("fiscal_regime", "Tax/Royalty"))
-    if _regime_raw.startswith("NCS"):
-        _regime = "NCS"
-    elif _regime_raw.startswith("PSC"):
-        _regime = "PSC"
-    else:
-        _regime = "Tax/Royalty"
-
-    econ_dict = {
-        "oil_price": oil_price_f,
-        "gas_price": gas_price_f,
-        "opex_var":  opex_var_f,
-        "opex_fixed": float(scalar.get("opex_fixed", 20)) * 1e6,
-        "capex_per_well": float(scalar.get("capex_well", 15)) * _cont_wells_mult,
-        "discount_rate": float(scalar.get("disc", 0.10)),
-        "tax_rate":      float(scalar.get("tax_rate", 0.30)),
-        "royalty_rate":  float(scalar.get("royalty", 0.10)),
-        "tariff_oil": tariff_oil_f,
-        "tariff_gas": tariff_gas_f,
-        "abandonment_cost_MM": float(scalar.get("aban_cost", 80)) * _cont_topside_mult,
-        "facility_capex": facility_capex,
-        "ngl_yield_bbl_per_mmscf": float(scalar.get("ngl_yield", 0.0)),
-        "ngl_price_bbl": float(scalar.get("ngl_price", 25.0)),
-        "ngl_opex_bbl": float(scalar.get("ngl_opex", 5.0)),
-        "ngl_shrinkage_pct": float(scalar.get("ngl_shrink", 0.0)),
-        "rig_meta": rig_meta,
-        # ---- Fiscal regime ----
-        "fiscal_regime": _regime,
-        # The live UI saves these under ncs_cit / ncs_spt / ncs_uplift (no
-        # _rate suffix); accept both so a saved/active case reproduces the
-        # live tax exactly instead of silently falling back to defaults.
-        "ncs_cit_rate": float(scalar.get("ncs_cit",
-                              scalar.get("ncs_cit_rate", 0.22))),
-        "ncs_spt_rate": float(scalar.get("ncs_spt",
-                              scalar.get("ncs_spt_rate", 0.718))),
-        "ncs_uplift_rate": float(scalar.get("ncs_uplift",
-                                 scalar.get("ncs_uplift_rate", 0.1769))),
-        "ncs_depreciation_years": float(
-            scalar.get("ncs_depreciation_years", 6.0)),
-        "ncs_uplift_years": float(scalar.get("ncs_uplift_years", 4.0)),
-        # PSC parameters (stored under short keys in the payload)
-        "psc_cost_recovery_ceiling": float(scalar.get("psc_cr_ceiling", 0.50)),
-        "psc_profit_oil_share_contractor": float(scalar.get("psc_pos", 0.40)),
-        "psc_govt_participation": float(scalar.get("psc_gov_part", 0.0)),
-        "psc_psc_tax_rate": float(scalar.get("psc_tax", 0.30)),
-        "psc_signature_bonus_MM": float(scalar.get("psc_sig_bonus", 0.0)),
-        # ---- Well cost model (rig-rate components carry WELLS contingency) ----
-        "well_cost_mode": str(scalar.get("well_cost_mode", "rig_rate")),
-        "rig_day_rate_kUSD": float(
-            scalar.get("rig_dayrate", 500.0)) * _cont_wells_mult,
-        "completion_day_rate_kUSD": float(
-            scalar.get("cmpl_dayrate", 350.0)) * _cont_wells_mult,
-        "well_tangibles_MM": float(
-            scalar.get("well_tangibles", 4.0)) * _cont_wells_mult,
-        "well_intangibles_pct": float(
-            scalar.get("well_intangibles_pct", 0.10)),
-        # ---- Money basis ----
-        "money_basis": ("nominal"
-            if str(scalar.get("money_basis_label", "")).startswith("Nominal")
-            else "real"),
-        # The inflation widget stores a percent (e.g. 2.5); the engine
-        # wants a fraction. Divide by 100 if it looks like a percent.
-        "inflation_rate": (float(scalar.get("inflation_rate", 0.0)) / 100.0
-                            if float(scalar.get("inflation_rate", 0.0)) > 1.0
-                            else float(scalar.get("inflation_rate", 0.0))),
-        # ---- CO2 economics ----
-        "co2_price": float(scalar.get("co2_price", 0.0)),
-        "co2_factor_gas_combust": float(
-            scalar.get("co2_factor_gas_combust", 53.0)),
-        "co2_factor_flare_inefficiency": float(
-            scalar.get("co2_factor_flare_inefficiency", 0.02)),
-        "co2_factor_oil_routine": float(
-            scalar.get("co2_factor_oil_routine", 0.5)),
-        "co2_scope3_enabled": bool(scalar.get("co2_scope3_enabled", False)),
-        "co2_scope3_factor_oil": float(
-            scalar.get("co2_scope3_factor_oil", 430.0)),
-        "co2_scope3_factor_gas": float(
-            scalar.get("co2_scope3_factor_gas", 53.0)),
-        "co2_scope3_price": float(scalar.get("co2_scope3_price", 0.0)),
-        "economic_cutoff_mode": ("economic"
-            if str(scalar.get("economic_cutoff_mode_label", "")).startswith("Economic")
-            else "horizon"),
-        "economic_cutoff_persistence": int(scalar.get("economic_cutoff_persistence", 6)),
-    }
+    # Economics are built through the SINGLE shared mapping so the batch and
+    # live paths cannot diverge. Contingency multipliers come from the split
+    # rates (legacy capex_contingency_pct as fallback); the SURF rate was
+    # already applied to the facility rows above.
+    econ_dict = _econ_dict_from_scalar(
+        scalar, units,
+        cont_wells_mult=_cont_wells_mult,
+        cont_topside_mult=_cont_topside_mult,
+        facility_capex=facility_capex, rig_meta=rig_meta)
     return wells, _reservoirs_from_payload(payload, units), meta, econ_dict
 
 
@@ -18452,11 +18380,12 @@ def concept_selector_section(default_start_date):
                                                 _facd.get("label",
                                                 [""] * len(_facd))],
                                         }
-                                except Exception:
-                                    pass
-                            except Exception:
-                                pass
-                    except Exception:
+                                except Exception as _fe:
+                                    _diag("STEA fac_df capture", _fe)
+                            except Exception as _se2:
+                                _diag("STEA columns capture", _se2)
+                    except Exception as _pe:
+                        _diag("case profile build", _pe)
                         _profile = None
                 else:
                     npv_MM = cum_primary = rf = irr = breakeven = None
@@ -18957,7 +18886,8 @@ def concept_selector_section(default_start_date):
                                          "stea": {"index": _si,
                                                   "columns": _sc},
                                          "fac_df": _facblk}
-                    except Exception:
+                    except Exception as _rbe:
+                        _diag("STEA profile rebuild", _rbe)
                         _prof = None
                 if _prof is None or not _prof.get("stea"):
                     _stea_skipped += 1
