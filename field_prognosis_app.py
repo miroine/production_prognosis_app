@@ -16518,15 +16518,17 @@ _CONCEPT_TEMPLATES = {
 
 
 def _concept_study_to_doc(dimensions, selected, results, base_source,
-                          base_loaded, reference=None):
+                          base_loaded, reference=None, showstoppers=None):
     """Assemble the nested study dict (matrix + base + results).
 
     `reference` is the per-dimension reference map {dim_index: opt_index};
     we serialise it as a per-option boolean flag so it survives dimension
-    reordering on reload.
+    reordering on reload. `showstoppers` is a set of (dim_idx, opt_idx)
+    flagged as technically not feasible — also serialised per-option.
     """
     from datetime import datetime as _dt, timezone as _tz
     reference = reference or {}
+    showstoppers = showstoppers or set()
     return {
         "fieldvista_concept_study": {
             "schema_version": 1,
@@ -16550,6 +16552,7 @@ def _concept_study_to_doc(dimensions, selected, results, base_source,
                                 "patches": o.get("patches", {}),
                                 "swept": (oi in selected.get(di, set())),
                                 "reference": (reference.get(di) == oi),
+                                "showstopper": ((di, oi) in showstoppers),
                             }
                             for oi, o in enumerate(d["options"])
                         ],
@@ -16601,6 +16604,7 @@ def _concept_doc_to_matrix(doc):
     dimensions = []
     selected = {}
     reference = {}
+    showstoppers = set()
     for di, d in enumerate(dims_in):
         opts = []
         sel = set()
@@ -16616,6 +16620,8 @@ def _concept_doc_to_matrix(doc):
                 sel.add(oi)
             if o.get("reference", False) and di not in reference:
                 reference[di] = oi      # first flagged option wins
+            if o.get("showstopper", False):
+                showstoppers.add((di, oi))
         dimensions.append({
             "name": d.get("name", f"Dimension {di+1}"),
             "description": d.get("description", ""),
@@ -16624,7 +16630,7 @@ def _concept_doc_to_matrix(doc):
         selected[di] = sel
     if not dimensions:
         raise ValueError("No dimensions found in study document.")
-    return dimensions, selected, reference
+    return dimensions, selected, reference, showstoppers
 
 
 def _concept_pareto_front(rows):
@@ -16807,18 +16813,24 @@ def _concept_color_for_npv(npv_MM: float, lo: float, hi: float) -> str:
 
 def _render_concept_garden_svg(dimensions: list, selected: dict,
                                 results_by_pick: dict | None = None,
-                                reference: dict | None = None) -> str:
+                                reference: dict | None = None,
+                                showstoppers: dict | None = None) -> str:
     """SVG of the concept long-list, coloured by NPV when results exist.
 
     `selected[dim_idx]` = set of option indices the user has ticked for
     inclusion in the batch. `results_by_pick` is keyed by frozenset of
-    (dim_name, option_label) and holds a dict with `npv_MM` for each
-    combination — used to colour boxes by the BEST NPV that flows
-    through that option. `reference[dim_idx]` = the option index the user
-    flagged as the reference (approved-plans baseline) for that dimension;
-    that box gets a thick dark square outline + a ⭐ marker.
+    (dim_name, option_label) and holds a dict with `npv_MM` and
+    `breakeven_oil` for each combination — used to colour boxes by the BEST
+    NPV that flows through that option and to print the break-even oil price.
+    `reference[dim_idx]` = the option index the user flagged as the reference
+    (approved-plans baseline) for that dimension; that box gets a thick dark
+    square outline + a ⭐ marker. `showstoppers` is a set of (dim_idx,
+    opt_idx) the user has flagged as technically not feasible / show-stoppers;
+    those boxes render GREY with a ⛔ sign and are EXCLUDED from the NPV
+    colour ramp and the legend min/max.
     """
     reference = reference or {}
+    showstoppers = showstoppers or set()
     col_w = 230
     gap_x = 20
     title_h = 34          # dedicated band for the chart title
@@ -16834,24 +16846,44 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
     # Map each option to its NPV (one case per option now — no
     # combinations, so it's a direct lookup by (dim_name, label)).
     best_per_opt = {}      # key: (dim_idx, opt_idx) → npv_MM
+    be_per_opt = {}        # key: (dim_idx, opt_idx) → breakeven_oil ($/bbl)
     if results_by_pick:
-        # Build a (dim_name,label) → npv lookup from the result records
+        # Build (dim_name,label) → npv and → breakeven lookups
         npv_by_pick = {}
+        be_by_pick = {}
         for res in results_by_pick.values():
-            npv = res.get("npv_MM")
-            if npv is None:
-                continue
             dn = res.get("dim")
             lbl = res.get("label")
-            if dn is not None and lbl is not None:
+            if dn is None or lbl is None:
+                continue
+            npv = res.get("npv_MM")
+            if npv is not None:
                 npv_by_pick[(dn, lbl)] = npv
+            be = res.get("breakeven_oil")
+            if be is not None:
+                be_by_pick[(dn, lbl)] = be
         for di, d in enumerate(dimensions):
             for oi, o in enumerate(d["options"]):
                 npv = npv_by_pick.get((d["name"], o["label"]))
                 if npv is not None:
                     best_per_opt[(di, oi)] = npv
-        all_npvs = [r.get("npv_MM") for r in results_by_pick.values()
-                    if r.get("npv_MM") is not None]
+                be = be_by_pick.get((d["name"], o["label"]))
+                if be is not None:
+                    be_per_opt[(di, oi)] = be
+        # NPV ramp range EXCLUDES show-stopper options — a technically-
+        # infeasible concept must not stretch the colour scale (and it's
+        # drawn grey anyway). Map result records back to (di,oi) to test.
+        _label_to_idx = {(d["name"], o["label"]): (di, oi)
+                         for di, d in enumerate(dimensions)
+                         for oi, o in enumerate(d["options"])}
+        all_npvs = []
+        for r in results_by_pick.values():
+            if r.get("npv_MM") is None:
+                continue
+            _idx = _label_to_idx.get((r.get("dim"), r.get("label")))
+            if _idx is not None and _idx in showstoppers:
+                continue
+            all_npvs.append(r.get("npv_MM"))
         npv_lo = min(all_npvs) if all_npvs else 0.0
         npv_hi = max(all_npvs) if all_npvs else 0.0
     else:
@@ -16904,10 +16936,18 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
         for oi, opt in enumerate(d["options"]):
             y = header_h + 16 + oi * (row_h + row_gap)
             is_selected = oi in selected.get(di, set())
-            # Colour: if results exist for this option, use NPV ramp;
-            # else neutral (selected = blue, unselected = grey).
+            _is_stopper = (di, oi) in showstoppers
+            # Colour: a show-stopper (technically not feasible) is ALWAYS
+            # rendered grey and excluded from the NPV ramp, regardless of
+            # selection or any computed NPV. Otherwise: NPV ramp when results
+            # exist, else neutral (selected = blue, unselected = grey).
             best_npv = best_per_opt.get((di, oi))
-            if is_selected and best_npv is not None:
+            if _is_stopper:
+                fill = "#d9d9d9"
+                stroke = "#8a8a8a"
+                stroke_w = 2
+                text_color = "#5a5a5a"
+            elif is_selected and best_npv is not None:
                 fill = _concept_color_for_npv(best_npv, npv_lo, npv_hi)
                 stroke = "#0B3D91"
                 stroke_w = 2
@@ -16942,11 +16982,20 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
                     f'stroke-width="1.5" rx="3"/>')
                 out.append(
                     f'<text x="{x + 8}" y="{y + 16}" font-size="13">⭐</text>')
+            if _is_stopper:
+                # ⛔ sign top-right + a diagonal hatch feel via a corner
+                # ribbon so an infeasible option is unmistakable even in a
+                # printed/greyscale export.
+                out.append(
+                    f'<text x="{x + col_w - 22}" y="{y + 18}" '
+                    f'font-size="14">⛔</text>')
             # Option label — centred, leaving the bottom strip for the
-            # NPV badge so the two never overlap.
+            # NPV/break-even badge (or the NOT FEASIBLE tag) so they never
+            # overlap.
             label = opt["label"]
-            _label_y = (y + row_h / 2 - 6) if (is_selected
-                        and best_npv is not None) else (y + row_h / 2 + 4)
+            _has_badge = (is_selected and best_npv is not None) or _is_stopper
+            _label_y = (y + row_h / 2 - 6) if _has_badge \
+                else (y + row_h / 2 + 4)
             if len(label) <= 30:
                 out.append(f'<text x="{x + col_w/2}" y="{_label_y}" '
                            f'font-size="12" font-weight="600" '
@@ -16966,13 +17015,24 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
                            f'font-size="11" font-weight="600" '
                            f'fill="{text_color}" text-anchor="middle">'
                            f'{l2}</text>')
-            # NPV badge — centred along the bottom edge of the box, below
-            # the label, so it never sits on top of the option name.
-            if is_selected and best_npv is not None:
+            # Bottom badge. Show-stopper → a clear "NOT FEASIBLE" tag.
+            # Otherwise NPV plus break-even oil price (when available), so the
+            # garden carries both the value and the resilience metric.
+            if _is_stopper:
                 out.append(
                     f'<text x="{x + col_w/2}" y="{y + row_h - 7}" '
-                    f'font-size="10" font-weight="700" fill="#1a1a1a" '
-                    f'text-anchor="middle">${best_npv:,.0f}MM</text>')
+                    f'font-size="9" font-weight="700" fill="#b00000" '
+                    f'text-anchor="middle">⛔ NOT FEASIBLE</text>')
+            elif is_selected and best_npv is not None:
+                _be = be_per_opt.get((di, oi))
+                if _be is not None and _be > 0:
+                    _badge = f"${best_npv:,.0f}MM · BE ${_be:,.0f}/bbl"
+                else:
+                    _badge = f"${best_npv:,.0f}MM"
+                out.append(
+                    f'<text x="{x + col_w/2}" y="{y + row_h - 7}" '
+                    f'font-size="9.5" font-weight="700" fill="#1a1a1a" '
+                    f'text-anchor="middle">{_badge}</text>')
     # Colour legend at the bottom
     if results_by_pick and npv_hi > npv_lo:
         legy = height - 20
@@ -17387,6 +17447,12 @@ def concept_selector_section(default_start_date):
     if "concept_reference" not in st.session_state:
         st.session_state["concept_reference"] = {}
     concept_reference = st.session_state["concept_reference"]
+    # Show-stopper set: (dim_idx, opt_idx) tuples the user has flagged as
+    # technically not feasible. These render grey + ⛔ in the garden, are
+    # excluded from the NPV colour ramp, and are NOT run in the batch.
+    if "concept_showstoppers" not in st.session_state:
+        st.session_state["concept_showstoppers"] = set()
+    concept_showstoppers = st.session_state["concept_showstoppers"]
     results = st.session_state["concept_results"]
 
     # ---- Base case source -------------------------------------------------
@@ -17594,7 +17660,9 @@ def concept_selector_section(default_start_date):
                                               "Current sidebar inputs"),
                         st.session_state.get("concept_base_payload"),
                         reference=st.session_state.get(
-                            "concept_reference", {}))
+                            "concept_reference", {}),
+                        showstoppers=st.session_state.get(
+                            "concept_showstoppers", set()))
                     path = fh.save_concept_study(study_name, doc)
                     # Reflect the version that was written
                     _saved = [s for s in fh.list_concept_studies()
@@ -17624,10 +17692,11 @@ def concept_selector_section(default_start_date):
                     try:
                         doc = fh.load_concept_study(
                             studies[idx]["filename"])
-                        dims, sel, ref = _concept_doc_to_matrix(doc)
+                        dims, sel, ref, stops = _concept_doc_to_matrix(doc)
                         st.session_state["concept_dimensions"] = dims
                         st.session_state["concept_selected"] = sel
                         st.session_state["concept_reference"] = ref
+                        st.session_state["concept_showstoppers"] = stops
                         st.session_state["concept_results"] = {}
                         st.session_state["concept_applied"] = None
                         st.success(
@@ -17675,10 +17744,11 @@ def concept_selector_section(default_start_date):
                     else:
                         import yaml as _yaml
                         doc = _yaml.safe_load(raw)
-                    dims, sel, ref = _concept_doc_to_matrix(doc)
+                    dims, sel, ref, stops = _concept_doc_to_matrix(doc)
                     st.session_state["concept_dimensions"] = dims
                     st.session_state["concept_selected"] = sel
                     st.session_state["concept_reference"] = ref
+                    st.session_state["concept_showstoppers"] = stops
                     st.session_state["concept_results"] = {}
                     st.session_state["concept_applied"] = None
                     st.success(
@@ -17786,7 +17856,8 @@ def concept_selector_section(default_start_date):
 
     # ---- The garden view ----
     svg = _render_concept_garden_svg(dimensions, selected, results,
-                                     reference=concept_reference)
+                                     reference=concept_reference,
+                                     showstoppers=concept_showstoppers)
     st.markdown(
         f'<div style="overflow-x:auto;width:100%">'
         f'<div style="min-width:900px">{svg}</div></div>',
@@ -17836,16 +17907,18 @@ def concept_selector_section(default_start_date):
                 dim_to_remove = di
             st.markdown("---")
             opt_to_remove = None
-            # Column header row so the two checkboxes (include / reference)
-            # are unambiguous — without this the collapsed-label ⭐ box was
-            # invisible and looked like it was missing.
-            _hc1, _hcr, _hc2, _hc3, _hc4, _hc5 = st.columns(
-                [0.6, 0.7, 2, 3, 3, 0.6])
+            # Column header row so the three checkboxes (include / reference /
+            # show-stopper) are unambiguous.
+            _hc1, _hcr, _hcs, _hc2, _hc3, _hc4, _hc5 = st.columns(
+                [0.6, 0.6, 0.6, 2.4, 2.4, 1.2, 0.6])
             _hc1.markdown("<div style='font-size:11px;color:#888;"
                           "text-align:center'>✓<br>run</div>",
                           unsafe_allow_html=True)
             _hcr.markdown("<div style='font-size:11px;color:#888;"
                           "text-align:center'>⭐<br>ref</div>",
+                          unsafe_allow_html=True)
+            _hcs.markdown("<div style='font-size:11px;color:#888;"
+                          "text-align:center'>⛔<br>stop</div>",
                           unsafe_allow_html=True)
             _hc2.markdown("<div style='font-size:11px;color:#888'>Option"
                           "</div>", unsafe_allow_html=True)
@@ -17855,8 +17928,8 @@ def concept_selector_section(default_start_date):
             _opt_drafts = []
             for oi, opt in enumerate(d["options"]):
                 _oid = opt["_id"]
-                oc1, ocr, oc2, oc3, oc4, oc5 = st.columns(
-                    [0.6, 0.7, 2, 3, 3, 0.6])
+                oc1, ocr, ocs, oc2, oc3, oc4, oc5 = st.columns(
+                    [0.6, 0.6, 0.6, 2.4, 2.4, 1.2, 0.6])
                 # Selection checkbox — applied immediately (cheap, and it
                 # drives the live garden colours / case count).
                 is_sel = oi in selected.get(di, set())
@@ -17886,6 +17959,21 @@ def concept_selector_section(default_start_date):
                     concept_reference[di] = oi          # exclusive
                 elif (not _new_ref) and _is_ref:
                     concept_reference.pop(di, None)
+                # Show-stopper checkbox — flags this option as technically not
+                # feasible. It renders grey + ⛔ in the garden, is excluded
+                # from the NPV colour ramp, and is skipped in the batch run.
+                _is_stop = (di, oi) in concept_showstoppers
+                _new_stop = ocs.checkbox(
+                    "⛔", value=_is_stop,
+                    key=f"concept_stop_{_did}_{_oid}",
+                    label_visibility="collapsed",
+                    help="Flag as a SHOW-STOPPER / technically not feasible. "
+                         "Greyed out, excluded from the NPV colour scale, and "
+                         "not run in the batch.")
+                if _new_stop and not _is_stop:
+                    concept_showstoppers.add((di, oi))
+                elif (not _new_stop) and _is_stop:
+                    concept_showstoppers.discard((di, oi))
                 _draft_label = oc2.text_input(
                     "Label", value=opt["label"],
                     key=f"concept_opt_{_oid}_label",
@@ -18194,6 +18282,17 @@ def concept_selector_section(default_start_date):
                         concept_reference.pop(di, None)   # ref deleted
                     elif _refoi > opt_to_remove:
                         concept_reference[di] = _refoi - 1
+                # Re-key show-stoppers for this dimension.
+                _new_stops = set()
+                for (_sdi, _soi) in concept_showstoppers:
+                    if _sdi != di:
+                        _new_stops.add((_sdi, _soi))
+                    elif _soi < opt_to_remove:
+                        _new_stops.add((_sdi, _soi))
+                    elif _soi > opt_to_remove:
+                        _new_stops.add((_sdi, _soi - 1))
+                    # _soi == opt_to_remove → dropped
+                st.session_state["concept_showstoppers"] = _new_stops
                 st.rerun()
             if st.button("➕ Add option", key=f"concept_opt_add_{_did}"):
                 d["options"].append({
@@ -18436,9 +18535,17 @@ def concept_selector_section(default_start_date):
         # we gather all the individual option-cases into one list and run
         # them one by one.
         run_items = []  # (dim_name, option_dict)
+        _stops = st.session_state.get("concept_showstoppers", set())
+        _n_skipped_stop = 0
         for di, d in enumerate(dimensions):
             for oi in sorted(selected.get(di, set())):
+                if (di, oi) in _stops:
+                    _n_skipped_stop += 1
+                    continue   # technically not feasible — don't run
                 run_items.append((d["name"], d["options"][oi]))
+        if _n_skipped_stop:
+            st.caption(f"⛔ Skipping {_n_skipped_stop} option(s) flagged as "
+                       f"show-stopper / not feasible.")
 
         results_new = {}
         total = len(run_items)
