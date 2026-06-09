@@ -13528,6 +13528,17 @@ def run_payload_case(payload: dict, default_start_date,
         case_units = scalar.get("units", default_units)
         case_fluid = scalar.get("fluid", "Oil with associated gas")
         case_strategy = scalar.get("strategy", "Depletion")
+        # Normalise descriptive drainage labels ("Water injection", "Gas
+        # injection", "WAG") to the engine token ("Injection"); the engine
+        # only recognises "Depletion"/"Injection", so without this an
+        # injection concept silently runs as depletion.
+        _csl = str(case_strategy).strip().lower()
+        if _csl == "depletion" or _csl == "":
+            case_strategy = "Depletion"
+        elif ("inject" in _csl or "wag" in _csl or "water" in _csl
+              or "gas re" in _csl or "flood" in _csl or "ior" in _csl
+              or "eor" in _csl):
+            case_strategy = "Injection"
         if case_fluid not in FLUID_SYSTEMS:
             raise ValueError(f"Unknown fluid system '{case_fluid}'. "
                              f"Valid: {', '.join(FLUID_SYSTEMS)}")
@@ -16268,17 +16279,26 @@ _DEFAULT_CONCEPT_DIMENSIONS = [
              "patches": {"strategy": "Depletion",
                           "aq_active": False, "vrr": 0.0, "inj_eff": 0.0}},
             {"label": "Water injection",
-             "description": "Waterflood with VRR=1, ~85% sweep efficiency.",
+             "description": "Waterflood with VRR=1, ~85% sweep efficiency. "
+                            "Lifts recovery ~1.3× vs primary depletion.",
              "patches": {"strategy": "Water injection",
-                          "vrr": 1.0, "inj_eff": 0.85}},
+                          "vrr": 1.0, "inj_eff": 0.85,
+                          "_rf_multiplier": 1.30,
+                          "_n_injectors_override": 2}},
             {"label": "Gas injection",
-             "description": "Pressure maintenance via lean gas re-injection.",
+             "description": "Pressure maintenance via lean gas re-injection. "
+                            "Lifts recovery ~1.2× vs depletion.",
              "patches": {"strategy": "Gas injection",
-                          "vrr": 1.0, "inj_eff": 0.80}},
+                          "vrr": 1.0, "inj_eff": 0.80,
+                          "_rf_multiplier": 1.20,
+                          "_n_injectors_override": 2}},
             {"label": "WAG",
-             "description": "Water-alternating-gas — best EOR sweep.",
+             "description": "Water-alternating-gas — best EOR sweep. "
+                            "Lifts recovery ~1.45× vs depletion.",
              "patches": {"strategy": "WAG",
-                          "vrr": 1.05, "inj_eff": 0.90}},
+                          "vrr": 1.05, "inj_eff": 0.90,
+                          "_rf_multiplier": 1.45,
+                          "_n_injectors_override": 3}},
         ],
     },
     {
@@ -16692,6 +16712,69 @@ def _apply_concept_patches(payload: dict, picks: list) -> dict:
                             fac["amount_MMUSD"] = (
                                 fac["amount_MMUSD"].astype(float) * ratio)
                         p["tables"]["fac_df"] = fac.to_dict(orient="list")
+                except Exception:
+                    pass
+            elif k.startswith("_rf_multiplier"):
+                # Injection-driven recovery uplift. A waterflood / gas
+                # injection / WAG physically RAISES recovery vs primary
+                # depletion. The engine derives recovery from rf_target, so a
+                # strategy patch that doesn't move rf_target produces an
+                # identical profile to depletion (the "water injection ==
+                # depletion" bug). This scales the base rf_target by the
+                # multiplier, capped at an 0.85 physical ceiling, so injection
+                # concepts actually recover more. Auto_scale_rf is turned off
+                # so the explicit target is honoured.
+                try:
+                    mult = float(v)
+                    base_rf = float(p["scalar"].get("rf_target", 0.35))
+                    p["scalar"]["rf_target"] = max(
+                        0.01, min(0.85, base_rf * mult))
+                    # Bind the target: with auto_scale_rf the engine scales
+                    # production to actually HIT rf_target, so the injection
+                    # uplift shows up as extra recovered volume (and NPV).
+                    # Without it, recovery is purely decline-driven and the
+                    # higher target is ignored (the collapse symptom).
+                    p["scalar"]["auto_scale_rf"] = True
+                except Exception:
+                    pass
+            elif k.startswith("_n_injectors_override"):
+                # Create N injector wells by cloning the producer design, so
+                # an injection strategy has real injectors (voidage support +
+                # their drilling CAPEX), instead of being an injection case
+                # with nothing to inject. 0 removes injectors.
+                try:
+                    n_inj = int(v)
+                    if "tables" in p and "producers_df" in p["tables"]:
+                        if n_inj <= 0:
+                            p["tables"]["injectors_df"] = {}
+                        else:
+                            pdf = pd.DataFrame(p["tables"]["producers_df"])
+                            if len(pdf) > 0:
+                                if len(pdf) >= n_inj:
+                                    idf = pdf.iloc[:n_inj].reset_index(
+                                        drop=True)
+                                else:
+                                    need = n_inj - len(pdf)
+                                    extra = pd.concat(
+                                        [pdf.iloc[[-1]]] * need,
+                                        ignore_index=True)
+                                    idf = pd.concat([pdf, extra],
+                                                    ignore_index=True)
+                                idf["name"] = [f"I-{i+1:02d}"
+                                               for i in range(len(idf))]
+                                # Injectors need an inj_rate column (the
+                                # producer clone lacks one). Default each
+                                # injector to a voidage-style rate based on the
+                                # producer's initial liquid rate so the engine
+                                # has a real injection stream to apply.
+                                if "inj_rate" not in idf.columns:
+                                    _qbase = (idf["qi_primary"].astype(float)
+                                              if "qi_primary" in idf.columns
+                                              else pd.Series([5000.0]
+                                                             * len(idf)))
+                                    idf["inj_rate"] = _qbase.values
+                                p["tables"]["injectors_df"] = idf.to_dict(
+                                    orient="list")
                 except Exception:
                     pass
             else:
