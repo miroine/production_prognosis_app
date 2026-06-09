@@ -123,6 +123,21 @@ check("629 $/Sm3 -> $/bbl", m.to_field(629.0, "price_oil", "metric"),
 check("100 $/bbl -> $/Sm3", m.from_field(100.0, "price_oil", "metric"),
       628.98, tol=0.5)
 
+section("4b. NGL display-unit consistency (NGL is a liquid: bbl/d)")
+# NGL rate is produced by the engine in bbl/d. In metric display it must
+# convert like an oil rate (bbl -> Sm3), not stay in bbl/d (a past leak).
+_ngl_df = pd.DataFrame({"ngl_rate": [1000.0], "oil_rate": [5000.0]})
+_ngl_metric = m.df_to_display_units(_ngl_df, "Gas with condensate", "metric")
+_ngl_col = [c for c in _ngl_metric.columns if c.startswith("ngl_rate")][0]
+check("NGL labelled Sm3/d in metric", "Sm³/d" in _ngl_col, True)
+check("NGL 1000 bbl/d -> 158.99 Sm3/d",
+      float(_ngl_metric[_ngl_col].iloc[0]), 158.99, tol=0.1)
+_ngl_field = m.df_to_display_units(_ngl_df, "Gas with condensate", "field")
+_ngl_colf = [c for c in _ngl_field.columns if c.startswith("ngl_rate")][0]
+check("NGL labelled stb/d in field", "stb/d" in _ngl_colf, True)
+check("NGL unchanged in field mode",
+      float(_ngl_field[_ngl_colf].iloc[0]), 1000.0)
+
 section("5. BOE conversion (6 Mscf gas = 1 boe)")
 # Build a tiny df with known cum volumes
 df_boe = pd.DataFrame({"cum_oil": [10.0], "cum_gas": [60.0]})  # MMstb, Bscf

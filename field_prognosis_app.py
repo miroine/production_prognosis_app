@@ -205,6 +205,10 @@ _DF_COLUMN_KINDS = {
     "gas_inj_rate":   "gas_rate",
     "gas_fuel_rate":  "gas_rate",
     "gas_flare_rate": "gas_rate",
+    # NGL is a liquid (engine produces bbl/d). Treat it like an oil rate so it
+    # converts to Sm³/d and is labelled consistently in metric display mode,
+    # instead of silently staying in bbl/d while every other liquid converts.
+    "ngl_rate":      "oil_rate",
     # Cumulatives
     "cum_oil":       "oil_vol",
     "cum_gas":       "gas_vol",
@@ -250,7 +254,6 @@ def df_to_display_units(df: "pd.DataFrame", fluid_system: str, units: str) -> "p
         "revenue_gas":     "[USD/month]",
         "revenue_condensate": "[USD/month]",
         "revenue_ngl":     "[USD/month]",
-        "ngl_rate":        "[bbl/d]",
         "opex":            "[USD/month]",
         "tax":             "[USD/month]",
         "capex_well":      "[USD/month]",
@@ -16638,15 +16641,19 @@ def _concept_color_for_npv(npv_MM: float, lo: float, hi: float) -> str:
 
 
 def _render_concept_garden_svg(dimensions: list, selected: dict,
-                                results_by_pick: dict | None = None) -> str:
+                                results_by_pick: dict | None = None,
+                                reference: dict | None = None) -> str:
     """SVG of the concept long-list, coloured by NPV when results exist.
 
     `selected[dim_idx]` = set of option indices the user has ticked for
     inclusion in the batch. `results_by_pick` is keyed by frozenset of
     (dim_name, option_label) and holds a dict with `npv_MM` for each
     combination — used to colour boxes by the BEST NPV that flows
-    through that option.
+    through that option. `reference[dim_idx]` = the option index the user
+    flagged as the reference (approved-plans baseline) for that dimension;
+    that box gets a thick dark square outline + a ⭐ marker.
     """
+    reference = reference or {}
     col_w = 230
     gap_x = 20
     title_h = 34          # dedicated band for the chart title
@@ -16750,10 +16757,26 @@ def _render_concept_garden_svg(dimensions: list, selected: dict,
                 stroke = "#ccc"
                 stroke_w = 1
                 text_color = "#666"
+            # Reference option: thick dark square outline so it's unmistakable
+            # as the approved-plans baseline the staircase ΔNPV is measured
+            # from. Drawn on top of the normal fill/stroke choice above.
+            _is_ref = (reference.get(di) == oi)
+            if _is_ref:
+                stroke = "#0B3D91"
+                stroke_w = 4
             out.append(
                 f'<rect x="{x}" y="{y}" width="{col_w}" height="{row_h}" '
                 f'fill="{fill}" stroke="{stroke}" stroke-width="{stroke_w}" '
                 f'rx="4"/>')
+            if _is_ref:
+                # ⭐ marker top-left + a second crisp inner square so the
+                # "reference" status reads even on a colour-filled box.
+                out.append(
+                    f'<rect x="{x + 2}" y="{y + 2}" width="{col_w - 4}" '
+                    f'height="{row_h - 4}" fill="none" stroke="#0B3D91" '
+                    f'stroke-width="1.5" rx="3"/>')
+                out.append(
+                    f'<text x="{x + 8}" y="{y + 16}" font-size="13">⭐</text>')
             # Option label — centred, leaving the bottom strip for the
             # NPV badge so the two never overlap.
             label = opt["label"]
@@ -17303,12 +17326,13 @@ def concept_selector_section(default_start_date):
             "dimension; matched options are switched to *manual KPI* mode and "
             "their values flow into the garden colours and every ranking. "
             "Recognised columns (all optional except label): "
-            "`label, npv_MM, npv_pretax_MM, capex_total_MM, capex_facility_MM, "
+            "`label, npv_MM, npv_pretax_MM, npv_p90, npv_p10, capex_total_MM, capex_facility_MM, "
             "capex_well_MM, breakeven_oil, cum_primary, final_rf, irr, "
             "payback_yrs, co2_total_Mt, resources_mmboe`. "
             "Tip: download the template below to get the exact headers.")
         # Downloadable template
-        _tmpl_cols = ["label", "npv_MM", "npv_pretax_MM", "capex_total_MM",
+        _tmpl_cols = ["label", "npv_MM", "npv_pretax_MM", "npv_p90", "npv_p10",
+                      "capex_total_MM",
                       "capex_facility_MM", "capex_well_MM", "breakeven_oil",
                       "cum_primary", "final_rf", "irr", "payback_yrs",
                       "co2_total_Mt", "resources_mmboe"]
@@ -17596,7 +17620,8 @@ def concept_selector_section(default_start_date):
                     "run one by one.")
 
     # ---- The garden view ----
-    svg = _render_concept_garden_svg(dimensions, selected, results)
+    svg = _render_concept_garden_svg(dimensions, selected, results,
+                                     reference=concept_reference)
     st.markdown(
         f'<div style="overflow-x:auto;width:100%">'
         f'<div style="min-width:900px">{svg}</div></div>',
@@ -17849,6 +17874,24 @@ def concept_selector_section(default_start_date):
                             value=float(_mk_cur.get("npv_pretax_MM", 0.0)
                                         or 0.0),
                             step=10.0, key=f"concept_opt_{_oid}_mk_npvpt")
+                        # Optional manual P90/P10 NPV — lets a manual/imported
+                        # option carry an uncertainty band so it shows the
+                        # same P90–mean–P10 spread in the staircase as a
+                        # probabilistic (Monte-Carlo) computed concept.
+                        _mk_new["npv_p90"] = mkc1.number_input(
+                            "NPV P90 — downside ($MM)",
+                            value=float(_mk_cur.get("npv_p90", 0.0) or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_p90",
+                            help="Optional low-side NPV (P90). Leave 0 to "
+                                 "omit. If set, this option shows a P90–mean–"
+                                 "P10 band in the staircase like a Monte-Carlo "
+                                 "concept.")
+                        _mk_new["npv_p10"] = mkc2.number_input(
+                            "NPV P10 — upside ($MM)",
+                            value=float(_mk_cur.get("npv_p10", 0.0) or 0.0),
+                            step=10.0, key=f"concept_opt_{_oid}_mk_p10",
+                            help="Optional high-side NPV (P10). Leave 0 to "
+                                 "omit.")
                         _mk_new["capex_total_MM"] = mkc3.number_input(
                             "CAPEX total ($MM)",
                             value=float(_mk_cur.get("capex_total_MM", 0.0)
@@ -17865,15 +17908,23 @@ def concept_selector_section(default_start_date):
                                         or 0.0),
                             step=10.0, key=f"concept_opt_{_oid}_mk_capwell")
                         _mk_new["breakeven_oil"] = mkc3.number_input(
-                            "Break-even ($/bbl or $/boe)",
+                            "Break-even oil price ($/bbl)",
                             value=float(_mk_cur.get("breakeven_oil", 0.0)
                                         or 0.0),
-                            step=1.0, key=f"concept_opt_{_oid}_mk_be")
+                            step=1.0, key=f"concept_opt_{_oid}_mk_be",
+                            help="Oil-price floor for NPV=0, in $/bbl — the "
+                                 "same basis the computed concepts report.")
                         _mk_new["cum_primary"] = mkc1.number_input(
-                            "Total production (MMboe or display unit)",
+                            "Cumulative primary production (MMstb oil / Bscf "
+                            "gas — informational)",
                             value=float(_mk_cur.get("cum_primary", 0.0)
                                         or 0.0),
-                            step=1.0, key=f"concept_opt_{_oid}_mk_prod")
+                            step=1.0, key=f"concept_opt_{_oid}_mk_prod",
+                            help="Optional. Stored with the option but the "
+                                 "screening table compares volumes via "
+                                 "'Resources (MMboe)' below — set that field "
+                                 "for a like-for-like comparison against "
+                                 "computed concepts.")
                         _mk_new["final_rf"] = mkc2.number_input(
                             "Recovery factor (fraction 0–1)",
                             value=float(_mk_cur.get("final_rf", 0.0) or 0.0),
@@ -18085,8 +18136,71 @@ def concept_selector_section(default_start_date):
             key="concept_mc_iters",
             help="More iterations = smoother percentiles but slower. "
                  "100 is a good screening compromise.")
+        # User-definable uncertainty ranges. Each value is the lognormal
+        # standard deviation (≈ the fractional 1σ spread) applied to that
+        # driver. The defaults reproduce the previous hardcoded ±20% / ±18%.
+        with st.expander("🎚️ Monte-Carlo ranges — set the uncertainty per "
+                         "driver", expanded=False):
+            st.caption(
+                "Each slider is the **1σ spread** (≈ ± one standard "
+                "deviation, lognormal) applied to that driver in every draw. "
+                "E.g. 0.20 means the value varies roughly ±20% around the "
+                "case value. Set a driver to 0 to hold it fixed. These apply "
+                "to all probabilistic concepts in the run.")
+            st.markdown("**💵 Economic drivers**")
+            _mcr1, _mcr2 = st.columns(2)
+            mc_sigma_oil = _mcr1.slider(
+                "Oil price 1σ", 0.0, 0.60, 0.20, 0.05,
+                key="concept_mc_sigma_oil")
+            mc_sigma_opex = _mcr2.slider(
+                "Variable OPEX 1σ", 0.0, 0.60, 0.20, 0.05,
+                key="concept_mc_sigma_opex")
+            mc_sigma_well = _mcr1.slider(
+                "Well CAPEX 1σ", 0.0, 0.60, 0.20, 0.05,
+                key="concept_mc_sigma_well")
+            mc_sigma_fac = _mcr2.slider(
+                "Facility CAPEX 1σ", 0.0, 0.60, 0.18, 0.05,
+                key="concept_mc_sigma_fac")
+            st.markdown("**🪨 Subsurface / production drivers**")
+            st.caption(
+                "These perturb the production profile itself, not just the "
+                "economics: hydrocarbons in place, well deliverability, "
+                "decline and flowing pressure. Off (0) by default so existing "
+                "runs are unchanged — turn them up to capture subsurface "
+                "uncertainty.")
+            _mcs1, _mcs2 = st.columns(2)
+            mc_sigma_inplace = _mcs1.slider(
+                "In-place volumes (OOIP/OGIP) 1σ", 0.0, 0.60, 0.0, 0.05,
+                key="concept_mc_sigma_inplace",
+                help="Scales OOIP and OGIP together each draw — the dominant "
+                     "resource-size uncertainty.")
+            mc_sigma_rf = _mcs2.slider(
+                "Recovery factor 1σ", 0.0, 0.40, 0.0, 0.05,
+                key="concept_mc_sigma_rf",
+                help="Scales the target recovery factor (rf_target). Capped "
+                     "at a physical ceiling so draws can't exceed ~85%.")
+            mc_sigma_qi = _mcs1.slider(
+                "Well productivity / initial rate 1σ", 0.0, 0.60, 0.0, 0.05,
+                key="concept_mc_sigma_qi",
+                help="Scales each producer's initial rates (qi) and PI — "
+                     "captures deliverability / productivity-index "
+                     "uncertainty.")
+            mc_sigma_decline = _mcs2.slider(
+                "Decline rate 1σ", 0.0, 0.60, 0.0, 0.05,
+                key="concept_mc_sigma_decline",
+                help="Scales each producer's annual decline rate (di). Higher "
+                     "decline = faster fall-off = lower late production.")
+            mc_sigma_pressure = _mcs1.slider(
+                "Flowing/wellhead pressure 1σ", 0.0, 0.40, 0.0, 0.05,
+                key="concept_mc_sigma_pressure",
+                help="Scales wellhead flowing pressure — affects drawdown and "
+                     "rate where IPR coupling is active.")
     else:
         mc_iters = 0
+        mc_sigma_oil = mc_sigma_opex = mc_sigma_well = 0.20
+        mc_sigma_fac = 0.18
+        mc_sigma_inplace = mc_sigma_rf = mc_sigma_qi = 0.0
+        mc_sigma_decline = mc_sigma_pressure = 0.0
 
     if do_run:
         # Base payload — fallback for options that don't link their own
@@ -18219,7 +18333,19 @@ def concept_selector_section(default_start_date):
                     "payback_yrs": _mkv("payback_yrs"),
                     "resources_mmboe": _mkv("resources_mmboe"),
                     "co2_total_Mt": _mkv("co2_total_Mt"),
-                    "npv_p90": None, "npv_p10": None, "npv_mc_mean": None,
+                    # Manual P90/P10 NPV band (optional). When the user
+                    # supplies them, this option carries a real uncertainty
+                    # spread; npv_mc_mean falls back to the point NPV so the
+                    # staircase draws mean + band consistently. "probabilistic"
+                    # tells the staircase to render the P90–mean–P10 markers.
+                    "npv_p90": _mkv("npv_p90"),
+                    "npv_p10": _mkv("npv_p10"),
+                    "npv_mc_mean": (_mkv("npv_MM")
+                                    if (_mkv("npv_p90") is not None
+                                        or _mkv("npv_p10") is not None)
+                                    else None),
+                    "probabilistic": (_mkv("npv_p90") is not None
+                                      and _mkv("npv_p10") is not None),
                     "mc_draws": None, "profile": None,
                     "fluid": st.session_state.get("fluid"),
                     "units": st.session_state.get("units", "field"),
@@ -18242,7 +18368,12 @@ def concept_selector_section(default_start_date):
             except Exception:
                 _payload_sig = repr(case_payload)
             _cache_key = _hashlib.md5(
-                (_payload_sig + f"|mc{mc_iters}").encode()).hexdigest()
+                (_payload_sig + f"|mc{mc_iters}"
+                 f"|s{mc_sigma_oil},{mc_sigma_opex},"
+                 f"{mc_sigma_well},{mc_sigma_fac}"
+                 f"|ss{mc_sigma_inplace},{mc_sigma_rf},{mc_sigma_qi},"
+                 f"{mc_sigma_decline},{mc_sigma_pressure}").encode()
+            ).hexdigest()
             if use_cache and _cache_key in combo_cache:
                 cached = dict(combo_cache[_cache_key])
                 cached["name"] = name
@@ -18406,6 +18537,31 @@ def concept_selector_section(default_start_date):
                     _ov0 = float(_sc0.get("opex_var_oil",
                                            _sc0.get("opex_var_gas", 5.5)))
                     _cw0 = float(_sc0.get("capex_well", 120.0))
+                    # Subsurface base values for production-profile uncertainty
+                    _ooip0 = _sc0.get("ooip")
+                    _ogip0 = _sc0.get("ogip")
+                    _rf0 = _sc0.get("rf_target")
+                    # Base producers table (per-well qi / decline / pressure).
+                    # After normalisation this is column-oriented
+                    # ({col: [per-well values]}); older paths may give a list
+                    # of row dicts. Capture whichever form is present.
+                    _prod0 = None
+                    _prod0_kind = None
+                    try:
+                        _pt = case_payload.get("tables", {}).get(
+                            "producers_df")
+                        if isinstance(_pt, dict) and _pt:
+                            _prod0 = _pt
+                            _prod0_kind = "cols"
+                        elif isinstance(_pt, list) and _pt:
+                            _prod0 = _pt
+                            _prod0_kind = "rows"
+                    except Exception:
+                        _prod0 = None
+                    _any_subsurface = (mc_sigma_inplace > 0 or mc_sigma_rf > 0
+                                       or mc_sigma_qi > 0
+                                       or mc_sigma_decline > 0
+                                       or mc_sigma_pressure > 0)
                     # Base facility CAPEX rows (development only) for scaling.
                     _fac0 = None
                     try:
@@ -18427,19 +18583,102 @@ def concept_selector_section(default_start_date):
                         _trial = dict(case_payload)
                         _ts = dict(_sc0)
                         _ts["oil_price_bbl"] = _op0 * float(
-                            _rng.lognormal(0, 0.20))
+                            _rng.lognormal(0, mc_sigma_oil)) \
+                            if mc_sigma_oil > 0 else _op0
                         _okey = ("opex_var_oil" if "opex_var_oil" in _ts
                                   else "opex_var_gas")
-                        _ts[_okey] = _ov0 * float(_rng.lognormal(0, 0.20))
-                        _ts["capex_well"] = _cw0 * float(
-                            _rng.lognormal(0, 0.20))
+                        _ts[_okey] = (_ov0 * float(
+                            _rng.lognormal(0, mc_sigma_opex))
+                            if mc_sigma_opex > 0 else _ov0)
+                        _ts["capex_well"] = (_cw0 * float(
+                            _rng.lognormal(0, mc_sigma_well))
+                            if mc_sigma_well > 0 else _cw0)
+                        # ---- Subsurface scalar uncertainty ----
+                        # In-place volumes: scale OOIP and OGIP by ONE shared
+                        # factor each draw (they move together with reservoir
+                        # size). Recovery factor scaled independently, capped
+                        # at a physical ceiling.
+                        if mc_sigma_inplace > 0:
+                            _ipf = float(_rng.lognormal(0, mc_sigma_inplace))
+                            if _ooip0 is not None:
+                                _ts["ooip"] = float(_ooip0) * _ipf
+                            if _ogip0 is not None:
+                                _ts["ogip"] = float(_ogip0) * _ipf
+                        if mc_sigma_rf > 0 and _rf0 is not None:
+                            _rfv = float(_rf0) * float(
+                                _rng.lognormal(0, mc_sigma_rf))
+                            _ts["rf_target"] = max(0.01, min(0.85, _rfv))
                         _trial["scalar"] = _ts
-                        # Facility CAPEX uncertainty — scale development rows
-                        # of fac_df by a lognormal factor (±~20%), leaving
-                        # cessation/P&A untouched.
-                        if _fac0 is not None:
-                            _ffac = float(_rng.lognormal(0, 0.18))
+                        # ---- Subsurface per-well uncertainty ----
+                        # Scale each producer's initial rates (qi ≈ deliver-
+                        # ability/PI), annual decline, and wellhead pressure.
+                        # One factor per driver per draw, applied to all wells
+                        # (a field-wide subsurface realisation, not independent
+                        # per well — the screening-level convention).
+                        _tbl_set = False
+                        if _prod0 is not None and (
+                                mc_sigma_qi > 0 or mc_sigma_decline > 0
+                                or mc_sigma_pressure > 0):
+                            _qif = (float(_rng.lognormal(0, mc_sigma_qi))
+                                    if mc_sigma_qi > 0 else 1.0)
+                            _dif = (float(_rng.lognormal(0, mc_sigma_decline))
+                                    if mc_sigma_decline > 0 else 1.0)
+                            _pf = (float(_rng.lognormal(0, mc_sigma_pressure))
+                                   if mc_sigma_pressure > 0 else 1.0)
+                            _qi_keys = ("qi_primary", "qi_secondary",
+                                        "well_pi_override")
+                            if _prod0_kind == "cols":
+                                _newprod = {k: list(v) if isinstance(v, list)
+                                            else v for k, v in _prod0.items()}
+                                if mc_sigma_qi > 0:
+                                    for _qk in _qi_keys:
+                                        if isinstance(_newprod.get(_qk), list):
+                                            _newprod[_qk] = [
+                                                (float(x) * _qif) if x else x
+                                                for x in _newprod[_qk]]
+                                if mc_sigma_decline > 0 and isinstance(
+                                        _newprod.get("di_annual"), list):
+                                    _newprod["di_annual"] = [
+                                        (float(x) * _dif) if x else x
+                                        for x in _newprod["di_annual"]]
+                                if mc_sigma_pressure > 0 and isinstance(
+                                        _newprod.get("wellhead_pressure_psi"),
+                                        list):
+                                    _newprod["wellhead_pressure_psi"] = [
+                                        (float(x) * _pf) if x else x
+                                        for x in
+                                        _newprod["wellhead_pressure_psi"]]
+                            else:   # list of row dicts
+                                _newprod = []
+                                for _w in _prod0:
+                                    _wc = dict(_w)
+                                    if mc_sigma_qi > 0:
+                                        for _qk in _qi_keys:
+                                            if _wc.get(_qk):
+                                                _wc[_qk] = (
+                                                    float(_wc[_qk]) * _qif)
+                                    if mc_sigma_decline > 0 and _wc.get(
+                                            "di_annual"):
+                                        _wc["di_annual"] = (
+                                            float(_wc["di_annual"]) * _dif)
+                                    if mc_sigma_pressure > 0 and _wc.get(
+                                            "wellhead_pressure_psi"):
+                                        _wc["wellhead_pressure_psi"] = (
+                                            float(_wc["wellhead_pressure_psi"])
+                                            * _pf)
+                                    _newprod.append(_wc)
                             _tbl = dict(case_payload.get("tables", {}))
+                            _tbl["producers_df"] = _newprod
+                            _trial["tables"] = _tbl
+                            _tbl_set = True
+                        # Facility CAPEX uncertainty — scale development rows
+                        # of fac_df by a lognormal factor, leaving
+                        # cessation/P&A untouched. Reuse the tables dict if the
+                        # subsurface block already started modifying it.
+                        if _fac0 is not None and mc_sigma_fac > 0:
+                            _ffac = float(_rng.lognormal(0, mc_sigma_fac))
+                            _tbl = (_trial["tables"] if _tbl_set
+                                    else dict(case_payload.get("tables", {})))
                             _newfac = dict(_tbl.get("fac_df", {}))
                             _scaled = []
                             for _i, _v in enumerate(_fac0):
@@ -18508,6 +18747,20 @@ def concept_selector_section(default_start_date):
                     "npv_MM": npv_MM,
                     "npv_pretax_MM": npv_pretax_MM,
                     "cum_primary": cum_primary,
+                    # Display-unit volume/rate reporting values + their unit
+                    # labels, copied from the engine kpis so the transposed
+                    # "Compare cases" view shows each case in ITS OWN unit
+                    # system (metric cases in MSm³/GSm³/Sm³/d, field cases in
+                    # MMstb/Bscf/stb/d) instead of silently defaulting to
+                    # field-unit numbers with field labels.
+                    "cum_oil_disp": kpis.get("cum_oil_disp"),
+                    "cum_gas_disp": kpis.get("cum_gas_disp"),
+                    "cum_oil_unit": kpis.get("cum_oil_unit"),
+                    "cum_gas_unit": kpis.get("cum_gas_unit"),
+                    "cum_oil_MMstb": kpis.get("cum_oil_MMstb"),
+                    "cum_gas_Bscf": kpis.get("cum_gas_Bscf"),
+                    "peak_primary_rate": kpis.get("peak_primary_rate"),
+                    "peak_rate_unit": kpis.get("peak_rate_unit"),
                     "final_rf": rf,
                     "irr": irr,
                     "breakeven_oil": breakeven,
