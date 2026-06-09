@@ -12218,9 +12218,9 @@ def collect_inputs_payload() -> dict:
     # snapshot both take precedence; this only fills genuine gaps.
     _ECON_DEFAULTS = {
         "oil_price_bbl": 75.0, "gas_price_mmbtu": 10.0,
-        "opex_var_oil": 8.0, "opex_var_gas": 0.9, "opex_var_bbl": 8.0,
+        "opex_var_oil": 5.5, "opex_var_gas": 0.9, "opex_var_bbl": 5.5,
         "opex_fixed": 20.0,
-        "tariff_oil_bbl": 2.0, "tariff_gas_mmbtu": 2.0,
+        "tariff_oil_bbl": 2.0, "tariff_gas_mmbtu": 0.3,
         "disc": 0.10, "tax_rate": 0.30, "royalty": 0.10,
         "capex_well": 15.0, "aban_cost": 80.0,
         "fiscal_regime": "Tax/Royalty",
@@ -12232,15 +12232,15 @@ def collect_inputs_payload() -> dict:
         "cmpl_dayrate": 350.0, "well_tangibles": 4.0,
         "well_intangibles_pct": 0.10,
         "capex_contingency_pct": 30.0,
-        "co2_price": 0.0, "co2_factor_gas_combust": 53.0,
+        "co2_price": 80.0, "co2_factor_gas_combust": 53.0,
         "co2_factor_flare_inefficiency": 0.02,
         "co2_factor_oil_routine": 0.5,
         "co2_scope3_enabled": False, "co2_scope3_factor_oil": 430.0,
         "co2_scope3_factor_gas": 53.0, "co2_scope3_price": 0.0,
-        "money_basis_label": "Real (constant)", "inflation_rate": 0.0,
+        "money_basis_label": "Real (constant)", "inflation_rate": 2.5,
         "ngl_yield": 0.0, "ngl_price": 25.0, "ngl_opex": 5.0,
         "ngl_shrink": 0.0,
-        "economic_cutoff_mode_label": "Horizon", "well_pi_default": 50.0,
+        "economic_cutoff_mode_label": "Horizon", "well_pi_default": 2.0,
         "cost_input_currency": "USD", "usd_to_nok": 10.5,
     }
     for _ek, _ev in _ECON_DEFAULTS.items():

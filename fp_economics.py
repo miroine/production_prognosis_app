@@ -57,7 +57,7 @@ def econ_dict_from_scalar(scalar: dict, units: str, *,
     elif "opex_var_gas" in scalar and scalar.get("opex_var_gas") is not None:
         opex_var_f = float(scalar.get("opex_var_gas"))
     elif "opex_var_bbl" in scalar:
-        opex_var_f = float(scalar.get("opex_var_bbl", 8.0))
+        opex_var_f = float(scalar.get("opex_var_bbl", 5.5))
     else:
         opex_var_f = to_field(float(scalar.get("opex_var", 8)),
                               "price_oil", units)
