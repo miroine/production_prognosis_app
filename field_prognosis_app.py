@@ -12205,6 +12205,49 @@ def collect_inputs_payload() -> dict:
                     payload["scalar"][k] = v.isoformat()
                 else:
                     payload["scalar"][k] = v
+    # CRITICAL: the economic scalars (prices, tariffs, tax, fiscal, NGL, CO2,
+    # well-cost) live in the economics_section, which only renders on the
+    # Field-prognosis page. On the Concept Selector — or any page where that
+    # section hasn't been opened — those widget keys are NOT in session_state,
+    # so without this they'd be silently dropped from the export and the
+    # batch/concept reload would fall back to engine defaults (the live-vs-
+    # batch NPV mismatch: a default case exported from the Concept Selector
+    # carried subsurface keys but no prices/tariffs/tax). Backfill any missing
+    # economic key from its live widget default so the exported scalar is
+    # always a COMPLETE economic case. Live session values and the loaded
+    # snapshot both take precedence; this only fills genuine gaps.
+    _ECON_DEFAULTS = {
+        "oil_price_bbl": 75.0, "gas_price_mmbtu": 10.0,
+        "opex_var_oil": 8.0, "opex_var_gas": 0.9, "opex_var_bbl": 8.0,
+        "opex_fixed": 20.0,
+        "tariff_oil_bbl": 2.0, "tariff_gas_mmbtu": 2.0,
+        "disc": 0.10, "tax_rate": 0.30, "royalty": 0.10,
+        "capex_well": 15.0, "aban_cost": 80.0,
+        "fiscal_regime": "Tax/Royalty",
+        "ncs_cit": 0.22, "ncs_spt": 0.718, "ncs_uplift": 0.1769,
+        "ncs_depreciation_years": 6.0, "ncs_uplift_years": 4.0,
+        "psc_cr_ceiling": 0.50, "psc_pos": 0.40, "psc_tax": 0.30,
+        "psc_gov_part": 0.0, "psc_sig_bonus": 0.0,
+        "well_cost_mode": "rig_rate", "rig_dayrate": 500.0,
+        "cmpl_dayrate": 350.0, "well_tangibles": 4.0,
+        "well_intangibles_pct": 0.10,
+        "capex_contingency_pct": 30.0,
+        "co2_price": 0.0, "co2_factor_gas_combust": 53.0,
+        "co2_factor_flare_inefficiency": 0.02,
+        "co2_factor_oil_routine": 0.5,
+        "co2_scope3_enabled": False, "co2_scope3_factor_oil": 430.0,
+        "co2_scope3_factor_gas": 53.0, "co2_scope3_price": 0.0,
+        "money_basis_label": "Real (constant)", "inflation_rate": 0.0,
+        "ngl_yield": 0.0, "ngl_price": 25.0, "ngl_opex": 5.0,
+        "ngl_shrink": 0.0,
+        "economic_cutoff_mode_label": "Horizon", "well_pi_default": 50.0,
+        "cost_input_currency": "USD", "usd_to_nok": 10.5,
+    }
+    for _ek, _ev in _ECON_DEFAULTS.items():
+        if _ek not in payload["scalar"] or payload["scalar"][_ek] in (
+                None, ""):
+            payload["scalar"][_ek] = _ev
+
     # CRITICAL: units, fluid and start_date must ALWAYS be present in the
     # exported scalar. They drive unit interpretation of every rate/profile,
     # the fluid system, and the timeline — if any is missing on import the
@@ -13957,7 +14000,26 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
     # built. The batch path must do the same, otherwise a Depletion case
     # with injectors listed in the YAML over-counts well CAPEX vs Field
     # prognosis (the live-vs-batch well-cost mismatch).
-    _strategy = str(payload.get("scalar", {}).get("strategy", "Depletion"))
+    #
+    # The Concept Selector uses descriptive drainage labels ("Water
+    # injection", "Gas injection", "WAG") that the engine doesn't recognise
+    # — it only knows "Depletion" / "Injection". Normalise any injection-type
+    # label to "Injection" so those concepts actually build injectors and
+    # apply voidage support, instead of silently collapsing to depletion
+    # (which made every injection concept return the base-case NPV).
+    _strategy_raw = str(payload.get("scalar", {}).get("strategy", "Depletion"))
+    _sl = _strategy_raw.strip().lower()
+    if _sl == "depletion" or _sl == "":
+        _strategy = "Depletion"
+    elif ("inject" in _sl or "wag" in _sl or "water" in _sl
+          or "gas re" in _sl or "flood" in _sl or "ior" in _sl
+          or "eor" in _sl):
+        _strategy = "Injection"
+    else:
+        _strategy = _strategy_raw   # pass through anything explicit
+    # Write the normalised token back so downstream reservoir assembly
+    # (which also tests strategy == "Injection") sees it consistently.
+    payload.setdefault("scalar", {})["strategy"] = _strategy
     idata = tables.get("injectors_df", {})
     if idata and _strategy == "Injection":
         n = len(idata.get("name", []))
@@ -14250,7 +14312,23 @@ def _reservoirs_from_payload(payload: dict, units: str) -> list:
             name = str(rdata.get("name", [rid] * n)[i])
             fluid_system = str(rdata.get("fluid_system",
                                           ["Oil with associated gas"] * n)[i])
-            strategy = str(rdata.get("strategy", ["Depletion"] * n)[i])
+            # Strategy: prefer the reservoir's own, but fall back to the
+            # scalar/global strategy (which is what the Concept Selector
+            # patches set). Normalise descriptive labels ("Water injection",
+            # "Gas injection", "WAG") to the engine's "Injection" token.
+            _rstrat = str(rdata.get(
+                "strategy",
+                [payload.get("scalar", {}).get("strategy", "Depletion")]
+                * n)[i])
+            _rsl = _rstrat.strip().lower()
+            if _rsl == "depletion" or _rsl == "":
+                strategy = "Depletion"
+            elif ("inject" in _rsl or "wag" in _rsl or "water" in _rsl
+                  or "gas re" in _rsl or "flood" in _rsl or "ior" in _rsl
+                  or "eor" in _rsl):
+                strategy = "Injection"
+            else:
+                strategy = _rstrat
             ooip = to_field(float(rdata.get("ooip_oil_MMstb", [0.0] * n)[i]),
                              "oil_vol", units)
             ogip = to_field(float(rdata.get("ogip_gas_Bscf",  [0.0] * n)[i]),
@@ -14268,7 +14346,11 @@ def _reservoirs_from_payload(payload: dict, units: str) -> list:
                                "pressure", units)
             aq_active = bool(rdata.get("aquifer_active", [False] * n)[i])
             gc_active = bool(rdata.get("gas_cap_active", [False] * n)[i])
-            vrr = float(rdata.get("vrr", [1.0] * n)[i])
+            _sc = payload.get("scalar", {})
+            vrr = float(rdata.get("vrr",
+                        [float(_sc.get("vrr", 1.0))] * n)[i])
+            _inj_eff = float(rdata.get("inj_eff",
+                             [float(_sc.get("inj_eff", 0.85))] * n)[i])
             r_pvt = PVTInputs(p_init_psi=p_init, t_res_F=t_res, api=api,
                                gas_grav=sg, rs_init=rs_i, p_bub_psi=p_bub)
             r_aq  = AquiferInputs(active=aq_active, model="Pot",
@@ -14280,7 +14362,7 @@ def _reservoirs_from_payload(payload: dict, units: str) -> list:
                 id=rid, name=name, fluid_system=fluid_system,
                 ooip_oil=ooip, ogip_gas=ogip, rf_target=rf_t,
                 strategy=strategy, pvt=r_pvt, aquifer=r_aq, gas_cap=r_gc,
-                voidage_ratio=vrr, inj_efficiency=0.85,
+                voidage_ratio=vrr, inj_efficiency=_inj_eff,
             ))
         except Exception:
             continue
