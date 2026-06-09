@@ -17836,6 +17836,21 @@ def concept_selector_section(default_start_date):
                 dim_to_remove = di
             st.markdown("---")
             opt_to_remove = None
+            # Column header row so the two checkboxes (include / reference)
+            # are unambiguous — without this the collapsed-label ⭐ box was
+            # invisible and looked like it was missing.
+            _hc1, _hcr, _hc2, _hc3, _hc4, _hc5 = st.columns(
+                [0.6, 0.7, 2, 3, 3, 0.6])
+            _hc1.markdown("<div style='font-size:11px;color:#888;"
+                          "text-align:center'>✓<br>run</div>",
+                          unsafe_allow_html=True)
+            _hcr.markdown("<div style='font-size:11px;color:#888;"
+                          "text-align:center'>⭐<br>ref</div>",
+                          unsafe_allow_html=True)
+            _hc2.markdown("<div style='font-size:11px;color:#888'>Option"
+                          "</div>", unsafe_allow_html=True)
+            _hc3.markdown("<div style='font-size:11px;color:#888'>"
+                          "Description</div>", unsafe_allow_html=True)
             # Collect drafts; commit all at once on the Apply button.
             _opt_drafts = []
             for oi, opt in enumerate(d["options"]):
@@ -17854,10 +17869,11 @@ def concept_selector_section(default_start_date):
                     selected.setdefault(di, set()).add(oi)
                 elif (not new_sel) and is_sel:
                     selected.setdefault(di, set()).discard(oi)
-                # Reference radio — ticking sets THIS option as the reference
-                # (approved plans) for this dimension; mutually exclusive
-                # within the dimension. Drives the staircase baseline and the
-                # thick square in the garden.
+                # Reference checkbox — ticking sets THIS option as the
+                # reference (approved plans) for this dimension; mutually
+                # exclusive within the dimension. Drives the staircase
+                # baseline and the thick square in the garden. The label is
+                # shown ("⭐") rather than collapsed so the control is visible.
                 _is_ref = (concept_reference.get(di) == oi)
                 _new_ref = ocr.checkbox(
                     "⭐", value=_is_ref,
