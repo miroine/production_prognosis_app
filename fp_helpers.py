@@ -7763,3 +7763,375 @@ def unit_checks_summary(results: list[dict]) -> tuple[int, int]:
     n_total = len(results)
     n_passed = sum(1 for r in results if r["status"] == "OK")
     return n_passed, n_total
+
+
+# ---------------------------------------------------------------------------
+# STEA profile import
+# ---------------------------------------------------------------------------
+# A STEA file carries annual PROFILES (production volumes + cost / investment
+# streams), not reservoir parameters. parse_stea_profiles() normalises either
+#   (a) the app's own STEA xlsx export (line-item rows × calendar-year columns)
+#   (b) a simple CSV (year + a few volume/cost columns)
+# into a canonical dict keyed by year:
+#   {year: {"oil_MSm3","gas_GSm3","ngl_MTPA","condensate_MSm3",
+#           "capex_MNOK","opex_MNOK","abandonment_MNOK","co2_MTPA"}}
+# Production volumes are STEA-metric (MSm³/yr oil, GSm³/yr gas, MTPA NGL);
+# costs are Real MNOK. The caller converts these to the engine's monthly
+# field-unit frame and runs compute_economics with the concept's own prices /
+# tax / fiscal regime.
+
+# Which STEA template row labels roll up into each canonical cost bucket.
+# Investment + study + drilling rows → CAPEX; operations rows → OPEX;
+# cessation rows → abandonment. Matching is case-insensitive substring.
+_STEA_CAPEX_ROWS = (
+    "feasibility", "conceptual stud", "other stud", "feed stud",
+    "subsea production", "topside", "substructure", "transport system",
+    "onshore (power", "capex - onshore", "rig upgrade", "rig mob",
+    "oil producer", "water injector", "gas producer", "gas injector",
+    "project specific drilling", "seismic acquisition",
+)
+_STEA_OPEX_ROWS = (
+    "offshore facilities operations", "onshore related opex",
+    "additional opex", "well intervention", "country office",
+    "g&g and admin", "historic cost",
+)
+_STEA_ABANDON_ROWS = (
+    "cessation - development wells", "cessation - offshore facilities",
+    "cessation",
+)
+
+
+def _stea_row_bucket(label: str) -> str | None:
+    """Classify a STEA line-item label into a canonical bucket, or None.
+
+    Returns one of: 'oil','gas','ngl','condensate','co2','capex','opex',
+    'abandonment' — or None if the row is a section header / unrecognised /
+    a row we deliberately ignore (e.g. net sales gas, which is derived).
+    """
+    lo = str(label or "").strip().lower()
+    if not lo:
+        return None
+    # Production rows
+    if lo.startswith("oil production") or lo == "additional oil production":
+        return "oil"
+    if "condensate production" in lo:
+        return "condensate"
+    if "rich gas production" in lo or lo == "additional rich gas production":
+        return "gas"
+    if lo.startswith("ngl"):
+        return "ngl"
+    if lo.startswith("co2") or "co2 emission" in lo:
+        return "co2"
+    # Ignore derived / non-input production rows so we don't double count
+    if lo in ("net sales gas", "fuel, flaring and losses", "imported gas",
+              "deferred oil production", "deferred gas production",
+              "imported electricity"):
+        return None
+    # Cost / investment rows
+    if any(k in lo for k in _STEA_ABANDON_ROWS):
+        return "abandonment"
+    if any(k in lo for k in _STEA_OPEX_ROWS):
+        return "opex"
+    if any(k in lo for k in _STEA_CAPEX_ROWS):
+        return "capex"
+    return None
+
+
+def _empty_year() -> dict:
+    return {"oil_MSm3": 0.0, "gas_GSm3": 0.0, "ngl_MTPA": 0.0,
+            "condensate_MSm3": 0.0, "capex_MNOK": 0.0, "opex_MNOK": 0.0,
+            "abandonment_MNOK": 0.0, "co2_MTPA": 0.0}
+
+
+def parse_stea_profiles(file_bytes: bytes, filename: str) -> dict:
+    """Parse a STEA xlsx (app schema) or CSV into canonical annual profiles.
+
+    Returns {"by_year": {year:{...}}, "years":[...], "source": "xlsx"|"csv",
+             "warnings":[...]}. Raises ValueError on an unreadable file.
+    """
+    name = (filename or "").lower()
+    if name.endswith((".xlsx", ".xlsm", ".xls")):
+        return _parse_stea_xlsx(file_bytes)
+    if name.endswith((".csv", ".tsv", ".txt")):
+        return _parse_stea_csv(file_bytes)
+    # Fall back to sniffing: try xlsx then csv
+    try:
+        return _parse_stea_xlsx(file_bytes)
+    except Exception:
+        return _parse_stea_csv(file_bytes)
+
+
+def _coerce_year_columns(cols) -> dict:
+    """Map a header row to {col_index_or_name: year_int} for 4-digit years."""
+    year_map = {}
+    for c in cols:
+        s = str(c).strip()
+        m = re.search(r"(19|20)\d{2}", s)
+        if m:
+            try:
+                year_map[c] = int(m.group(0))
+            except ValueError:
+                pass
+    return year_map
+
+
+def _parse_stea_xlsx(file_bytes: bytes) -> dict:
+    """Parse the app's STEA xlsx: a 'Name' (line-item) column plus calendar-
+    year columns. Robust to a leading blank column, a 'Price name'/'Units'/
+    'Sum' block, and a title band before the header row. Any column whose
+    header contains a 4-digit year is a year column; the line-item label is
+    the 'Name' column (or the first text column that isn't Units/Sum/Price)."""
+    bio = io.BytesIO(file_bytes)
+    try:
+        xls = pd.ExcelFile(bio, engine="openpyxl")
+    except Exception as e:
+        raise ValueError(f"Could not open Excel file: {e}")
+    by_year: dict[int, dict] = {}
+    warnings: list[str] = []
+    used_sheet = None
+    _NON_YEAR_LABELS = ("price name", "units", "unit", "sum", "total")
+    for sheet in xls.sheet_names:
+        df = None
+        year_map = {}
+        # Scan the first few rows for the one that yields year columns; the
+        # template has a 'Name | Price name | Units | Sum | <years…>' header.
+        for hdr in range(0, 6):
+            try:
+                cand = xls.parse(sheet, header=hdr, dtype=object)
+            except Exception:
+                continue
+            if cand is None or cand.empty:
+                continue
+            ym = _coerce_year_columns(cand.columns)
+            if ym:
+                df = cand
+                year_map = ym
+                break
+        if not year_map or df is None:
+            continue
+        # Drop any all-blank leading columns (Excel col A is often empty).
+        # Identify the label column: prefer a column literally named "Name";
+        # else the first text column that isn't a year / Units / Sum / Price.
+        label_col = None
+        for c in df.columns:
+            if str(c).strip().lower() == "name":
+                label_col = c
+                break
+        if label_col is None:
+            for c in df.columns:
+                if c in year_map:
+                    continue
+                if str(c).strip().lower() in _NON_YEAR_LABELS:
+                    continue
+                if df[c].astype(str).str.strip().str.len().gt(0).any():
+                    label_col = c
+                    break
+        if label_col is None:
+            continue
+        used_sheet = sheet
+        for _, row in df.iterrows():
+            bucket = _stea_row_bucket(row.get(label_col))
+            if bucket is None:
+                continue
+            for col, yr in year_map.items():
+                val = row.get(col)
+                try:
+                    fv = float(val)
+                except (TypeError, ValueError):
+                    continue
+                if fv == 0 or fv != fv:   # skip zero / NaN
+                    continue
+                by_year.setdefault(yr, _empty_year())
+                _accumulate_bucket(by_year[yr], bucket, fv)
+        break   # first sheet with a usable year header wins
+    if not by_year:
+        raise ValueError(
+            "No STEA year columns / recognised line items found. Expected the "
+            "app's STEA export schema (line-item rows × year columns).")
+    years = sorted(by_year)
+    return {"by_year": by_year, "years": years, "source": "xlsx",
+            "sheet": used_sheet, "warnings": warnings}
+
+
+def _parse_stea_csv(file_bytes: bytes) -> dict:
+    """Parse a simple STEA CSV. Two shapes are accepted:
+
+    (A) Tidy per-year rows with named columns (preferred):
+        year, oil_MSm3, gas_GSm3, ngl_MTPA, condensate_MSm3,
+              capex_MNOK, opex_MNOK, abandonment_MNOK, co2_MTPA
+        (any subset; missing columns default to 0)
+    (B) The app-schema layout saved as CSV (line-item rows × year columns) —
+        falls through to the same row-classification as the xlsx path.
+    """
+    text = file_bytes.decode("utf-8-sig", errors="replace")
+    sep = "\t" if ("\t" in text.split("\n", 1)[0]) else ","
+    try:
+        df = pd.read_csv(io.StringIO(text), sep=sep, dtype=object)
+    except Exception as e:
+        raise ValueError(f"Could not read CSV: {e}")
+    if df is None or df.empty:
+        raise ValueError("Empty CSV.")
+    lower = {str(c).strip().lower(): c for c in df.columns}
+    by_year: dict[int, dict] = {}
+    warnings: list[str] = []
+    # Shape (A): a 'year' column + named metric columns
+    if "year" in lower:
+        ycol = lower["year"]
+        alias = {
+            "oil_MSm3": ("oil_msm3", "oil", "oil_production", "oil_msm3_yr"),
+            "gas_GSm3": ("gas_gsm3", "gas", "rich_gas", "gas_production",
+                         "rich_gas_gsm3"),
+            "ngl_MTPA": ("ngl_mtpa", "ngl", "ngl_production"),
+            "condensate_MSm3": ("condensate_msm3", "condensate", "cond_msm3"),
+            "capex_MNOK": ("capex_mnok", "capex", "investment", "invest_mnok"),
+            "opex_MNOK": ("opex_mnok", "opex", "operating_cost"),
+            "abandonment_MNOK": ("abandonment_mnok", "abandonment",
+                                  "cessation", "aban_mnok"),
+            "co2_MTPA": ("co2_mtpa", "co2", "co2_emissions"),
+        }
+        colmap = {}
+        for canon, names in alias.items():
+            for nm in names:
+                if nm in lower:
+                    colmap[canon] = lower[nm]
+                    break
+        if not colmap:
+            raise ValueError(
+                "CSV has a 'year' column but no recognised metric columns "
+                "(oil_MSm3, gas_GSm3, capex_MNOK, opex_MNOK, …).")
+        for _, row in df.iterrows():
+            try:
+                yr = int(float(row[ycol]))
+            except (TypeError, ValueError):
+                continue
+            by_year.setdefault(yr, _empty_year())
+            for canon, src in colmap.items():
+                try:
+                    by_year[yr][canon] += float(row[src])
+                except (TypeError, ValueError):
+                    pass
+        years = sorted(by_year)
+        if not years:
+            raise ValueError("No valid year rows in CSV.")
+        return {"by_year": by_year, "years": years, "source": "csv",
+                "warnings": warnings}
+    # Shape (B): app-schema (line items × years) saved as CSV
+    year_map = _coerce_year_columns(df.columns)
+    if year_map:
+        label_col = None
+        for c in df.columns:
+            if c in year_map:
+                continue
+            label_col = c
+            break
+        if label_col is not None:
+            for _, row in df.iterrows():
+                bucket = _stea_row_bucket(row.get(label_col))
+                if bucket is None:
+                    continue
+                for col, yr in year_map.items():
+                    try:
+                        fv = float(row.get(col))
+                    except (TypeError, ValueError):
+                        continue
+                    if fv == 0 or fv != fv:
+                        continue
+                    by_year.setdefault(yr, _empty_year())
+                    _accumulate_bucket(by_year[yr], bucket, fv)
+            if by_year:
+                years = sorted(by_year)
+                return {"by_year": by_year, "years": years, "source": "csv",
+                        "warnings": warnings}
+    raise ValueError(
+        "Unrecognised CSV. Use either tidy per-year columns (year, oil_MSm3, "
+        "gas_GSm3, capex_MNOK, opex_MNOK, …) or the app's STEA line-item "
+        "schema (line items in column 1, calendar years across the top).")
+
+
+def _accumulate_bucket(yrec: dict, bucket: str, value: float) -> None:
+    """Add a value into the canonical year record for a classified bucket."""
+    if bucket == "oil":
+        yrec["oil_MSm3"] += value
+    elif bucket == "gas":
+        yrec["gas_GSm3"] += value
+    elif bucket == "ngl":
+        yrec["ngl_MTPA"] += value
+    elif bucket == "condensate":
+        yrec["condensate_MSm3"] += value
+    elif bucket == "co2":
+        yrec["co2_MTPA"] += value
+    elif bucket == "capex":
+        yrec["capex_MNOK"] += value
+    elif bucket == "opex":
+        yrec["opex_MNOK"] += value
+    elif bucket == "abandonment":
+        yrec["abandonment_MNOK"] += value
+
+
+def stea_profiles_to_monthly_df(profiles: dict, usd_to_nok: float = 10.5):
+    """Convert canonical annual STEA profiles to a monthly engine-internal
+    frame ready for compute_economics.
+
+    Returns a DataFrame with columns the economics engine consumes:
+      date, primary_rate, secondary_rate, gross_gas_rate, gas_export_rate,
+      ngl_rate, capex_well, capex_facility, abandonment, rig_mob,
+      co2_emissions_tonnes, recovery_factor (0), plus the field-unit volume
+      conventions. Production is split evenly across the 12 months of each
+      year; costs (MNOK) are converted to USD and placed in the FIRST month
+      of their year. The frame is oil-PRIMARY by convention (oil_MSm3 →
+      primary_rate); for a gas/condensate STEA file the gas drives gas_rate
+      and condensate the secondary. Caller decides is_oil based on which
+      volumes dominate.
+
+    Engine field units: oil/condensate in stb/d, gas in Mscf/d. Conversions:
+      MSm³/yr → stb/d : ×1e6 ×6.2898 / 365.25
+      GSm³/yr → Mscf/d: ×1e9 /1000 ×35.3147 / 365.25
+      MTPA NGL → bbl/d: ×1e6 / 0.0875 / 365.25
+    """
+    by_year_raw = profiles.get("by_year", {})
+    # After a JSON round-trip the year keys may be strings — coerce to int.
+    by_year = {}
+    for k, v in by_year_raw.items():
+        try:
+            by_year[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+    years = sorted(by_year)
+    if not years:
+        raise ValueError("No years in STEA profiles.")
+    rate = float(usd_to_nok) or 10.5
+    rows = []
+    OIL_MSm3_to_stbd = 1e6 * 6.2898 / 365.25
+    GAS_GSm3_to_mscfd = 1e9 / 1000.0 * 35.3147 / 365.25
+    NGL_MTPA_to_bpd = 1e6 / 0.0875 / 365.25
+    for yr in range(years[0], years[-1] + 1):
+        rec = by_year.get(yr, _empty_year())
+        oil_stbd = rec["oil_MSm3"] * OIL_MSm3_to_stbd
+        cond_stbd = rec["condensate_MSm3"] * OIL_MSm3_to_stbd
+        gas_mscfd = rec["gas_GSm3"] * GAS_GSm3_to_mscfd
+        ngl_bpd = rec["ngl_MTPA"] * NGL_MTPA_to_bpd
+        capex_usd = rec["capex_MNOK"] / rate * 1e6
+        opex_usd = rec["opex_MNOK"] / rate * 1e6
+        aban_usd = rec["abandonment_MNOK"] / rate * 1e6
+        co2_t = rec["co2_MTPA"] * 1e6
+        for mo in range(12):
+            rows.append({
+                "date": pd.Timestamp(year=yr, month=mo + 1, day=1),
+                "oil_rate": oil_stbd,
+                "primary_rate": oil_stbd,
+                "secondary_rate": cond_stbd,
+                "gas_rate": gas_mscfd,
+                "gross_gas_rate": gas_mscfd,
+                "gas_export_rate": gas_mscfd,
+                "ngl_rate": ngl_bpd,
+                # costs: whole-year amount placed in month 0, else 0
+                "capex_well": 0.0,
+                "capex_facility": (capex_usd if mo == 0 else 0.0),
+                "opex": (opex_usd / 12.0),
+                "abandonment": (aban_usd if mo == 0 else 0.0),
+                "rig_mob": 0.0,
+                "co2_emissions_tonnes": co2_t / 12.0,
+                "recovery_factor": 0.0,
+            })
+    df = pd.DataFrame(rows)
+    return df

@@ -280,6 +280,39 @@ gas_mscf = (df_g.get('gas_export_rate',
 check("gas revenue = Mscf x $/Mscf ($4 basis)", gas_rev,
       gas_mscf * 4.0, tol=0.10, rel=True)
 
+section("9. STEA profile import (volumes/costs → engine)")
+import fp_helpers as _fh
+_stea_csv = (
+    "year,oil_MSm3,gas_GSm3,ngl_MTPA,capex_MNOK,opex_MNOK,"
+    "abandonment_MNOK,co2_MTPA\n"
+    "2028,0,0,0,5250,0,0,0\n"
+    "2029,2.5,1.2,0.05,3150,400,0,0.08\n"
+    "2030,4.0,2.0,0.08,0,600,0,0.12\n"
+    "2045,0.1,0,0,0,200,840,0.01\n")
+_prof = _fh.parse_stea_profiles(_stea_csv.encode(), "t.csv")
+check("STEA CSV: first year", _prof["years"][0], 2028)
+check("STEA CSV: last year", _prof["years"][-1], 2045)
+check("STEA CSV: 2030 oil_MSm3", _prof["by_year"][2030]["oil_MSm3"], 4.0)
+check("STEA CSV: 2028 capex_MNOK", _prof["by_year"][2028]["capex_MNOK"],
+      5250.0)
+check("STEA CSV: 2045 abandonment_MNOK",
+      _prof["by_year"][2045]["abandonment_MNOK"], 840.0)
+# Monthly conversion: 4.0 MSm³/yr oil → stb/d
+_dfm = _fh.stea_profiles_to_monthly_df(_prof, usd_to_nok=10.5)
+check("STEA monthly row count", len(_dfm), (2045 - 2028 + 1) * 12)
+_oil30 = _dfm[_dfm["date"].dt.year == 2030]["primary_rate"].iloc[0]
+check("STEA 2030 oil 4.0 MSm³/yr → stb/d", _oil30,
+      4.0 * 1e6 * 6.2898 / 365.25, tol=0.01, rel=True)
+# CAPEX 5250 MNOK / 10.5 → USD, placed mid-year (month 7)
+_cap28 = _dfm[(_dfm["date"].dt.year == 2028)]["capex_facility"].sum()
+check("STEA 2028 capex → USD", _cap28, 5250.0 / 10.5 * 1e6, tol=0.01,
+      rel=True)
+# JSON round-trip (year keys become strings) must still work
+import json as _json
+_prof_j = _json.loads(_json.dumps(_prof))
+_dfm_j = _fh.stea_profiles_to_monthly_df(_prof_j, usd_to_nok=10.5)
+check("STEA JSON round-trip rows", len(_dfm_j), (2045 - 2028 + 1) * 12)
+
 # ================================================================ summary
 print(f"\n{'='*52}")
 print(f"UNITS AUDIT: {_passed} passed, {_failed} failed")
