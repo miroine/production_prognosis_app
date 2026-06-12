@@ -3639,10 +3639,12 @@ def sidebar_inputs():
             implied_cond_disp = from_field(implied_cond_mmstb,
                                             "oil_vol", units)
             entered_cond_mmstb = to_field(ooip, "oil_vol", units)
-            # CGR engine units are stb/MMscf; SI equivalent is Sm³/kSm³
-            # (× 0.22213).
-            _cgr_d = _cgr if units == "field" else _cgr * 0.22213
-            _cgr_u = "stb/MMscf" if units == "field" else "Sm³/kSm³"
+            # CGR engine units are stb/MMscf; the SI convention is Sm³
+            # condensate per MSm³ gas. 1 stb/MMscf = 0.158987 Sm³ /
+            # 0.0283168 MSm³ = 5.6146 Sm³/MSm³. (A previous factor of
+            # 0.22213 used the inverted oil conversion and was ~39.6× off.)
+            _cgr_d = _cgr if units == "field" else _cgr * 5.6146
+            _cgr_u = "stb/MMscf" if units == "field" else "Sm³/MSm³"
             st.sidebar.caption(
                 f"Implied condensate in place from OGIP × CGR "
                 f"({_cgr_d:.1f} {_cgr_u}): "
@@ -4881,6 +4883,13 @@ def well_section(units, fluid, start_date):
             pdf_display["fluid_gradient_psi_per_ft"] = (
                 pdf_display["fluid_gradient_psi_per_ft"].apply(
                     lambda v: float(v or 0.0) * 0.22621))
+        # Friction stored as psi per 1000 bbl/d → bar per 1000 Sm³/d for
+        # display. 1 psi/kbpd = (1/14.5038) bar/psi × 6.2898 kbpd/(kSm³/d)
+        # = 0.43367 bar/(kSm³/d).
+        if "friction_psi_per_kbpd" in pdf_display.columns:
+            pdf_display["friction_psi_per_kbpd"] = (
+                pdf_display["friction_psi_per_kbpd"].apply(
+                    lambda v: float(v or 0.0) * 0.43367))
 
     producers_df_buf = st.data_editor(
         pdf_display, num_rows="dynamic", use_container_width=True,
@@ -4982,10 +4991,11 @@ def well_section(units, fluid, start_date):
                 "Friction [psi/kbpd]" if units == "field"
                 else "Friction [bar/(k Sm³/d)]",
                 min_value=0.0, max_value=50.0, step=0.5, format="%.1f",
-                help=("Linear friction proxy. In field units this is psi per "
-                      "1000 bbl/d; the metric label is bar per 1000 Sm³/d for "
-                      "reference, but the stored value is the same field-"
-                      "convention number the engine uses. Higher tubing ID "
+                help=("Linear friction proxy. Field: psi per 1000 bbl/d; "
+                      "metric: bar per 1000 Sm³/d. The value converts with "
+                      "the unit system (1 psi/kbpd = 0.434 bar/(kSm³/d)), "
+                      "matching the pressure / depth / gradient columns. "
+                      "Higher tubing ID "
                       "and lower viscosity reduce this. Typical 2-10 for oil "
                       "wells, 5-20 for high-rate gas wells.")),
         },
@@ -5046,6 +5056,11 @@ def well_section(units, fluid, start_date):
                 commit["fluid_gradient_psi_per_ft"] = (
                     commit["fluid_gradient_psi_per_ft"].apply(
                         lambda v: float(v or 0.0) / 0.22621))
+            # Friction user-entered as bar/(kSm³/d) → storage psi/kbpd.
+            if "friction_psi_per_kbpd" in commit.columns:
+                commit["friction_psi_per_kbpd"] = (
+                    commit["friction_psi_per_kbpd"].apply(
+                        lambda v: float(v or 0.0) / 0.43367))
         # Drop rows missing required fields
         if "name" in commit.columns:
             commit = commit[commit["name"].notna() & (commit["name"].astype(str).str.strip() != "")]
@@ -5549,16 +5564,23 @@ def well_section(units, fluid, start_date):
                     # RATIOS — derived from rates
                     with np.errstate(divide="ignore", invalid="ignore"):
                         if _is_oil_prev:
-                            # GOR in scf/stb  =  Mscf/d × 1000 / stb/d
+                            # GOR in scf/stb  =  Mscf/d × 1000 / stb/d.
+                            # Metric display: Sm³/Sm³ = scf/stb ÷ 5.6146,
+                            # consistent with the table/KPI conversion map.
                             gor = np.where(prim > 0,
                                            sec * 1000.0 / prim, 0.0)
+                            if units == "metric":
+                                gor = gor / 5.6146
                             fig_gor.add_trace(go.Scatter(
                                 x=_prev_dates, y=gor, mode="lines",
                                 name=w.name))
                         else:
-                            # CGR in stb/MMscf = stb/d  /  (Mscf/d / 1000)
+                            # CGR in stb/MMscf = stb/d  /  (Mscf/d / 1000).
+                            # Metric display: Sm³/MSm³ = stb/MMscf × 5.6146.
                             cgr = np.where(prim > 0,
                                            sec / (prim / 1000.0), 0.0)
+                            if units == "metric":
+                                cgr = cgr * 5.6146
                             fig_gor.add_trace(go.Scatter(
                                 x=_prev_dates, y=cgr, mode="lines",
                                 name=w.name))
@@ -5599,11 +5621,13 @@ def well_section(units, fluid, start_date):
                 st.plotly_chart(fh.apply_plot_template(fig_water),
                                 use_container_width=True)
             else:
+                _gor_u = ("Sm³/Sm³" if units == "metric" else "scf/stb")
+                _cgr_u = ("Sm³/MSm³" if units == "metric" else "stb/MMscf")
                 fig_gor.update_layout(
-                    title=("GOR (scf/stb) per well" if _is_oil_prev
-                           else "CGR (stb/MMscf) per well"),
-                    yaxis_title=("GOR (scf/stb)" if _is_oil_prev
-                                 else "CGR (stb/MMscf)"),
+                    title=(f"GOR ({_gor_u}) per well" if _is_oil_prev
+                           else f"CGR ({_cgr_u}) per well"),
+                    yaxis_title=(f"GOR ({_gor_u})" if _is_oil_prev
+                                 else f"CGR ({_cgr_u})"),
                     height=260,
                     legend=dict(orientation="h", y=-0.3))
                 st.plotly_chart(fh.apply_plot_template(fig_gor),
@@ -6483,15 +6507,18 @@ def economics_section(units, start_date):
             "(so at oil = $75/bbl, expect NGL $22–45/bbl)."
         )
         ngl1, ngl2, ngl3, ngl4 = st.columns(4)
-        _ngl_unit = ("bbl/MMscf" if units == "field"
-                     else "Sm³/kSm³")
+        # NGL yield is ALWAYS bbl/MMscf — the industry convention and the
+        # engine's native basis — in both unit systems (like prices). The
+        # previous metric label claimed Sm³/kSm³ while the value stayed
+        # bbl/MMscf (a label/value mismatch); the metric equivalence is
+        # given in the help instead.
         ngl_yield = ngl1.number_input(
-            f"NGL yield ({_ngl_unit})", value=0.0, min_value=0.0, step=5.0,
+            "NGL yield (bbl/MMscf)", value=0.0, min_value=0.0, step=5.0,
             key="ngl_yield", on_change=mark_stale,
             help="Volume of NGL recovered per unit of gross gas processed. "
-                 "Entered in bbl per MMscf (field) — the metric label shown "
-                 "is Sm³ NGL per kSm³ gas for reference; 1 bbl/MMscf ≈ 5.6 "
-                 "Sm³/MSm³. The engine value is the same yield number."
+                 "Always entered in bbl per MMscf regardless of unit system "
+                 "(industry convention, like $/bbl prices). Metric "
+                 "equivalence: 1 bbl/MMscf ≈ 5.6 Sm³/MSm³."
         )
         ngl_price = ngl2.number_input(
             "NGL price ($/bbl)", value=25.0, min_value=0.0, step=1.0,
@@ -10522,18 +10549,34 @@ def main():
     # independent cases, not derived from the current sidebar run).
     # Guard against a stale persisted value from before the page was renamed
     # (an unknown active_page would make st.radio raise).
-    _page_opts = ["🛢️ Business case builder", "🌳 Concept Selector"]
+    _page_opts = ["🛢️ Business case builder", "🌳 Concept Selector",
+                  "🤖 Case from text"]
     if st.session_state.get("active_page") not in _page_opts:
         st.session_state["active_page"] = _page_opts[0]
     page = st.sidebar.radio(
         "📑 Page",
-        ["🛢️ Business case builder", "🌳 Concept Selector"],
+        _page_opts,
         key="active_page",
         help="Business case builder — the full production + economics model. "
              "Concept Selector — a standalone hanging-garden tool where "
              "each option links to its own case (YAML or saved case) and "
-             "the batch runs them one by one.")
+             "the batch runs them one by one. "
+             "Case from text — describe a business case in plain language "
+             "and let an LLM (your own API key) build a runnable YAML case.")
     st.sidebar.markdown("---")
+    if page == "🤖 Case from text":
+        # Standalone page — natural-language case builder.
+        case_from_text_section(date.today())
+        st.markdown(
+            f"""
+            <div class="app-footer">
+                <b>FieldVista</b> — Case from text ·
+                © 2026 <b>Merouane Hamdani</b> · MIT License
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
     if page == "🌳 Concept Selector":
         # Standalone page — does not need the main run flow at all.
         concept_selector_section(date.today())
@@ -17436,6 +17479,519 @@ def well_planner_section(units, fluid):
                 st.rerun()
         except Exception as _e:
             st.info(f"Could not render the well schematic: {_e}")
+
+
+# ===========================================================================
+# 🤖 Case from text — natural-language business case → YAML → engine
+# ===========================================================================
+# The user describes a business case in plain text; an LLM (their choice of
+# OpenAI / Azure OpenAI / Anthropic Claude, with their own per-session API
+# key) maps it onto the app's YAML case schema and asks clarifying questions
+# for anything missing. The YAML is NEVER trusted raw: it goes through a
+# review editor + yaml_to_payload validation + the economics backfill, and
+# the engine recomputes everything. The LLM only fills in a form.
+
+_NL_SCHEMA_PROMPT = """You translate a petroleum business-case description \
+into a YAML case file for a screening tool. Respond with ONLY a JSON object \
+(no markdown fences, no prose) of the form:
+{"yaml": "<the YAML case as a string>",
+ "questions": ["<question for each missing/ambiguous REQUIRED item>"],
+ "assumptions": ["<each default you assumed, briefly>"]}
+
+YAML schema (all under top-level keys `scalar:` and `tables:`):
+scalar:
+  units: field | metric          # REQUIRED (metric = Sm3/bar/m)
+  fluid: "Oil with associated gas" | "Gas with condensate" | "Dry gas"  # REQUIRED
+  strategy: Depletion | Injection
+  start_date: 'YYYY-MM-DD'       # REQUIRED (first production)
+  horizon: <years, int>          # default 25
+  ooip: <oil/condensate in place, MMstb field / MSm3 metric>   # REQUIRED for oil
+  ogip: <gas in place, Bscf field / GSm3 metric>               # REQUIRED for gas
+  rf_target: <recovery factor fraction 0-0.85>
+  auto_scale_rf: true|false
+  p_init: <initial reservoir pressure, psi field / bar metric>
+  t_res: <reservoir temperature, F field / C metric>
+  api: <oil API gravity>     gas_grav: <gas SG>
+  rs_init: <solution GOR scf/stb>   p_bub: <bubble point psi/bar>
+  oil_price_bbl: <$/bbl, default 75>   gas_price_mmbtu: <$/MMBtu, default 10>
+  opex_var_oil: <$/bbl, 5.5> | opex_var_gas: <$/Mscf, 0.9>
+  opex_fixed: <$MM/yr, 20>
+  tariff_oil_bbl: <$/bbl, 2>   tariff_gas_mmbtu: <$/MMBtu, 0.3>
+  disc: <discount rate fraction, 0.10>
+  fiscal_regime: "Tax/Royalty" | "PSC" | "NCS (Norwegian shelf)"
+  tax_rate: <0.30>  royalty: <0.10>      # Tax/Royalty regime
+  ncs_cit: 0.22  ncs_spt: 0.718  ncs_uplift: 0.1769   # NCS regime
+  capex_well: <$MM per well if fixed mode>   well_cost_mode: fixed | rig_rate
+  aban_cost: <$MM abandonment, 80>   co2_price: <$/t, 80>
+tables:
+  rigs_df: [{name: Rig-A, start_date: 'YYYY-MM-DD', move_in_days: 30, move_out_days: 15}]
+  producers_df:    # one row per producer well
+    - {name: P-01, rig: Rig-A, drill_days: 60, completion_days: 30,
+       qi_primary: <initial rate stb/d or Sm3/d per units>,
+       qi_secondary: <secondary-phase rate>, decline_model: Exponential,
+       di_annual: 0.15, b_factor: 0.5, wc_initial: 0.0, wc_final: 0.7,
+       wc_ramp_months: 60, scale_factor: 1.0, uptime: 0.95,
+       derive_qi_from_pi: false, well_pi_override: 0.0,
+       fluid: oil, ipr_mode: false, wellhead_pressure_psi: 200,
+       tubing_depth_ft: 8000, fluid_gradient_psi_per_ft: 0.35,
+       friction_psi_per_kbpd: 5.0}
+  injectors_df: []   # same shape + inj_rate, only for Injection strategy
+  fac_df:            # facility CAPEX schedule
+    - {date: 'YYYY-MM-DD', amount_MMUSD: <number>, label: 'Subsea production system'}
+
+Rules: ask a question for every REQUIRED field the text doesn't give; list \
+every default you assume in "assumptions". Numbers must be plain (no units \
+in values). Use the user's stated unit system. Production wells: if the text \
+gives a field rate or well count, build that many producer rows."""
+
+
+def _llm_chat(provider: str, cfg: dict, system: str, messages: list):
+    """Provider-agnostic chat call over raw HTTP (no SDK dependency).
+
+    `messages` = [{"role": "user"|"assistant", "content": str}, ...]
+    Returns (content_str, error_str_or_None). Never raises.
+    """
+    import requests as _rq
+    try:
+        timeout = 90
+        if provider == "Anthropic Claude":
+            r = _rq.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": cfg.get("api_key", ""),
+                         "anthropic-version": "2023-06-01",
+                         "content-type": "application/json"},
+                json={"model": cfg.get("model") or
+                      "claude-sonnet-4-20250514",
+                      "max_tokens": 4096, "system": system,
+                      "messages": messages},
+                timeout=timeout)
+            if r.status_code != 200:
+                return None, f"Anthropic API {r.status_code}: {r.text[:300]}"
+            data = r.json()
+            parts = [b.get("text", "") for b in data.get("content", [])
+                     if b.get("type") == "text"]
+            return "".join(parts), None
+        if provider == "Azure OpenAI":
+            ep = (cfg.get("endpoint") or "").rstrip("/")
+            dep = cfg.get("deployment") or "gpt-4o"
+            ver = cfg.get("api_version") or "2024-06-01"
+            url = (f"{ep}/openai/deployments/{dep}/chat/completions"
+                   f"?api-version={ver}")
+            r = _rq.post(
+                url,
+                headers={"api-key": cfg.get("api_key", ""),
+                         "content-type": "application/json"},
+                json={"messages": ([{"role": "system", "content": system}]
+                                    + messages),
+                      "temperature": 0.1, "max_tokens": 4096},
+                timeout=timeout)
+            if r.status_code != 200:
+                return None, f"Azure OpenAI {r.status_code}: {r.text[:300]}"
+            return (r.json()["choices"][0]["message"]["content"], None)
+        # default: OpenAI
+        r = _rq.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {cfg.get('api_key', '')}",
+                     "content-type": "application/json"},
+            json={"model": cfg.get("model") or "gpt-4o",
+                  "messages": ([{"role": "system", "content": system}]
+                                + messages),
+                  "temperature": 0.1, "max_tokens": 4096},
+            timeout=timeout)
+        if r.status_code != 200:
+            return None, f"OpenAI API {r.status_code}: {r.text[:300]}"
+        return (r.json()["choices"][0]["message"]["content"], None)
+    except Exception as e:
+        return None, f"LLM call failed: {e}"
+
+
+def _nl_extract_envelope(text: str):
+    """Parse the {"yaml","questions","assumptions"} JSON envelope robustly.
+
+    Strips markdown fences; if the whole text isn't valid JSON, falls back to
+    the outermost {...} block; if a model returned bare YAML in ```yaml
+    fences, wraps it in an envelope with no questions. Returns (env, err).
+    """
+    import json as _json
+    import re as _re
+    if not text:
+        return None, "Empty LLM response."
+    t = text.strip()
+    t = _re.sub(r"^```(json)?\s*|\s*```$", "", t, flags=_re.S)
+    try:
+        env = _json.loads(t)
+        if isinstance(env, dict) and "yaml" in env:
+            return env, None
+    except Exception:
+        pass
+    m = _re.search(r"\{.*\}", text, _re.S)
+    if m:
+        try:
+            env = _json.loads(m.group(0))
+            if isinstance(env, dict) and "yaml" in env:
+                return env, None
+        except Exception:
+            pass
+    ym = _re.search(r"```ya?ml\s*(.*?)```", text, _re.S)
+    if ym:
+        return {"yaml": ym.group(1), "questions": [],
+                "assumptions": ["model returned bare YAML"]}, None
+    return None, ("Could not parse the LLM response as the expected JSON "
+                  "envelope. Raw response shown below — you can copy the "
+                  "YAML out manually.")
+
+
+def _nl_tornado(payload: dict, start_date, base_npv: float) -> "pd.DataFrame":
+    """One-at-a-time sensitivity (tornado) around the case via the engine.
+
+    Perturbs each driver low/high, reruns run_payload_case, returns a frame
+    of (driver, npv_low, npv_high) sorted by total swing.
+    """
+    import copy as _copy
+    drivers = [
+        ("Oil price ±20%", "scalar", "oil_price_bbl", 0.8, 1.2),
+        ("Gas price ±20%", "scalar", "gas_price_mmbtu", 0.8, 1.2),
+        ("Variable OPEX ±20%", "scalar", "_opex_var", 0.8, 1.2),
+        ("Well CAPEX ±20%", "scalar", "capex_well", 0.8, 1.2),
+        ("Facility CAPEX ±20%", "fac", None, 0.8, 1.2),
+        ("In-place volumes ±20%", "inplace", None, 0.8, 1.2),
+        ("Recovery factor ±15%", "scalar", "rf_target", 0.85, 1.15),
+    ]
+    rows = []
+    for label, kind, key, flo, fhi in drivers:
+        npvs = []
+        for f in (flo, fhi):
+            t = _copy.deepcopy(payload)
+            sc = t.setdefault("scalar", {})
+            try:
+                if kind == "scalar":
+                    if key == "_opex_var":
+                        for k in ("opex_var_oil", "opex_var_gas",
+                                  "opex_var_bbl"):
+                            if sc.get(k) is not None:
+                                sc[k] = float(sc[k]) * f
+                    elif sc.get(key) is not None:
+                        v = float(sc[key]) * f
+                        if key == "rf_target":
+                            v = max(0.01, min(0.85, v))
+                        sc[key] = v
+                    else:
+                        npvs.append(None)
+                        continue
+                elif kind == "fac":
+                    ft = t.get("tables", {}).get("fac_df")
+                    if isinstance(ft, dict) and ft.get("amount_MMUSD"):
+                        ft["amount_MMUSD"] = [float(x) * f
+                                              for x in ft["amount_MMUSD"]]
+                    elif isinstance(ft, list) and ft:
+                        for row in ft:
+                            row["amount_MMUSD"] = (
+                                float(row.get("amount_MMUSD", 0)) * f)
+                    else:
+                        npvs.append(None)
+                        continue
+                elif kind == "inplace":
+                    any_set = False
+                    for k in ("ooip", "ogip"):
+                        if sc.get(k) is not None:
+                            sc[k] = float(sc[k]) * f
+                            any_set = True
+                    if not any_set:
+                        npvs.append(None)
+                        continue
+                r = run_payload_case(t, start_date)
+                npvs.append(r["kpis"].get("npv_MM") if r.get("ok") else None)
+            except Exception:
+                npvs.append(None)
+        if npvs and npvs[0] is not None and npvs[1] is not None:
+            rows.append({"driver": label, "npv_low": npvs[0],
+                         "npv_high": npvs[1],
+                         "swing": abs(npvs[1] - npvs[0])})
+    df = pd.DataFrame(rows)
+    return df.sort_values("swing", ascending=True) if not df.empty else df
+
+
+def _nl_monte_carlo(payload: dict, start_date, n: int = 100,
+                    sigma: float = 0.20) -> list:
+    """Lognormal MC on price / OPEX / well & facility CAPEX (same approach as
+    the Concept Selector). Returns the list of NPV ($MM) draws."""
+    import copy as _copy
+    rng = np.random.default_rng(42)
+    draws = []
+    base_sc = payload.get("scalar", {})
+    for _ in range(int(n)):
+        t = _copy.deepcopy(payload)
+        sc = t["scalar"]
+        for k in ("oil_price_bbl", "gas_price_mmbtu"):
+            if sc.get(k) is not None:
+                sc[k] = float(base_sc[k]) * float(rng.lognormal(0, sigma))
+        for k in ("opex_var_oil", "opex_var_gas", "opex_fixed",
+                  "capex_well"):
+            if sc.get(k) is not None:
+                sc[k] = float(base_sc[k]) * float(rng.lognormal(0, sigma))
+        ft = t.get("tables", {}).get("fac_df")
+        ffac = float(rng.lognormal(0, sigma * 0.9))
+        if isinstance(ft, dict) and ft.get("amount_MMUSD"):
+            ft["amount_MMUSD"] = [float(x) * ffac
+                                  for x in ft["amount_MMUSD"]]
+        try:
+            r = run_payload_case(t, start_date)
+            if r.get("ok") and r["kpis"].get("npv_MM") is not None:
+                draws.append(float(r["kpis"]["npv_MM"]))
+        except Exception:
+            continue
+    return draws
+
+
+def case_from_text_section(default_start_date):
+    """🤖 Case from text — describe a business case, get a runnable YAML."""
+    st.markdown("## 🤖 Case from text")
+    st.caption(
+        "Describe the business case in plain language. Your chosen LLM maps "
+        "it onto the app's YAML case schema and asks for anything missing. "
+        "You review and edit the YAML before anything runs — the engine "
+        "recomputes all physics and economics; the LLM only fills in the "
+        "form. Your API key stays in this session only.")
+
+    # ---- Provider & key ----------------------------------------------------
+    with st.expander("🔑 LLM provider & API key", expanded=True):
+        pcol1, pcol2 = st.columns([1.2, 2])
+        provider = pcol1.selectbox(
+            "Provider", ["OpenAI", "Azure OpenAI", "Anthropic Claude"],
+            key="nl_provider")
+        cfg = {"api_key": pcol2.text_input(
+            "API key (kept in this session only — never saved)",
+            type="password", key="nl_api_key")}
+        if provider == "OpenAI":
+            cfg["model"] = pcol1.text_input("Model", value="gpt-4o",
+                                            key="nl_openai_model")
+        elif provider == "Anthropic Claude":
+            cfg["model"] = pcol1.text_input(
+                "Model", value="claude-sonnet-4-20250514",
+                key="nl_claude_model")
+        else:
+            az1, az2, az3 = st.columns(3)
+            cfg["endpoint"] = az1.text_input(
+                "Azure endpoint",
+                placeholder="https://myresource.openai.azure.com",
+                key="nl_az_endpoint")
+            cfg["deployment"] = az2.text_input(
+                "Deployment name", value="gpt-4o", key="nl_az_deployment")
+            cfg["api_version"] = az3.text_input(
+                "API version", value="2024-06-01", key="nl_az_apiver")
+
+    # ---- Case description --------------------------------------------------
+    case_text = st.text_area(
+        "📝 Business case description",
+        height=180, key="nl_case_text",
+        placeholder=("e.g. A subsea tie-back oil development on the NCS, "
+                     "~120 MMbbl in place, 6 producers at ~8000 bbl/d "
+                     "initial each, water injection, first oil 2029, "
+                     "facility CAPEX about 900 MUSD, NCS fiscal terms, "
+                     "metric units."))
+    if "nl_messages" not in st.session_state:
+        st.session_state["nl_messages"] = []
+
+    bcol1, bcol2 = st.columns([1, 1])
+    if bcol1.button("🤖 Extract YAML from text", type="primary",
+                    disabled=not (case_text.strip()
+                                  and cfg.get("api_key", "").strip()),
+                    key="nl_extract_btn"):
+        st.session_state["nl_messages"] = [
+            {"role": "user", "content": case_text}]
+        with st.spinner(f"Asking {provider}…"):
+            content, err = _llm_chat(provider, cfg, _NL_SCHEMA_PROMPT,
+                                     st.session_state["nl_messages"])
+        if err:
+            st.error(err)
+        else:
+            st.session_state["nl_messages"].append(
+                {"role": "assistant", "content": content})
+            env, perr = _nl_extract_envelope(content)
+            if perr:
+                st.error(perr)
+                st.code(content[:3000])
+            else:
+                st.session_state["nl_yaml"] = env.get("yaml", "")
+                st.session_state["nl_questions"] = env.get("questions", [])
+                st.session_state["nl_assumptions"] = env.get(
+                    "assumptions", [])
+                st.rerun()
+    if bcol2.button("🧹 Start over", key="nl_reset"):
+        for k in ("nl_messages", "nl_yaml", "nl_questions",
+                  "nl_assumptions", "nl_result"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    # ---- Clarifying questions (multi-turn) ---------------------------------
+    qs = st.session_state.get("nl_questions") or []
+    if qs:
+        st.markdown("#### ❓ The model needs a few answers")
+        answers = []
+        for i, q in enumerate(qs):
+            a = st.text_input(q, key=f"nl_q_{i}")
+            if a.strip():
+                answers.append(f"Q: {q}\nA: {a}")
+        if st.button("↩️ Send answers & refine the YAML",
+                     disabled=not answers, key="nl_refine_btn"):
+            st.session_state["nl_messages"].append(
+                {"role": "user",
+                 "content": ("Answers to your questions:\n"
+                             + "\n".join(answers)
+                             + "\nReturn the updated full JSON envelope.")})
+            with st.spinner(f"Refining with {provider}…"):
+                content, err = _llm_chat(provider, cfg, _NL_SCHEMA_PROMPT,
+                                         st.session_state["nl_messages"])
+            if err:
+                st.error(err)
+            else:
+                st.session_state["nl_messages"].append(
+                    {"role": "assistant", "content": content})
+                env, perr = _nl_extract_envelope(content)
+                if perr:
+                    st.error(perr)
+                    st.code(content[:3000])
+                else:
+                    st.session_state["nl_yaml"] = env.get("yaml", "")
+                    st.session_state["nl_questions"] = env.get(
+                        "questions", [])
+                    st.session_state["nl_assumptions"] = env.get(
+                        "assumptions", [])
+                    # clear stale answer widgets
+                    for i in range(len(qs)):
+                        st.session_state.pop(f"nl_q_{i}", None)
+                    st.rerun()
+
+    if st.session_state.get("nl_assumptions"):
+        with st.expander("📌 Assumptions the model made", expanded=False):
+            for a in st.session_state["nl_assumptions"]:
+                st.markdown(f"- {a}")
+
+    # ---- Review, validate & run --------------------------------------------
+    if st.session_state.get("nl_yaml"):
+        st.markdown("#### 📝 Review & edit the YAML before running")
+        yaml_text = st.text_area(
+            "Case YAML (editable — this is what actually runs)",
+            value=st.session_state["nl_yaml"], height=320,
+            key="nl_yaml_editor")
+        rcol1, rcol2 = st.columns([1, 1])
+        if rcol1.button("✅ Validate & run the case", type="primary",
+                        key="nl_run_btn"):
+            try:
+                payload, _meta = fh.yaml_to_payload(yaml_text)
+                res = run_payload_case(payload, default_start_date)
+                if not res.get("ok"):
+                    st.error(f"Engine error: {res.get('error')}")
+                else:
+                    st.session_state["nl_result"] = res
+                    st.session_state["nl_payload"] = payload
+                    st.rerun()
+            except Exception as e:
+                st.error(f"YAML did not validate: {e}")
+        rcol2.download_button(
+            "💾 Download this YAML", data=yaml_text.encode(),
+            file_name="case_from_text.yaml", mime="text/yaml",
+            key="nl_dl_yaml")
+
+    # ---- Results ------------------------------------------------------------
+    res = st.session_state.get("nl_result")
+    if res and res.get("ok"):
+        k = res["kpis"]
+        st.markdown("---")
+        st.markdown("### 📊 Results")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("NPV after tax",
+                  f"${(k.get('npv_MM') or 0):,.0f} MM")
+        m2.metric("IRR", f"{k['irr']*100:,.1f}%"
+                  if k.get("irr") is not None else "—")
+        m3.metric("Break-even oil",
+                  f"${k['breakeven_oil']:,.0f}/bbl"
+                  if k.get("breakeven_oil") is not None else "—")
+        m4.metric("CAPEX total",
+                  f"${(k.get('capex_total_MM') or 0):,.0f} MM")
+        m5.metric("Recovery factor",
+                  f"{k['final_rf']*100:,.1f}%"
+                  if k.get("final_rf") is not None else "—")
+        df = res.get("df")
+        df_e = res.get("df_e")
+        # Production profile
+        if df is not None and "date" in df.columns:
+            figp = go.Figure()
+            for c, nmlbl in (("primary_rate", "Primary"),
+                             ("secondary_rate", "Secondary")):
+                if c in df.columns:
+                    figp.add_trace(go.Scatter(
+                        x=df["date"], y=df[c], mode="lines", name=nmlbl))
+            figp.update_layout(title="Production profile (engine units)",
+                               xaxis_title="Date", yaxis_title="rate",
+                               height=300)
+            st.plotly_chart(fh.apply_plot_template(figp),
+                            use_container_width=True)
+        # Cashflow + NPV
+        if df_e is not None and "cashflow" in df_e.columns:
+            figc = go.Figure()
+            figc.add_trace(go.Bar(x=df_e["date"],
+                                  y=df_e["cashflow"] / 1e6,
+                                  name="Monthly CF ($MM)"))
+            if "npv" in df_e.columns:
+                figc.add_trace(go.Scatter(
+                    x=df_e["date"], y=df_e["npv"] / 1e6, mode="lines",
+                    name="Cumulative NPV ($MM)", yaxis="y2"))
+            figc.update_layout(
+                title="Cashflow & cumulative NPV", height=300,
+                yaxis=dict(title="$MM/month"),
+                yaxis2=dict(title="NPV $MM", overlaying="y", side="right"))
+            st.plotly_chart(fh.apply_plot_template(figc),
+                            use_container_width=True)
+        # Tornado
+        with st.expander("🌪️ Tornado — one-at-a-time sensitivities",
+                          expanded=False):
+            if st.button("Run tornado", key="nl_tornado_btn"):
+                with st.spinner("Running sensitivities…"):
+                    tdf = _nl_tornado(st.session_state["nl_payload"],
+                                      default_start_date,
+                                      k.get("npv_MM") or 0.0)
+                st.session_state["nl_tornado_df"] = tdf
+            tdf = st.session_state.get("nl_tornado_df")
+            if tdf is not None and not tdf.empty:
+                base = k.get("npv_MM") or 0.0
+                figt = go.Figure()
+                figt.add_trace(go.Bar(
+                    y=tdf["driver"], x=tdf["npv_low"] - base,
+                    orientation="h", name="Low", marker_color="#EB0037"))
+                figt.add_trace(go.Bar(
+                    y=tdf["driver"], x=tdf["npv_high"] - base,
+                    orientation="h", name="High", marker_color="#9DBA00"))
+                figt.update_layout(
+                    barmode="overlay", height=340,
+                    title=f"ΔNPV vs base (${base:,.0f}MM)",
+                    xaxis_title="ΔNPV ($MM)")
+                st.plotly_chart(fh.apply_plot_template(figt),
+                                use_container_width=True)
+        # Monte Carlo
+        with st.expander("🎲 Monte-Carlo (price / OPEX / CAPEX, "
+                          "lognormal ±20%)", expanded=False):
+            nmc = st.slider("Iterations", 25, 250, 100, 25, key="nl_mc_n")
+            if st.button("Run Monte-Carlo", key="nl_mc_btn"):
+                with st.spinner(f"Running {nmc} draws…"):
+                    draws = _nl_monte_carlo(
+                        st.session_state["nl_payload"],
+                        default_start_date, n=nmc)
+                st.session_state["nl_mc_draws"] = draws
+            draws = st.session_state.get("nl_mc_draws")
+            if draws:
+                arr = np.asarray(draws)
+                p90, p50, p10 = np.percentile(arr, [10, 50, 90])
+                c1, c2, c3 = st.columns(3)
+                c1.metric("P90 (downside)", f"${p90:,.0f} MM")
+                c2.metric("P50", f"${p50:,.0f} MM")
+                c3.metric("P10 (upside)", f"${p10:,.0f} MM")
+                figh = go.Figure(go.Histogram(x=arr, nbinsx=30,
+                                              marker_color="#00243D"))
+                figh.update_layout(title="NPV distribution ($MM)",
+                                   height=300, xaxis_title="NPV ($MM)")
+                st.plotly_chart(fh.apply_plot_template(figh),
+                                use_container_width=True)
 
 
 def _concept_unit_converter():

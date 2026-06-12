@@ -280,6 +280,22 @@ gas_mscf = (df_g.get('gas_export_rate',
 check("gas revenue = Mscf x $/Mscf ($4 basis)", gas_rev,
       gas_mscf * 4.0, tol=0.10, rel=True)
 
+section("8b. IPR compound-unit display round-trips")
+# Friction: stored psi/kbpd ↔ displayed bar/(kSm³/d). 1 psi/kbpd =
+# (1/14.5038) bar/psi × 6.2898 kbpd/(kSm³/d) = 0.43367.
+check("friction psi/kbpd -> bar/kSm3/d", 5.0 * 0.43367,
+      5.0 / 14.5038 * 6.2898, tol=0.001, rel=True)
+check("friction round-trip", (5.0 * 0.43367) / 0.43367, 5.0, tol=1e-9)
+# Fluid gradient: psi/ft ↔ bar/m via 0.22621.
+check("gradient psi/ft -> bar/m", 0.433 * 0.22621,
+      0.433 / 14.5038 * 3.28084, tol=0.001, rel=True)
+# CGR: stb/MMscf -> Sm3/MSm3 is ×5.6146 (was a ×0.22213 inverted-factor bug).
+check("CGR stb/MMscf -> Sm3/MSm3", 100.0 * 5.6146,
+      100.0 * 0.158987 / 0.0283168, tol=0.001, rel=True)
+# GOR display: scf/stb -> Sm3/Sm3 is ÷5.6146 (1 scf/stb = 0.178 Sm3/Sm3).
+check("GOR scf/stb -> Sm3/Sm3", 1000.0 / 5.6146,
+      1000.0 * 0.0283168 / 0.158987 / 1000.0 * 1000.0, tol=0.01, rel=True)
+
 section("9. STEA profile import (volumes/costs → engine)")
 import fp_helpers as _fh
 _stea_csv = (
