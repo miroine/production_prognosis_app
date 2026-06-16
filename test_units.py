@@ -296,8 +296,66 @@ check("CGR stb/MMscf -> Sm3/MSm3", 100.0 * 5.6146,
 check("GOR scf/stb -> Sm3/Sm3", 1000.0 / 5.6146,
       1000.0 * 0.0283168 / 0.158987 / 1000.0 * 1000.0, tol=0.01, rel=True)
 
+section("8c. Liquid-constrained watercut throttle + CGR override")
+import pandas as _pd
+_dates = _pd.date_range("2030-01-01", periods=120, freq="MS")
+def _mk_w(**over):
+    base = dict(name="P1", is_producer=True, rig="R",
+                spud_date=date(2030, 1, 1), drill_days=0, completion_days=0,
+                qi_primary=10000.0, qi_secondary=0.0,
+                decline_model="Exponential", di_annual=0.0, b_factor=0.5,
+                wc_initial=0.0, wc_final=0.8, wc_ramp_months=60,
+                scale_factor=1.0, uptime=1.0)
+    base.update(over)
+    return m.WellSpec(**base)
+# Oil: legacy OFF leaves oil unchanged; ON throttles oil = liquid×(1−WC).
+_off = m.well_monthly(_mk_w(liquid_constrained=False), _dates,
+                      field_is_oil=True)
+_on = m.well_monthly(_mk_w(liquid_constrained=True), _dates,
+                     field_is_oil=True)
+check("oil OFF: WC does not reduce oil", _off["oil"][-1], 10000.0, tol=1.0)
+check("oil ON: oil = liquid×(1−WC)", _on["oil"][-1], 10000.0 * (1 - 0.8),
+      tol=1.0)
+check("oil ON: water = liquid×WC", _on["water"][-1], 10000.0 * 0.8, tol=1.0)
+# Gas: ON throttles gas = capacity×(1−water fraction).
+_goff = m.well_monthly(_mk_w(fluid="gas", liquid_constrained=False), _dates,
+                       field_is_oil=False)
+_gon = m.well_monthly(_mk_w(fluid="gas", liquid_constrained=True), _dates,
+                      field_is_oil=False)
+check("gas OFF: WC does not reduce gas", _goff["gas"][-1], 10000.0, tol=1.0)
+check("gas ON: gas = capacity×(1−wf)", _gon["gas"][-1],
+      10000.0 * (1 - 0.8), tol=1.0)
+# CGR override: condensate = gas/1000 × CGR, independent of PVT.
+_wc = m.well_monthly(_mk_w(fluid="gas", cgr_override=50.0, wc_final=0.0),
+                     _dates, field_is_oil=False)
+check("per-well CGR override: cond = gas/1000×CGR", _wc["oil"][0],
+      _wc["gas"][0] / 1000.0 * 50.0, tol=0.01, rel=True)
+
 section("9. STEA profile import (volumes/costs → engine)")
 import fp_helpers as _fh
+
+# Subsea template cost must scale with well count: N wells on too-few
+# templates auto-adds the templates needed to host them (cost-integrity fix).
+def _surf_tmpl_cost(nt, nw, tt="4-slot (4 wells)"):
+    s = {"concept_type": "Subsea tie-in", "template_type": tt,
+         "n_templates": nt, "n_subsea_wells": nw, "n_dry_wells": 0,
+         "field_architecture": "Cluster", "flowline_km": 10,
+         "umbilical_km": 10, "riser_type": "None (tie-back)",
+         "host_concept": "Tie-back to existing"}
+    r = _fh.build_development_concept(s)
+    return sum(x["amount_MMUSD"] for x in r["capex_rows"]
+               if "template" in x["label"].lower())
+# 8 wells on 1×4-slot must cost the same as 2×4-slot explicitly (2×$70).
+check("SURF: 8 wells auto-scale to 2 templates", _surf_tmpl_cost(1, 8),
+      _surf_tmpl_cost(2, 8), tol=0.01)
+check("SURF: 8-well template cost = 2×$70MM", _surf_tmpl_cost(1, 8), 140.0,
+      tol=0.01)
+check("SURF: 12 wells → 3×4-slot = $210MM", _surf_tmpl_cost(1, 12), 210.0,
+      tol=0.01)
+# In-capacity design is unchanged (4 wells on 1×4-slot = $70MM).
+check("SURF: 4 wells on 1 template unchanged = $70MM",
+      _surf_tmpl_cost(1, 4), 70.0, tol=0.01)
+
 _stea_csv = (
     "year,oil_MSm3,gas_GSm3,ngl_MTPA,capex_MNOK,opex_MNOK,"
     "abandonment_MNOK,co2_MTPA\n"

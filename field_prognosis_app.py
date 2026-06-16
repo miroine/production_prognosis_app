@@ -460,6 +460,23 @@ class WellSpec:
     tubing_depth_ft: float = 8000.0          # mid-perf depth
     fluid_gradient_psi_per_ft: float = 0.35  # hydrostatic gradient (oil ~0.35, gas ~0.10, water ~0.45)
     friction_psi_per_kbpd: float = 5.0       # linear friction proxy (psi per 1000 bbl/d)
+    # Liquid-handling constraint. When True, qi_primary is interpreted as the
+    # initial GROSS FLUID capacity (gross liquid for an oil well, gross
+    # wellstream for a gas well), and the produced hydrocarbon is throttled by
+    # the water cut / water fraction:
+    #   oil well:  oil = gross_liquid  × (1 − WC)
+    #   gas well:  gas = gross_stream × (1 − water_fraction)
+    # so a rising WC directly displaces hydrocarbon (and hence NPV / RF),
+    # rather than only adding a water stream on top of an unaffected rate.
+    # When False (default) the legacy WOR/WGR-additive behaviour is kept, so
+    # existing cases are unchanged.
+    liquid_constrained: bool = False
+    # Per-well overrides for condensate-gas ratio and gas hydrostatic
+    # gradient, independent of the field PVT. 0.0 / negative ⇒ "use the field
+    # value" (the field-level override, or PVT). Units: CGR in stb/MMscf,
+    # gradient in psi/ft.
+    cgr_override: float = 0.0
+    gas_gradient_override_psi_per_ft: float = 0.0
 
     @property
     def online_date(self):
@@ -693,6 +710,14 @@ class FieldAssumptions:
     # in the reservoir.
     retrograde_enabled: bool = False
     retrograde_drop_fraction: float = 0.55
+    # Field-level CGR & gas-gradient override (independent of PVT). When
+    # cgr_override > 0 the condensate stream uses this CGR (stb/MMscf) instead
+    # of pvt.rs_init; when gas_gradient_override_psi_per_ft > 0 the gas IPR /
+    # outflow head uses this gradient instead of the PVT-derived density.
+    # A per-well override (Well.cgr_override / .gas_gradient_override...) takes
+    # precedence over these field-level values.
+    cgr_override: float = 0.0
+    gas_gradient_override_psi_per_ft: float = 0.0
     # Fractional-flow water cut (oil fields only). When enabled, the field
     # water cut is derived from Corey relative-permeability curves and the
     # cumulative recovery, rather than the per-well water-cut ramp.
@@ -864,7 +889,41 @@ def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = T
                 frac = min(1.0, rm / max(well.wc_ramp_months, 1))
                 wc[i] = well.wc_initial + frac * (well.wc_final - well.wc_initial)
         safe_wc = np.clip(wc, 0.0, 0.99)
-        water = primary * safe_wc / np.where(safe_wc < 1, 1 - safe_wc, 1)
+        # Determine oil vs gas BEFORE applying the constraint, since the
+        # throttle target differs by phase.
+        _wf = getattr(well, "fluid", "auto")
+        _is_oil_w = field_is_oil if _wf == "auto" else (_wf == "oil")
+        if getattr(well, "liquid_constrained", False):
+            # qi_primary is the GROSS FLUID capacity. The produced
+            # hydrocarbon is throttled by the water fraction; water takes the
+            # remainder of the same gross-fluid envelope, so rising WC
+            # directly displaces hydrocarbon instead of riding on top.
+            gross = primary.copy()
+            if _is_oil_w:
+                # Oil well: primary was gross liquid → oil = liquid × (1−WC).
+                primary = gross * (1.0 - safe_wc)
+                water = gross * safe_wc
+            else:
+                # Gas well: primary was gross wellstream capacity; the water
+                # fraction loads the well and throttles gas. Water rate is
+                # reported on a gross-stream basis (Mscf-equivalent of the
+                # displaced capacity is not physical, so water is the
+                # volumetric remainder of the throttle, in bbl/d via the
+                # WGR-style remainder). gas = capacity × (1−water_fraction).
+                primary = gross * (1.0 - safe_wc)
+                # Water stream (bbl/d): scale the displaced gas capacity by a
+                # nominal water-yield so the water curve is non-zero and rises
+                # with the constraint. Use the WGR-equivalent remainder.
+                water = gross * safe_wc / 1000.0  # Mscf/d displaced → bbl/d proxy
+        else:
+            # Legacy behaviour: water stream added via WOR/WGR; the primary
+            # (oil or gas) rate is unaffected by WC.
+            water = primary * safe_wc / np.where(safe_wc < 1, 1 - safe_wc, 1)
+            if not _is_oil_w:
+                # For a gas well the legacy "water" used gas as the base; keep
+                # it dimensionally as a small water proxy (unchanged from
+                # prior behaviour, which applied the same formula to gas).
+                pass
     else:
         inj = np.where(active, well.inj_rate * sf, 0.0)
 
@@ -881,6 +940,13 @@ def well_monthly(well: WellSpec, dates: pd.DatetimeIndex, field_is_oil: bool = T
     else:
         gas_phase = primary       # primary = gas rate (Mscf/d)
         oil_phase = secondary     # secondary = condensate (stb/d)
+        # Per-well CGR override (gas-condensate): if set, recompute the
+        # condensate stream from this well's gas using the user CGR
+        # (stb/MMscf), independent of PVT. gas_phase is Mscf/d → /1000 = MMscf/d.
+        _cgr_w = getattr(well, "cgr_override", 0.0) or 0.0
+        if _cgr_w > 0:
+            oil_phase = gas_phase / 1000.0 * _cgr_w
+            secondary = oil_phase
 
     return {"primary": primary, "secondary": secondary, "water": water,
             "inj": inj, "active": active,
@@ -1633,11 +1699,22 @@ def run_simulation(wells, asm: FieldAssumptions):
                     continue
                 if wf == "gas":
                     c_coef = pi_w / max(2.0 * p_res_i, 1.0)
+                    # Gas gradient override precedence: per-well →
+                    # field-level → the well's own fluid_gradient. Lets the
+                    # user set a gas hydrostatic gradient independent of PVT.
+                    _ggrad = (getattr(w, "gas_gradient_override_psi_per_ft",
+                                      0.0) or 0.0)
+                    if _ggrad <= 0:
+                        _ggrad = (getattr(asm,
+                                          "gas_gradient_override_psi_per_ft",
+                                          0.0) or 0.0)
+                    if _ggrad <= 0:
+                        _ggrad = w.fluid_gradient_psi_per_ft
                     res_q = fh.deliverable_rate(
                         p_res=p_res_i, p_wh=w.wellhead_pressure_psi,
                         depth_ft=w.tubing_depth_ft,
                         pi=c_coef, p_bub=p_bub, fluid="gas",
-                        fluid_grad_psi_per_ft=w.fluid_gradient_psi_per_ft,
+                        fluid_grad_psi_per_ft=_ggrad,
                         friction_psi_per_kbpd=w.friction_psi_per_kbpd,
                         q_decline_target=q_decline)
                 else:
@@ -1719,9 +1796,14 @@ def run_simulation(wells, asm: FieldAssumptions):
                           FLUID_SYSTEMS[asm.fluid_system]["secondary"]
                           == "condensate")
     if (_is_gas_condensate and getattr(asm, "retrograde_enabled", False)
-            and asm.pvt.rs_init > 0):
+            and (asm.pvt.rs_init > 0
+                 or (getattr(asm, "cgr_override", 0.0) or 0.0) > 0)):
         p_dew = asm.pvt.p_bub_psi   # for a gas system p_bub holds the dew point
-        cgr0 = asm.pvt.rs_init      # stb/MMscf
+        # CGR source precedence: field-level override (asm.cgr_override) wins
+        # over PVT rs_init. (Per-well CGR override is applied to each well's
+        # condensate separately in the well loop.)
+        _cgr_field = getattr(asm, "cgr_override", 0.0) or 0.0
+        cgr0 = _cgr_field if _cgr_field > 0 else asm.pvt.rs_init  # stb/MMscf
         retro = retrograde_cgr(pressure, p_dew, cgr0,
                                asm.pvt.p_init_psi,
                                drop_fraction=getattr(
@@ -3823,6 +3905,39 @@ def sidebar_inputs():
                          "producible CGR falls to 45% of its initial value "
                          "— typical for a moderately rich condensate. "
                          "Leaner gas: lower; richer: higher.")
+        # ---- Field-level CGR & gas-gradient override (independent of PVT) --
+        # Lets the user drive condensate yield and the gas hydrostatic head
+        # from explicit values rather than the PVT correlation. Per-well
+        # columns in the producers table override these per well.
+        if _pvt_is_gas:
+            with st.expander("⚙️ Override gas gradient & CGR "
+                             "(independent of PVT)", expanded=False):
+                st.caption(
+                    "Drive the condensate-gas ratio and the gas hydrostatic "
+                    "gradient from explicit field-level values instead of "
+                    "the PVT correlation. 0 = use PVT. Per-well overrides in "
+                    "the Producers table take precedence over these.")
+                _co1, _co2 = st.columns(2)
+                if FLUID_SYSTEMS[fluid]["secondary"] == "condensate":
+                    _co1.number_input(
+                        "Field CGR override (stb/MMscf)",
+                        min_value=0.0, step=5.0, value=float(
+                            st.session_state.get("cgr_override_field", 0.0)),
+                        key="cgr_override_field", on_change=mark_stale,
+                        help="Condensate = gas × CGR. Overrides PVT rs_init "
+                             "for the condensate stream when > 0. Typical "
+                             "lean 10-50, rich 50-200 stb/MMscf.")
+                _co2.number_input(
+                    "Field gas gradient override (psi/ft)",
+                    min_value=0.0, max_value=0.30, step=0.005,
+                    value=float(st.session_state.get(
+                        "gas_grad_override_field", 0.0)),
+                    format="%.3f",
+                    key="gas_grad_override_field", on_change=mark_stale,
+                    help="Gas hydrostatic gradient for the IPR/outflow head "
+                         "when > 0 (IPR mode wells). Overrides the PVT-"
+                         "derived density. Typical dry gas 0.05-0.10 psi/ft "
+                         "(≈0.011-0.023 bar/m).")
         ct_rock = st.number_input("Rock compressibility (1/psi)", value=4e-6,
                                   format="%.1e", key="ct_rock", on_change=mark_stale)
         sw_init = st.number_input("Initial water saturation", value=0.20,
@@ -4153,6 +4268,10 @@ def sidebar_inputs():
         "ct_rock": ct_rock, "sw_init": sw_init,
         "retrograde_enabled": retrograde_enabled,
         "retrograde_drop_fraction": retrograde_drop_fraction,
+        "cgr_override": float(st.session_state.get("cgr_override_field", 0.0)
+                              or 0.0),
+        "gas_gradient_override_psi_per_ft": float(
+            st.session_state.get("gas_grad_override_field", 0.0) or 0.0),
         "fractional_flow_enabled": ff_enabled,
         "ff_params": ff_params_ui,
         "prod_eff": prod_eff,
@@ -4840,6 +4959,9 @@ def well_section(units, fluid, start_date):
                 "tubing_depth_ft": _td_default,
                 "fluid_gradient_psi_per_ft": 0.35,   # engine units (psi/ft)
                 "friction_psi_per_kbpd": 5.0,
+                "liquid_constrained": False,
+                "cgr_override": 0.0,
+                "gas_gradient_override_psi_per_ft": 0.0,
             })
         st.session_state.producers_df = pd.DataFrame(rows)
     else:
@@ -4863,6 +4985,12 @@ def well_section(units, fluid, start_date):
             pdf["fluid_gradient_psi_per_ft"] = 0.35
         if "friction_psi_per_kbpd" not in pdf.columns:
             pdf["friction_psi_per_kbpd"] = 5.0
+        if "liquid_constrained" not in pdf.columns:
+            pdf["liquid_constrained"] = False
+        if "cgr_override" not in pdf.columns:
+            pdf["cgr_override"] = 0.0
+        if "gas_gradient_override_psi_per_ft" not in pdf.columns:
+            pdf["gas_gradient_override_psi_per_ft"] = 0.0
         st.session_state.producers_df = pdf
 
     # ---- Display→storage conversion for unit-bearing IPR columns ----
@@ -4998,6 +5126,27 @@ def well_section(units, fluid, start_date):
                       "Higher tubing ID "
                       "and lower viscosity reduce this. Typical 2-10 for oil "
                       "wells, 5-20 for high-rate gas wells.")),
+            "liquid_constrained": st.column_config.CheckboxColumn(
+                "Liq.-constr.",
+                help=("When ON, qi treats the well as GROSS-FLUID limited: "
+                      "oil = gross liquid × (1−WC) for an oil well, gas = "
+                      "gross stream × (1−water fraction) for a gas well — so "
+                      "rising water cut DISPLACES hydrocarbon (affects NPV & "
+                      "recovery). When OFF (default), water is added on top "
+                      "via WOR/WGR and the hydrocarbon rate is unchanged.")),
+            "cgr_override": st.column_config.NumberColumn(
+                "CGR [stb/MMscf]",
+                min_value=0.0, step=5.0, format="%.0f",
+                help=("Per-well condensate-gas ratio override (gas fields), "
+                      "independent of PVT. 0 = use the field-level override "
+                      "or PVT. When >0, condensate = gas × CGR.")),
+            "gas_gradient_override_psi_per_ft": st.column_config.NumberColumn(
+                "Gas ρ [psi/ft]",
+                min_value=0.0, max_value=0.30, step=0.01, format="%.3f",
+                help=("Per-well gas hydrostatic gradient override for the "
+                      "IPR/outflow head (gas wells), independent of PVT. "
+                      "0 = use field-level override or the well's ρ. Typical "
+                      "dry gas ~0.05-0.10 psi/ft.")),
         },
         key="producers_editor",
     )
@@ -5440,6 +5589,14 @@ def well_section(units, fluid, start_date):
                     row.get("fluid_gradient_psi_per_ft"), 0.35),
                 friction_psi_per_kbpd=_f(
                     row.get("friction_psi_per_kbpd"), 5.0),
+                # Liquid-handling constraint toggle (default off → legacy).
+                liquid_constrained=bool(
+                    row.get("liquid_constrained", False)),
+                # Per-well CGR (stb/MMscf) & gas gradient (psi/ft) overrides.
+                # Stored field-convention; 0 ⇒ use field-level / PVT.
+                cgr_override=_f(row.get("cgr_override"), 0.0),
+                gas_gradient_override_psi_per_ft=_f(
+                    row.get("gas_gradient_override_psi_per_ft"), 0.0),
             )
         else:
             inj_rate_val = _f(row.get("inj_rate"), 0.0)
@@ -6745,8 +6902,12 @@ def economics_section(units, start_date):
                      "(e.g. a maintenance month or a price trough); 6–12 "
                      "months is typical.")
 
-    # ---- Money basis (nominal vs real) ----
-    with _eco_block("💱 Money basis (real vs nominal)"):
+    # ---- Currency input (money basis + cost-input currency) ----
+    # One section covering BOTH (a) whether cashflows are real or nominal and
+    # (b) the currency costs are entered in (USD or NOK, converted to USD for
+    # the engine). Results are always shown in USD.
+    with _eco_block("💱 Currency input"):
+        st.markdown("**Money basis**")
         mb_col1, mb_col2 = st.columns([2, 1])
         money_basis = mb_col1.radio(
             "All cashflows in", ["Real (today's $)", "Nominal (escalated $)"],
@@ -6773,116 +6934,123 @@ def economics_section(units, start_date):
                      "economies; 5-10% may be appropriate for high-inflation "
                      "environments.") / 100.0
 
-    # ---- Cost-input currency (input side — costs can be entered in NOK and
-    # the engine converts them to USD for the calculation; all RESULTS are
-    # always displayed in USD). NCS costs are typically quoted in NOK, so
-    # this lets you enter MNOK figures directly. ----
-    # When the user flips the currency we rescale the EXISTING cost values in
-    # session_state by the FX rate, so a "$20MM" fixed-OPEX default becomes
-    # "210 MNOK" (not a bare 20 that would silently mean ~$1.9MM). Scalar cost
-    # widgets and the facility-schedule amounts are converted together.
-    _COST_SCALAR_KEYS = ["opex_fixed", "opex_var_oil", "opex_var_gas",
-                         "capex_well", "aban_cost", "rig_dayrate",
-                         "cmpl_dayrate", "well_tangibles",
-                         "dc_topside_rate_k", "dc_manhour_rate"]
+        # ---- Cost-input currency (input side — costs can be entered in NOK
+        # and the engine converts them to USD for the calculation; all RESULTS
+        # are always displayed in USD). NCS costs are typically quoted in NOK,
+        # so this lets you enter MNOK figures directly. ----
+        # When the user flips the currency we rescale the EXISTING cost values
+        # in session_state by the FX rate, so a "$20MM" fixed-OPEX default
+        # becomes "210 MNOK" (not a bare 20 that would silently mean ~$1.9MM).
+        # Scalar cost widgets and the facility-schedule amounts convert
+        # together.
+        st.markdown("---")
+        st.markdown("**Cost input currency**")
+        _COST_SCALAR_KEYS = ["opex_fixed", "opex_var_oil", "opex_var_gas",
+                             "capex_well", "aban_cost", "rig_dayrate",
+                             "cmpl_dayrate", "well_tangibles",
+                             "dc_topside_rate_k", "dc_manhour_rate"]
 
-    def _rescale_costs(factor):
-        """Multiply all cost scalar widgets + facility schedule by `factor`."""
-        if factor == 1.0:
-            return
-        for k in _COST_SCALAR_KEYS:
-            if k in st.session_state and st.session_state[k] is not None:
-                try:
-                    st.session_state[k] = round(
-                        float(st.session_state[k]) * factor, 4)
-                except (TypeError, ValueError):
-                    pass
-        try:
-            _f = st.session_state.get("fac_df")
-            if _f is not None and "amount_MMUSD" in _f.columns:
-                _f = _f.copy()
-                _f["amount_MMUSD"] = (
-                    _f["amount_MMUSD"].astype(float) * factor).round(4)
-                st.session_state["fac_df"] = _f
-        except Exception:
-            pass
+        def _rescale_costs(factor):
+            """Multiply all cost scalar widgets + facility schedule by factor."""
+            if factor == 1.0:
+                return
+            for k in _COST_SCALAR_KEYS:
+                if k in st.session_state and st.session_state[k] is not None:
+                    try:
+                        st.session_state[k] = round(
+                            float(st.session_state[k]) * factor, 4)
+                    except (TypeError, ValueError):
+                        pass
+            try:
+                _f = st.session_state.get("fac_df")
+                if _f is not None and "amount_MMUSD" in _f.columns:
+                    _f = _f.copy()
+                    _f["amount_MMUSD"] = (
+                        _f["amount_MMUSD"].astype(float) * factor).round(4)
+                    st.session_state["fac_df"] = _f
+            except Exception:
+                pass
 
-    def _on_currency_switch():
-        prev = st.session_state.get("_cost_currency_prev", "USD")
-        now = st.session_state.get("cost_input_currency", "USD")
-        if prev == now:
-            return
-        rate = float(st.session_state.get("usd_to_nok", 10.5))
-        if rate <= 0:
+        def _on_currency_switch():
+            prev = st.session_state.get("_cost_currency_prev", "USD")
+            now = st.session_state.get("cost_input_currency", "USD")
+            if prev == now:
+                return
+            rate = float(st.session_state.get("usd_to_nok", 10.5))
+            if rate <= 0:
+                st.session_state["_cost_currency_prev"] = now
+                return
+            # USD→NOK multiplies by rate; NOK→USD divides.
+            factor = rate if (prev == "USD" and now == "NOK") else (
+                1.0 / rate if (prev == "NOK" and now == "USD") else 1.0)
+            _rescale_costs(factor)
             st.session_state["_cost_currency_prev"] = now
-            return
-        # USD→NOK multiplies by rate; NOK→USD divides.
-        factor = rate if (prev == "USD" and now == "NOK") else (
-            1.0 / rate if (prev == "NOK" and now == "USD") else 1.0)
-        _rescale_costs(factor)
-        st.session_state["_cost_currency_prev"] = now
-        # Keep the rate tracker in sync so a switch isn't double-counted as a
-        # rate change.
-        st.session_state["_cost_rate_prev"] = rate
-        mark_stale()
+            # Keep the rate tracker in sync so a switch isn't double-counted as
+            # a rate change.
+            st.session_state["_cost_rate_prev"] = rate
+            mark_stale()
 
-    def _on_rate_change():
-        # Behaviour on FX-rate change is controlled by the toggle below.
-        # "Hold USD" → rescale the NOK figures so the real USD cost stays
-        # constant at the new rate (good after seeding USD-equivalent
-        # defaults). "Hold NOK" → leave the typed NOK numbers as-is; only
-        # their USD equivalent changes (good once you've entered real NOK
-        # quotes).
-        new_rate = float(st.session_state.get("usd_to_nok", 10.5))
-        old_rate = float(st.session_state.get("_cost_rate_prev", new_rate))
-        st.session_state["_cost_rate_prev"] = new_rate
-        mode = st.session_state.get("_rate_change_mode", "Hold USD value")
-        if (mode == "Hold USD value"
-                and st.session_state.get("cost_input_currency", "USD") == "NOK"
-                and old_rate > 0 and new_rate > 0 and new_rate != old_rate):
-            _rescale_costs(new_rate / old_rate)
-        mark_stale()
+        def _on_rate_change():
+            # Behaviour on FX-rate change is controlled by the toggle below.
+            # "Hold USD" → rescale the NOK figures so the real USD cost stays
+            # constant at the new rate (good after seeding USD-equivalent
+            # defaults). "Hold NOK" → leave the typed NOK numbers as-is; only
+            # their USD equivalent changes (good once you've entered real NOK
+            # quotes).
+            new_rate = float(st.session_state.get("usd_to_nok", 10.5))
+            old_rate = float(st.session_state.get("_cost_rate_prev", new_rate))
+            st.session_state["_cost_rate_prev"] = new_rate
+            mode = st.session_state.get("_rate_change_mode", "Hold USD value")
+            if (mode == "Hold USD value"
+                    and st.session_state.get("cost_input_currency",
+                                             "USD") == "NOK"
+                    and old_rate > 0 and new_rate > 0
+                    and new_rate != old_rate):
+                _rescale_costs(new_rate / old_rate)
+            mark_stale()
 
-    cur_col1, cur_col2 = st.columns([2, 1])
-    cost_input_currency = cur_col1.radio(
-        "Cost input currency", ["USD", "NOK"],
-        horizontal=True, key="cost_input_currency",
-        on_change=_on_currency_switch,
-        help="The currency you ENTER costs in (CAPEX, OPEX, day-rates, "
-             "tangibles, facility schedule). Selecting NOK lets you type "
-             "MNOK figures; the engine converts them to USD using the rate "
-             "at right before computing. All RESULTS (NPV, breakeven, etc.) "
-             "are always shown in USD.")
-    nok_to_usd_rate = cur_col2.number_input(
-        "NOK→USD rate", min_value=1.0, max_value=30.0,
-        value=float(st.session_state.get("usd_to_nok", 10.5)),
-        step=0.1, key="usd_to_nok", on_change=_on_rate_change,
-        help="NOK per 1 USD (≈10-11 recently). Cost inputs in NOK are "
-             "divided by this to get USD for the engine. Changing this while "
-             "in NOK mode rescales your entered NOK costs to the new rate.")
-    if cost_input_currency == "NOK":
-        st.session_state.setdefault("_rate_change_mode", "Hold USD value")
-        cur_col2.radio(
-            "On rate change",
-            ["Hold USD value", "Hold NOK value"],
-            key="_rate_change_mode", horizontal=False,
-            help="**Hold USD value**: when you change the rate, your NOK "
-                 "figures are rescaled so the real USD cost (and the "
-                 "USD-equivalent defaults) stay constant. **Hold NOK "
-                 "value**: your typed NOK numbers stay fixed; only their USD "
-                 "equivalent changes. Use Hold NOK once you've entered real "
-                 "NOK quotes.")
-        cur_col2.caption(f"1 USD = {nok_to_usd_rate:.1f} NOK — "
-                         f"costs entered as NOK ÷ {nok_to_usd_rate:.1f}")
-        st.info(f"💱 **Cost inputs are in NOK.** All cost fields below "
-                f"(CAPEX, OPEX, day-rates, tangibles, facility schedule) "
-                f"are read as **MNOK / NOK** and converted to USD at "
-                f"{nok_to_usd_rate:.1f} NOK/USD for the calculation. "
-                f"Oil/gas prices stay in USD. **All results are shown in "
-                f"USD.**")
-    # Track current currency so the next flip can rescale existing values.
-    st.session_state.setdefault("_cost_currency_prev", cost_input_currency)
-    st.session_state.setdefault("_cost_rate_prev", float(nok_to_usd_rate))
+        cur_col1, cur_col2 = st.columns([2, 1])
+        cost_input_currency = cur_col1.radio(
+            "Cost input currency", ["USD", "NOK"],
+            horizontal=True, key="cost_input_currency",
+            on_change=_on_currency_switch,
+            help="The currency you ENTER costs in (CAPEX, OPEX, day-rates, "
+                 "tangibles, facility schedule). Selecting NOK lets you type "
+                 "MNOK figures; the engine converts them to USD using the "
+                 "rate at right before computing. All RESULTS (NPV, "
+                 "breakeven, etc.) are always shown in USD.")
+        nok_to_usd_rate = cur_col2.number_input(
+            "NOK→USD rate", min_value=1.0, max_value=30.0,
+            value=float(st.session_state.get("usd_to_nok", 10.5)),
+            step=0.1, key="usd_to_nok", on_change=_on_rate_change,
+            help="NOK per 1 USD (≈10-11 recently). Cost inputs in NOK are "
+                 "divided by this to get USD for the engine. Changing this "
+                 "while in NOK mode rescales your entered NOK costs to the "
+                 "new rate.")
+        if cost_input_currency == "NOK":
+            st.session_state.setdefault("_rate_change_mode", "Hold USD value")
+            cur_col2.radio(
+                "On rate change",
+                ["Hold USD value", "Hold NOK value"],
+                key="_rate_change_mode", horizontal=False,
+                help="**Hold USD value**: when you change the rate, your NOK "
+                     "figures are rescaled so the real USD cost (and the "
+                     "USD-equivalent defaults) stay constant. **Hold NOK "
+                     "value**: your typed NOK numbers stay fixed; only their "
+                     "USD equivalent changes. Use Hold NOK once you've "
+                     "entered real NOK quotes.")
+            cur_col2.caption(f"1 USD = {nok_to_usd_rate:.1f} NOK — "
+                             f"costs entered as NOK ÷ {nok_to_usd_rate:.1f}")
+            st.info(f"💱 **Cost inputs are in NOK.** All cost fields below "
+                    f"(CAPEX, OPEX, day-rates, tangibles, facility schedule) "
+                    f"are read as **MNOK / NOK** and converted to USD at "
+                    f"{nok_to_usd_rate:.1f} NOK/USD for the calculation. "
+                    f"Oil/gas prices stay in USD. **All results are shown in "
+                    f"USD.**")
+        # Track current currency so the next flip can rescale existing values.
+        st.session_state.setdefault("_cost_currency_prev",
+                                    cost_input_currency)
+        st.session_state.setdefault("_cost_rate_prev", float(nok_to_usd_rate))
 
     # ---- Fiscal regime (Tax/Royalty / PSC / NCS) ----
     with _eco_block("🏛️ Fiscal regime (Tax/Royalty · PSC · NCS)"):
@@ -7125,6 +7293,23 @@ def economics_section(units, start_date):
         well_planner_section(
             units, st.session_state.get("fluid", "Oil with associated gas"))
 
+        # ---- SURF concept (subsea / umbilicals / risers / flowlines) ----
+        # The SURF counterpart to the Drilling section above: design the
+        # subsea production system (templates, trees, flowlines, umbilicals,
+        # risers, boosting) right next to its cost, and feed the same NCS/UKCS
+        # benchmarking cross-plots (subsea-facility cost per well, umbilical
+        # and pipeline unit costs) further down. Mirrors the Drilling →
+        # Well Planner pairing.
+        st.markdown("### 🌊 SURF concept — subsea production system design")
+        st.caption(
+            "The **SURF** section pairs the subsea-facility cost model with "
+            "the design inputs below (templates, trees, flowlines, "
+            "umbilicals, risers, boosting). The resulting subsea-facility "
+            "cost per well, umbilical $/m and pipeline $/m are plotted "
+            "against the NCS/UKCS peer cloud in the **benchmarking "
+            "cross-plots** below — the SURF analog to the Drilling "
+            "'well cost vs days/metres' benchmarks.")
+
         # Template type — sets slot capacity and per-template cost.
         tt1, tt2 = st.columns(2)
         template_type = tt1.selectbox(
@@ -7135,9 +7320,11 @@ def economics_section(units, start_date):
             help="A subsea template is built for a fixed number of well "
                  "slots. More slots → bigger, heavier, costlier structure, "
                  "but more drilling flexibility and room for future infill. "
-                 "Screening cost: single $18MM, double $30MM, 4-slot $52MM, "
-                 "6-slot $72MM. The number of subsea wells must fit within "
-                 "n_templates × slots — a warning is shown if not.")
+                 "Screening cost: single $24MM, double $40MM, 4-slot $70MM, "
+                 "6-slot $96MM. The number of subsea wells must fit within "
+                 "n_templates × slots; if you specify more wells than slots, "
+                 "the cost model auto-adds the templates needed to host them "
+                 "(and a warning is shown).")
         _slot_cap = {"Single-slot (1 well)": 1, "Double-slot (2 wells)": 2,
                      "4-slot (4 wells)": 4, "6-slot (6 wells)": 6}[template_type]
         _total_slots = n_templates * _slot_cap
@@ -10961,6 +11148,9 @@ def main():
         retrograde_enabled=inputs.get("retrograde_enabled", False),
         retrograde_drop_fraction=inputs.get("retrograde_drop_fraction",
                                             0.55),
+        cgr_override=inputs.get("cgr_override", 0.0),
+        gas_gradient_override_psi_per_ft=inputs.get(
+            "gas_gradient_override_psi_per_ft", 0.0),
         fractional_flow_enabled=inputs.get("fractional_flow_enabled",
                                            False),
         ff_swc=inputs.get("ff_params", {}).get("swc", 0.20),
@@ -12200,6 +12390,7 @@ def collect_inputs_payload() -> dict:
         "well_pi_default", "min_bhp_default",
         "retrograde_enabled", "retrograde_drop_fraction",
         "cgr_from_inplace",
+        "cgr_override_field", "gas_grad_override_field",
         # Fractional-flow (Buckley-Leverett) water-cut model parameters
         "fractional_flow_enabled", "ff_enabled",
         "ff_swc", "ff_sor", "ff_krw_max", "ff_kro_max",
@@ -12306,6 +12497,18 @@ def collect_inputs_payload() -> dict:
     if "units" not in payload["scalar"]:
         payload["scalar"]["units"] = str(
             st.session_state.get("units", "field"))
+    # Field-level CGR / gas-gradient override: the live widgets are
+    # cgr_override_field / gas_grad_override_field, but the engine + batch
+    # path read the scalar keys cgr_override / gas_gradient_override_psi_per_ft.
+    # Emit both so a saved case drives the override identically in the live
+    # app and the batch/concept runner.
+    _cgr_ov = st.session_state.get("cgr_override_field")
+    if _cgr_ov is not None:
+        payload["scalar"]["cgr_override"] = float(_cgr_ov or 0.0)
+    _ggrad_ov = st.session_state.get("gas_grad_override_field")
+    if _ggrad_ov is not None:
+        payload["scalar"]["gas_gradient_override_psi_per_ft"] = float(
+            _ggrad_ov or 0.0)
     if "fluid" not in payload["scalar"]:
         payload["scalar"]["fluid"] = str(
             st.session_state.get("fluid", "Oil with associated gas"))
@@ -12423,6 +12626,23 @@ def restore_inputs_payload(payload: dict) -> None:
             # Never let a single odd key abort the whole case load.
             pass
 
+    # Mirror the engine-facing override scalar names back onto the live
+    # widget keys so a loaded case shows the user's CGR / gas-gradient
+    # overrides in the sidebar (collect_inputs_payload emits both names).
+    _sc_load = payload.get("scalar", {})
+    if "cgr_override" in _sc_load:
+        try:
+            st.session_state["cgr_override_field"] = float(
+                _sc_load["cgr_override"] or 0.0)
+        except Exception:
+            pass
+    if "gas_gradient_override_psi_per_ft" in _sc_load:
+        try:
+            st.session_state["gas_grad_override_field"] = float(
+                _sc_load["gas_gradient_override_psi_per_ft"] or 0.0)
+        except Exception:
+            pass
+
     # Numeric columns per table (used to coerce after load)
     NUMERIC_COLS = {
         "rigs_df": [],
@@ -12433,7 +12653,9 @@ def restore_inputs_payload(payload: dict) -> None:
                           "scale_factor", "uptime",
                           "well_pi_override",
                           "wellhead_pressure_psi", "tubing_depth_ft",
-                          "fluid_gradient_psi_per_ft", "friction_psi_per_kbpd"],
+                          "fluid_gradient_psi_per_ft", "friction_psi_per_kbpd",
+                          "cgr_override",
+                          "gas_gradient_override_psi_per_ft"],
         "injectors_df": ["drill_days", "completion_days",
                           "inj_rate", "scale_factor", "uptime"],
         "cap_df": ["oil", "gas", "water", "liquid", "water_inj", "gas_inj"],
@@ -12451,7 +12673,8 @@ def restore_inputs_payload(payload: dict) -> None:
     }
     BOOL_COLS = {
         "reservoirs_df": ["aquifer_active", "gas_cap_active"],
-        "producers_df": ["derive_qi_from_pi", "ipr_mode"],
+        "producers_df": ["derive_qi_from_pi", "ipr_mode",
+                         "liquid_constrained"],
     }
     STR_COLS = {
         "rigs_df": ["rig"],
@@ -14467,6 +14690,9 @@ def _wells_from_payload_tables(payload: dict, units: str, start_date_default,
         "retrograde_enabled": bool(scalar.get("retrograde_enabled", False)),
         "retrograde_drop_fraction": float(
             scalar.get("retrograde_drop_fraction", 0.55)),
+        "cgr_override": float(scalar.get("cgr_override", 0.0) or 0.0),
+        "gas_gradient_override_psi_per_ft": float(
+            scalar.get("gas_gradient_override_psi_per_ft", 0.0) or 0.0),
         # Fractional-flow water modelling (oil fields)
         "fractional_flow_enabled": bool(
             scalar.get("fractional_flow_enabled", False)),
@@ -14613,6 +14839,9 @@ def _build_asm_for_scenario(meta: dict, fluid: str, strategy: str,
         retrograde_enabled=meta.get("retrograde_enabled", False),
         retrograde_drop_fraction=meta.get(
             "retrograde_drop_fraction", 0.55),
+        cgr_override=meta.get("cgr_override", 0.0),
+        gas_gradient_override_psi_per_ft=meta.get(
+            "gas_gradient_override_psi_per_ft", 0.0),
         fractional_flow_enabled=meta.get("fractional_flow_enabled", False),
         ff_swc=meta.get("ff_params", {}).get("swc", 0.20),
         ff_sor=meta.get("ff_params", {}).get("sor", 0.25),
@@ -17743,6 +17972,241 @@ def _nl_monte_carlo(payload: dict, start_date, n: int = 100,
     return draws
 
 
+def _nl_demo_envelope(text: str) -> dict:
+    """Offline demo extractor — NO LLM, NO network, NO API key.
+
+    A deliberately simple, deterministic regex parser that maps an obvious
+    business-case description onto the YAML schema, so the whole Case-from-
+    text workflow (questions → YAML review → run → tornado → MC) can be
+    tested without a key. It is NOT an LLM: it only catches plainly-stated
+    numbers (in-place, well count, rate, first oil year, facility CAPEX) and
+    keywords (fluid, units, fiscal regime, injection). Everything it could
+    not find becomes a question; every default it used is listed openly in
+    the assumptions.
+    """
+    import re as _re
+    import yaml as _yaml
+    t = " " + (text or "") + " "
+    lo = t.lower()
+    questions, assumptions = [], []
+
+    # ---- units ----
+    if _re.search(r"\bmetric\b|\bsi units\b|sm³|sm3|msm3|gsm3", lo):
+        units = "metric"
+    elif _re.search(r"\bfield units?\b|mmbbl|mmstb|bscf|bbl/d|stb/d", lo):
+        units = "field"
+    else:
+        units = "metric" if _re.search(r"\bncs\b|norweg|norway", lo) \
+            else "field"
+        assumptions.append(f"units = {units} (not stated; inferred from "
+                           "context)")
+
+    # ---- fluid ----
+    if _re.search(r"gas[- ]?condensate|condensate", lo):
+        fluid = "Gas with condensate"
+    elif _re.search(r"dry gas|gas field|gas development", lo):
+        fluid = "Dry gas"
+    elif _re.search(r"\boil\b", lo):
+        fluid = "Oil with associated gas"
+    else:
+        fluid = "Oil with associated gas"
+        questions.append("What is the fluid system — oil, gas-condensate, "
+                         "or dry gas?")
+    is_oil = fluid.startswith("Oil")
+
+    # ---- in-place ----
+    ooip = ogip = None
+    m_o = _re.search(r"([\d.,]+)\s*(mmbbl|mmstb|million\s+barrels?)", lo)
+    m_om = _re.search(r"([\d.,]+)\s*(msm3|msm³)", lo)
+    m_g = _re.search(r"([\d.,]+)\s*(bscf|tcf)", lo)
+    m_gm = _re.search(r"([\d.,]+)\s*(gsm3|gsm³)", lo)
+    def _num(s):
+        try:
+            return float(s.replace(",", ""))
+        except Exception:
+            return None
+    if units == "field":
+        if m_o:
+            ooip = _num(m_o.group(1))
+        elif m_om:
+            ooip = (_num(m_om.group(1)) or 0) * 6.2898   # MSm³→MMstb
+            assumptions.append("converted in-place MSm³ → MMstb (×6.2898)")
+        if m_g:
+            ogip = _num(m_g.group(1)) * (1000.0 if m_g.group(2) == "tcf"
+                                          else 1.0)
+        elif m_gm:
+            ogip = (_num(m_gm.group(1)) or 0) * 35.3147  # GSm³→Bscf
+            assumptions.append("converted in-place GSm³ → Bscf (×35.3147)")
+    else:
+        if m_om:
+            ooip = _num(m_om.group(1))
+        elif m_o:
+            ooip = (_num(m_o.group(1)) or 0) / 6.2898    # MMstb→MSm³
+            assumptions.append("converted in-place MMbbl → MSm³ (÷6.2898)")
+        if m_gm:
+            ogip = _num(m_gm.group(1))
+        elif m_g:
+            ogip = (_num(m_g.group(1)) or 0) / 35.3147 * (
+                1000.0 if m_g.group(2) == "tcf" else 1.0)
+            assumptions.append("converted in-place Bscf → GSm³ (÷35.3147)")
+    if is_oil and ooip is None:
+        questions.append("How much oil in place "
+                         f"({'MMbbl' if units=='field' else 'MSm³'})?")
+    if (not is_oil) and ogip is None:
+        questions.append("How much gas in place "
+                         f"({'Bscf' if units=='field' else 'GSm³'})?")
+
+    # ---- wells & rate ----
+    n_wells = None
+    m_w = _re.search(r"(\d+)\s*(?:producers?|production wells?|wells?)", lo)
+    if m_w:
+        n_wells = int(m_w.group(1))
+    else:
+        questions.append("How many production wells?")
+    qi = None
+    m_r = _re.search(r"([\d.,]+)\s*(?:k)?\s*(bbl/d|stb/d|b/d|sm3/d|sm³/d|"
+                     r"mmscf/d|ksm3/d|ksm³/d)", lo)
+    if m_r:
+        qi = _num(m_r.group(1))
+        unit_r = m_r.group(2)
+        # normalise the stated rate unit to the case's unit system
+        if units == "field" and unit_r in ("sm3/d", "sm³/d"):
+            qi = qi * 6.2898
+            assumptions.append("converted well rate Sm³/d → bbl/d")
+        elif units == "metric" and unit_r in ("bbl/d", "stb/d", "b/d"):
+            qi = qi / 6.2898
+            assumptions.append("converted well rate bbl/d → Sm³/d")
+        elif unit_r == "mmscf/d":
+            qi = qi * (1000.0 if units == "field" else 28.3168)
+            assumptions.append("interpreted rate as gas MMscf/d")
+    else:
+        questions.append(
+            "What initial rate per well "
+            f"({'bbl/d' if (is_oil and units=='field') else 'Sm³/d' if is_oil else 'Mscf/d or kSm³/d'})?")
+
+    # ---- first production ----
+    m_y = _re.search(r"(?:first (?:oil|gas|production)|on-?stream|start-?up|"
+                     r"production start)\D{0,15}(20\d{2})", lo)
+    if not m_y:
+        m_y = _re.search(r"\b(20\d{2})\b", lo)
+        if m_y:
+            assumptions.append(f"first production {m_y.group(1)} (year "
+                               "mentioned without explicit 'first oil')")
+    if m_y:
+        start_date = f"{m_y.group(1)}-07-01"
+        assumptions.append(f"start_date = {start_date} (mid-year)")
+    else:
+        start_date = None
+        questions.append("Which year is first production?")
+
+    # ---- facility CAPEX ----
+    fac_amount = None
+    m_c = _re.search(r"([\d.,]+)\s*(musd|mmusd|mm usd|\$\s?mm|million usd|"
+                     r"musd|mnok|bnok|bn usd|busd)", lo)
+    if m_c:
+        v = _num(m_c.group(1))
+        u = m_c.group(2).replace(" ", "")
+        if u in ("mnok",):
+            fac_amount = v / 10.5
+            assumptions.append("facility CAPEX MNOK → $MM at 10.5 NOK/USD")
+        elif u in ("bnok",):
+            fac_amount = v * 1000.0 / 10.5
+            assumptions.append("facility CAPEX BNOK → $MM at 10.5 NOK/USD")
+        elif u in ("bnusd", "busd"):
+            fac_amount = v * 1000.0
+        else:
+            fac_amount = v
+    else:
+        questions.append("What is the facility CAPEX (in $MM or MNOK)?")
+
+    # ---- fiscal & strategy ----
+    if _re.search(r"\bncs\b|norweg|norway|78\s?%", lo):
+        fiscal = "NCS (Norwegian shelf)"
+    elif _re.search(r"\bpsc\b|production sharing", lo):
+        fiscal = "PSC"
+    else:
+        fiscal = "Tax/Royalty"
+        assumptions.append("fiscal regime = Tax/Royalty (none stated)")
+    if _re.search(r"water injection|gas injection|\bwag\b|injection", lo):
+        strategy = "Injection"
+        assumptions.append(
+            "strategy = Injection. Demo mode does NOT auto-create injector "
+            "wells — add them in the YAML editor (injectors_df) if wanted.")
+    else:
+        strategy = "Depletion"
+
+    # ---- defaults for whatever is still missing ----
+    if n_wells is None:
+        n_wells = 4
+        assumptions.append("4 producers (default until answered)")
+    if qi is None:
+        qi = (8000.0 if units == "field" else 1300.0) if is_oil else \
+             (30000.0 if units == "field" else 850.0)
+        assumptions.append(f"initial rate per well = {qi:g} "
+                           "(default until answered)")
+    if start_date is None:
+        start_date = "2029-07-01"
+    if fac_amount is None:
+        fac_amount = 600.0
+        assumptions.append("facility CAPEX = $600MM (default until "
+                           "answered)")
+    if is_oil and ooip is None:
+        ooip = 120.0 if units == "field" else 19.0
+        assumptions.append(f"in-place = {ooip:g} (default until answered)")
+    if (not is_oil) and ogip is None:
+        ogip = 500.0 if units == "field" else 14.0
+        assumptions.append(f"gas in place = {ogip:g} (default until "
+                           "answered)")
+
+    rig_start = f"{int(start_date[:4]) - 1}-01-01"
+    fac_date = f"{int(start_date[:4]) - 1}-07-01"
+    producers = []
+    for i in range(int(n_wells)):
+        producers.append({
+            "name": f"P-{i+1:02d}", "rig": "Rig-A",
+            "drill_days": 60, "completion_days": 30,
+            "qi_primary": float(qi), "qi_secondary": 0.0,
+            "decline_model": "Exponential", "di_annual": 0.15,
+            "b_factor": 0.5, "wc_initial": 0.0, "wc_final": 0.7,
+            "wc_ramp_months": 60, "scale_factor": 1.0, "uptime": 0.95,
+        })
+    case = {"scalar": {"units": units, "fluid": fluid,
+                       "strategy": strategy, "start_date": start_date,
+                       "horizon": 25,
+                       "rf_target": 0.35 if is_oil else 0.65,
+                       "auto_scale_rf": True,
+                       "oil_price_bbl": 75.0, "gas_price_mmbtu": 10.0,
+                       "opex_fixed": 20.0, "disc": 0.10,
+                       "fiscal_regime": fiscal,
+                       "capex_well": 50.0, "well_cost_mode": "fixed",
+                       "aban_cost": 80.0, "co2_price": 80.0},
+            "tables": {
+                "rigs_df": [{"name": "Rig-A", "start_date": rig_start,
+                             "move_in_days": 30, "move_out_days": 15}],
+                "producers_df": producers,
+                "injectors_df": [],
+                "fac_df": [{"date": fac_date,
+                            "amount_MMUSD": float(fac_amount),
+                            "label": "Facility"}],
+            }}
+    if is_oil:
+        case["scalar"]["ooip"] = float(ooip)
+        case["scalar"]["opex_var_oil"] = 5.5
+    else:
+        case["scalar"]["ogip"] = float(ogip)
+        case["scalar"]["opex_var_gas"] = 0.9
+        if ooip:
+            case["scalar"]["ooip"] = float(ooip)
+    assumptions.append("rig schedule, decline (15%/yr exp), uptime 95%, "
+                       "prices $75/bbl · $10/MMBtu, well CAPEX $50MM, "
+                       "RF target & remaining economics = screening "
+                       "defaults — edit in the YAML below.")
+    yaml_text = _yaml.safe_dump(case, sort_keys=False,
+                                default_flow_style=False)
+    return {"yaml": yaml_text, "questions": questions,
+            "assumptions": assumptions}
+
+
 def case_from_text_section(default_start_date):
     """🤖 Case from text — describe a business case, get a runnable YAML."""
     st.markdown("## 🤖 Case from text")
@@ -17757,11 +18221,23 @@ def case_from_text_section(default_start_date):
     with st.expander("🔑 LLM provider & API key", expanded=True):
         pcol1, pcol2 = st.columns([1.2, 2])
         provider = pcol1.selectbox(
-            "Provider", ["OpenAI", "Azure OpenAI", "Anthropic Claude"],
+            "Provider", ["OpenAI", "Azure OpenAI", "Anthropic Claude",
+                         "🧪 Demo (offline — no key needed)"],
             key="nl_provider")
-        cfg = {"api_key": pcol2.text_input(
-            "API key (kept in this session only — never saved)",
-            type="password", key="nl_api_key")}
+        _is_demo = provider.startswith("🧪")
+        if _is_demo:
+            cfg = {"api_key": ""}
+            pcol2.info(
+                "**Demo mode** — a simple offline parser, no LLM, no API "
+                "key, nothing leaves the app. It catches plainly-stated "
+                "numbers (in-place, wells, rate, first oil, CAPEX) and "
+                "keywords (fluid, units, NCS, injection); the rest become "
+                "questions and screening defaults. For testing the "
+                "workflow — switch to a real LLM for free-form text.")
+        else:
+            cfg = {"api_key": pcol2.text_input(
+                "API key (kept in this session only — never saved)",
+                type="password", key="nl_api_key")}
         if provider == "OpenAI":
             cfg["model"] = pcol1.text_input("Model", value="gpt-4o",
                                             key="nl_openai_model")
@@ -17769,7 +18245,7 @@ def case_from_text_section(default_start_date):
             cfg["model"] = pcol1.text_input(
                 "Model", value="claude-sonnet-4-20250514",
                 key="nl_claude_model")
-        else:
+        elif provider == "Azure OpenAI":
             az1, az2, az3 = st.columns(3)
             cfg["endpoint"] = az1.text_input(
                 "Azure endpoint",
@@ -17795,10 +18271,17 @@ def case_from_text_section(default_start_date):
     bcol1, bcol2 = st.columns([1, 1])
     if bcol1.button("🤖 Extract YAML from text", type="primary",
                     disabled=not (case_text.strip()
-                                  and cfg.get("api_key", "").strip()),
+                                  and (_is_demo
+                                       or cfg.get("api_key", "").strip())),
                     key="nl_extract_btn"):
         st.session_state["nl_messages"] = [
             {"role": "user", "content": case_text}]
+        if _is_demo:
+            env = _nl_demo_envelope(case_text)
+            st.session_state["nl_yaml"] = env.get("yaml", "")
+            st.session_state["nl_questions"] = env.get("questions", [])
+            st.session_state["nl_assumptions"] = env.get("assumptions", [])
+            st.rerun()
         with st.spinner(f"Asking {provider}…"):
             content, err = _llm_chat(provider, cfg, _NL_SCHEMA_PROMPT,
                                      st.session_state["nl_messages"])
@@ -17839,6 +18322,21 @@ def case_from_text_section(default_start_date):
                  "content": ("Answers to your questions:\n"
                              + "\n".join(answers)
                              + "\nReturn the updated full JSON envelope.")})
+            if _is_demo:
+                # Re-run the offline extractor over the original text plus
+                # the answers — its regexes pick the numbers/keywords out of
+                # the answer lines the same way.
+                _orig = next((mm["content"] for mm in
+                              st.session_state["nl_messages"]
+                              if mm["role"] == "user"), "")
+                env = _nl_demo_envelope(_orig + "\n" + "\n".join(answers))
+                st.session_state["nl_yaml"] = env.get("yaml", "")
+                st.session_state["nl_questions"] = env.get("questions", [])
+                st.session_state["nl_assumptions"] = env.get(
+                    "assumptions", [])
+                for i in range(len(qs)):
+                    st.session_state.pop(f"nl_q_{i}", None)
+                st.rerun()
             with st.spinner(f"Refining with {provider}…"):
                 content, err = _llm_chat(provider, cfg, _NL_SCHEMA_PROMPT,
                                          st.session_state["nl_messages"])
@@ -21041,11 +21539,30 @@ def concept_selector_section(default_start_date):
 
             if not chart_rows:
                 st.info("Selected concepts have no successful results.")
+                st.session_state.pop("_concept_cc_fig", None)
+                st.session_state.pop("_concept_cc_sig", None)
             else:
-                # Build the figure: NPV markers on the left axis, emissions
-                # bars on the right axis, both keyed by CAPEX on the x.
-                fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
-
+                # Signature of everything the comparison figure depends on.
+                # Only rebuild the (expensive) Plotly figure when this
+                # changes; an unrelated rerun (e.g. setting a qualitative
+                # colour) reuses the cached figure instead.
+                import hashlib as _hl
+                _ccsh = _hl.md5()
+                _ccsh.update(str(grouping_dim).encode())
+                for _r in chart_rows:
+                    _ccsh.update((
+                        f"{_r.get('concept')}|{_r.get('p90')}|"
+                        f"{_r.get('mean')}|{_r.get('p10')}|"
+                        f"{_r.get('capex_disc_MM')}|{_r.get('emissions_Mt')}|"
+                        f"{_r.get('breakeven_oil')}|{_r.get('pareto')}|"
+                        f"{_r.get('is_reference')}|{_r.get('probabilistic')}"
+                    ).encode())
+                _cc_sig = _ccsh.hexdigest()
+                _need_build = (st.session_state.get("_concept_cc_sig")
+                               != _cc_sig
+                               or st.session_state.get("_concept_cc_fig")
+                               is None)
+            if chart_rows and _need_build:
                 # Build the figure: NPV markers on the left axis, emissions
                 # bars on the right axis, both keyed by CAPEX on the x.
                 fig_cc = make_subplots(specs=[[{"secondary_y": True}]])
@@ -21089,15 +21606,20 @@ def concept_selector_section(default_start_date):
                             "NPV P10: $%{y:,.0f}MM<extra></extra>"),
                         customdata=[r["concept"] for r in chart_rows],
                     ), secondary_y=False)
-                    # Vertical bracket lines connecting P90 → P10 per concept
+                    # Vertical bracket lines connecting P90 → P10 per concept.
+                    # Drawn as ONE trace with None separators instead of one
+                    # trace per concept — far fewer Plotly objects, so the
+                    # chart builds and renders noticeably faster when many
+                    # concepts are present.
+                    _bx, _by = [], []
                     for r in chart_rows:
-                        fig_cc.add_trace(go.Scatter(
-                            x=[r["capex_disc_MM"], r["capex_disc_MM"]],
-                            y=[r["p90"], r["p10"]],
-                            mode="lines",
-                            line=dict(color="#888", width=1, dash="dot"),
-                            showlegend=False, hoverinfo="skip",
-                        ), secondary_y=False)
+                        _bx += [r["capex_disc_MM"], r["capex_disc_MM"], None]
+                        _by += [r["p90"], r["p10"], None]
+                    fig_cc.add_trace(go.Scatter(
+                        x=_bx, y=_by, mode="lines",
+                        line=dict(color="#888", width=1, dash="dot"),
+                        showlegend=False, hoverinfo="skip",
+                    ), secondary_y=False)
 
                 # Mean — the main labelled point (always shown). The concept
                 # label sits beside it; the P10/P90 are unlabeled markers.
@@ -21209,7 +21731,18 @@ def concept_selector_section(default_start_date):
                 # Reference horizontal zero-NPV line
                 fig_cc.add_hline(y=0, line=dict(color="grey", dash="dot"),
                                   secondary_y=False)
-                st.plotly_chart(fh.apply_plot_template(fig_cc),
+                st.session_state["_concept_cc_fig"] = fig_cc
+                st.session_state["_concept_cc_sig"] = _cc_sig
+
+            # Render the comparison figure (freshly built above, or the cached
+            # one when only an unrelated widget — e.g. a qualitative colour —
+            # changed). Building this Plotly figure and serialising it is the
+            # main cost behind the "NPV vs CAPEX is slow" lag; skipping the
+            # rebuild on unrelated reruns keeps colour-setting responsive.
+            _fig_show = (st.session_state.get("_concept_cc_fig")
+                         if chart_rows else None)
+            if _fig_show is not None:
+                st.plotly_chart(fh.apply_plot_template(_fig_show),
                                 use_container_width=True)
                 _any_prob = any(r.get("probabilistic")
                                  for r in chart_rows)

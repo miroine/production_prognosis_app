@@ -4618,9 +4618,32 @@ def build_development_concept(spec: dict) -> dict:
         slot_capacity = _TEMPLATE_SLOT_CAPACITY.get(template_type, 4)
         per_template_cost = _TEMPLATE_SLOT_COST.get(template_type,
                                                     _TEMPLATE_COST)
-        cost_templates = n_templates * per_template_cost * hpht_uplift
-        _push(0, cost_templates,
-              f"{n_templates} × {template_type} template/manifold{_hpht_sfx}")
+        # Cost-integrity fix: the template/manifold structure must host every
+        # subsea well. If the user-entered template count provides fewer slots
+        # than there are subsea wells, the previous behaviour kept the cost at
+        # the entered count (under-costing the structure by whole templates)
+        # and only emitted a warning. Here we cost the templates ACTUALLY
+        # NEEDED to host the wells — max(entered, ceil(wells / slots)) — so the
+        # subsea facility cost scales correctly with the well count. The
+        # validation warning still fires so the user sees the design was
+        # under-specified, but the CAPEX no longer silently understates it.
+        _n_templates_needed = (
+            -(-int(n_subsea_wells) // max(1, slot_capacity))
+            if n_subsea_wells > 0 else 0)
+        _n_templates_costed = max(int(n_templates), _n_templates_needed)
+        cost_templates = _n_templates_costed * per_template_cost * hpht_uplift
+        if _n_templates_costed > int(n_templates):
+            _push(0, cost_templates,
+                  f"{_n_templates_costed} × {template_type} "
+                  f"template/manifold{_hpht_sfx} "
+                  f"(auto-scaled from {n_templates} to host "
+                  f"{n_subsea_wells} wells)")
+        else:
+            _push(0, cost_templates,
+                  f"{_n_templates_costed} × {template_type} "
+                  f"template/manifold{_hpht_sfx}")
+        # Use the costed count downstream (HIPPS-per-template, slot totals).
+        n_templates = _n_templates_costed
         detail_flowline_km = 0.0
         detail_umbilical_km = 0.0
 
