@@ -356,6 +356,37 @@ check("SURF: 12 wells → 3×4-slot = $210MM", _surf_tmpl_cost(1, 12), 210.0,
 check("SURF: 4 wells on 1 template unchanged = $70MM",
       _surf_tmpl_cost(1, 4), 70.0, tol=0.01)
 
+# Profitability index = NPV ÷ discounted CAPEX, surfaced in run_payload_case.
+import fp_helpers as _fh2
+_p, _ = _fh2.yaml_to_payload(
+    open("test_fixtures/reference_gascond.yaml").read())
+_r = m.run_payload_case(_p, date(2029, 12, 2))
+_k = _r["kpis"]
+_pi = _k.get("profitability_index")
+check("PI present in KPIs", _pi is not None, True)
+if _pi is not None and _k.get("capex_disc_MM"):
+    check("PI = NPV / discounted CAPEX", _pi,
+          _k["npv_MM"] / _k["capex_disc_MM"], tol=1e-6, rel=True)
+
+# Concept-study-from-text: outline round-trip + study run.
+_study_env = m._nl_demo_study_envelope(
+    "Compare tie-back vs FPSO, depletion vs water injection, 4 to 8 "
+    "producers, 120 MMbbl NCS oil field, first oil 2029, metric.")
+check("study: dimensions proposed", len(_study_env["dimensions"]) >= 3, True)
+_outline = m._nl_dimensions_to_text(_study_env["dimensions"])
+_parsed = m._nl_parse_outline(_outline)
+check("study: outline round-trips dimension count",
+      len(_parsed), len(_study_env["dimensions"]))
+# Patch survives the text round-trip (injection option keeps its patches).
+_wi = [o for d in _parsed for o in d["options"]
+       if "injection" in o["label"].lower()]
+check("study: injection patch preserved through outline",
+      bool(_wi and _wi[0]["patches"]), True)
+_bp, _ = _fh2.yaml_to_payload(_study_env["base_yaml"])
+_sr, _sel = m._nl_run_study(_bp, _parsed, date(2029, 7, 1))
+check("study: every option ran ok",
+      all(v.get("ok") for v in _sr.values()), True)
+
 _stea_csv = (
     "year,oil_MSm3,gas_GSm3,ngl_MTPA,capex_MNOK,opex_MNOK,"
     "abandonment_MNOK,co2_MTPA\n"

@@ -44,6 +44,8 @@ from plotly.subplots import make_subplots
 import fp_helpers as fh
 # Pure economics mapping (Streamlit-free; see module docstring)
 import fp_economics as _fp_econ
+# Pure decision-analysis engine (influence diagram → tree → rollback/EVPI)
+import fp_decision as fdz
 
 # =============================================================================
 # Build stamp — so the running version is unambiguous in the UI
@@ -10653,6 +10655,484 @@ def validate_inputs(asm: FieldAssumptions, econ: EconInputs,
             st.info(m)
 
 
+def _dz_influence_svg(diagram):
+    """Render the influence diagram as an SVG: decision nodes (gold), chance
+    nodes (teal), value node (pistachio), laid out left→right by their order
+    in the sequence (value last). Arrows follow the sequence and the CPT
+    parents. Mirrors the Prisma look without a drag canvas."""
+    import html as _html
+    seq = list(diagram.sequence)
+    # Column index by sequence position; value node in the final column.
+    cols = {nm: i for i, nm in enumerate(seq)}
+    val_col = len(seq)
+    n_cols = val_col + 1
+    col_w, row_h = 230, 110
+    box_w, box_h = 190, 78
+    # Stack nodes vertically within a column when several share a rank — here
+    # each sequence node gets its own column, so one row; value node centered.
+    height = max(1, 1) * row_h + 60
+    width = n_cols * col_w + 40
+
+    def _x(c):
+        return 20 + c * col_w
+
+    y0 = 30
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+             f'height="{height}" viewBox="0 0 {width} {height}" '
+             f'font-family="Inter,Segoe UI,Arial">']
+    parts.append('<defs><marker id="dzarrow" markerWidth="10" '
+                 'markerHeight="10" refX="8" refY="3" orient="auto">'
+                 '<path d="M0,0 L8,3 L0,6 Z" fill="#7fd4e8"/></marker></defs>')
+
+    centers = {}
+    # node boxes
+    for nm in seq:
+        c = cols[nm]
+        kind = diagram.node_kind(nm)
+        x, y = _x(c), y0
+        cx, cy = x + box_w / 2, y + box_h / 2
+        centers[nm] = (x, y, cx, cy)
+        if kind == "decision":
+            fill, stroke, tag = "#1b2a3a", "#E0A500", "Decision"
+        else:
+            fill, stroke, tag = "#0f2230", "#3aa6c4", "Uncertainty"
+        n_states = len(diagram.states_of(nm))
+        parts.append(
+            f'<rect x="{x}" y="{y}" width="{box_w}" height="{box_h}" rx="8" '
+            f'fill="{fill}" stroke="{stroke}" stroke-width="2"/>')
+        parts.append(
+            f'<text x="{x+10}" y="{y+18}" fill="#9fb4c4" font-size="10">'
+            f'{tag}</text>')
+        parts.append(
+            f'<text x="{x+10}" y="{y+40}" fill="#ffffff" font-size="13" '
+            f'font-weight="bold">{_html.escape(nm[:24])}</text>')
+        parts.append(
+            f'<text x="{x+10}" y="{y+62}" fill="#7fa0b4" font-size="10">'
+            f'{n_states} {"options" if kind=="decision" else "outcomes"}'
+            f'</text>')
+    # value node
+    vx, vy = _x(val_col), y0
+    vcx, vcy = vx + box_w / 2, vy + box_h / 2
+    centers["__value__"] = (vx, vy, vcx, vcy)
+    parts.append(
+        f'<rect x="{vx}" y="{vy}" width="{box_w}" height="{box_h}" rx="8" '
+        f'fill="#13301a" stroke="#9DBA00" stroke-width="2"/>')
+    parts.append(f'<text x="{vx+10}" y="{vy+18}" fill="#bcd06a" '
+                 f'font-size="10">Utility</text>')
+    parts.append(f'<text x="{vx+10}" y="{vy+42}" fill="#ffffff" '
+                 f'font-size="13" font-weight="bold">'
+                 f'{_html.escape(diagram.value.name[:22])}</text>')
+
+    def _edge(a, b):
+        ax, ay, acx, acy = centers[a]
+        bx, by, bcx, bcy = centers[b]
+        x1 = ax + box_w
+        x2 = bx
+        parts.append(
+            f'<path d="M{x1},{acy} C{(x1+x2)/2},{acy} {(x1+x2)/2},{bcy} '
+            f'{x2-2},{bcy}" stroke="#7fd4e8" stroke-width="2" fill="none" '
+            f'marker-end="url(#dzarrow)"/>')
+
+    # sequence arrows (each node → next) and every node → value
+    for i in range(len(seq) - 1):
+        _edge(seq[i], seq[i + 1])
+    for nm in seq:
+        _edge(nm, "__value__")
+    # CPT parent arrows (parent chance → child chance)
+    for nm, cnode in diagram.chances.items():
+        for par in cnode.parents:
+            if par in centers and nm in centers:
+                _edge(par, nm)
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _dz_tree_svg(tree, max_depth=6):
+    """Render the compiled decision tree as a left→right SVG. Decision nodes
+    are gold squares, chance nodes teal circles, leaves show their value. The
+    optimal branch out of each decision is drawn thick/gold."""
+    import html as _html
+    # First pass: assign y positions to leaves, then parents = mean of kids.
+    leaf_gap = 26
+    x_step = 150
+    counter = {"y": 20}
+
+    def layout(node, depth):
+        if node.kind == "leaf" or depth >= max_depth:
+            y = counter["y"]
+            counter["y"] += leaf_gap
+            node._y = y
+            node._x = 20 + depth * x_step
+            return y
+        ys = []
+        for _, _, ch in node.branches:
+            ys.append(layout(ch, depth + 1))
+        node._y = sum(ys) / len(ys) if ys else counter["y"]
+        node._x = 20 + depth * x_step
+        return node._y
+
+    layout(tree, 0)
+    height = counter["y"] + 20
+    width = (max_depth + 1) * x_step + 120
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+             f'height="{height}" viewBox="0 0 {width} {height}" '
+             f'font-family="Inter,Segoe UI,Arial">']
+
+    def draw(node, depth, parent_xy=None, edge_label="", prob=None,
+             is_opt=False):
+        x, y = node._x, node._y
+        if parent_xy is not None:
+            px, py = parent_xy
+            col = "#E0A500" if is_opt else "#6f8aa0"
+            w = 3 if is_opt else 1.5
+            parts.append(
+                f'<path d="M{px},{py} C{(px+x)/2},{py} {(px+x)/2},{y} '
+                f'{x},{y}" stroke="{col}" stroke-width="{w}" fill="none"/>')
+            lbl = _html.escape(str(edge_label)[:16])
+            if prob is not None:
+                lbl += f" ({prob:.2f})"
+            parts.append(
+                f'<text x="{(px+x)/2}" y="{(py+y)/2-3}" fill="#9fb4c4" '
+                f'font-size="9" text-anchor="middle">{lbl}</text>')
+        if node.kind == "leaf" or depth >= max_depth:
+            v = node.value or 0.0
+            parts.append(f'<circle cx="{x}" cy="{y}" r="4" fill="#9DBA00"/>')
+            parts.append(
+                f'<text x="{x+8}" y="{y+4}" fill="#dfe8c0" font-size="10">'
+                f'{v:,.0f}</text>')
+            return
+        if node.kind == "decision":
+            parts.append(
+                f'<rect x="{x-7}" y="{y-7}" width="14" height="14" '
+                f'fill="#E0A500"/>')
+        else:
+            parts.append(
+                f'<circle cx="{x}" cy="{y}" r="7" fill="#3aa6c4"/>')
+        if node.value is not None:
+            parts.append(
+                f'<text x="{x-10}" y="{y-10}" fill="#cfe0ec" font-size="9" '
+                f'text-anchor="end">{node.value:,.0f}</text>')
+        parts.append(
+            f'<text x="{x}" y="{y-12}" fill="#ffffff" font-size="9" '
+            f'text-anchor="middle">{_html.escape(node.label[:14])}</text>')
+        for i, (blabel, bprob, ch) in enumerate(node.branches):
+            opt = (node.kind == "decision" and node.optimal_branch == i)
+            draw(ch, depth + 1, (x, y), blabel, bprob, opt)
+
+    draw(tree, 0)
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _dz_get_diagram():
+    """Build an InfluenceDiagram from the session-state editor tables."""
+    decisions = {}
+    for d in st.session_state.get("dz_decisions", []):
+        nm = str(d.get("name", "")).strip()
+        opts = [o.strip() for o in str(d.get("options", "")).split(",")
+                if o.strip()]
+        if nm and opts:
+            decisions[nm] = fdz.DecisionNode(nm, opts)
+    chances = {}
+    for c in st.session_state.get("dz_chances", []):
+        nm = str(c.get("name", "")).strip()
+        outs = [o.strip() for o in str(c.get("outcomes", "")).split(",")
+                if o.strip()]
+        pars = [p.strip() for p in str(c.get("parents", "")).split(",")
+                if p.strip()]
+        if nm and outs:
+            cpt = st.session_state.get("dz_cpt", {}).get(nm, {})
+            chances[nm] = fdz.ChanceNode(nm, outs, parents=pars, cpt=cpt)
+    val = fdz.ValueNode(
+        st.session_state.get("dz_value_name", "NPV"),
+        st.session_state.get("dz_value_units", "$MM"))
+    seq = [s for s in st.session_state.get("dz_sequence", [])
+           if s in decisions or s in chances]
+    return fdz.InfluenceDiagram(
+        decisions=decisions, chances=chances, value=val, sequence=seq,
+        leaf_values=st.session_state.get("dz_leaf_values", {}))
+
+
+def _dz_seed_example():
+    """Seed the classic Drill / Don't decision as a starting example."""
+    st.session_state["dz_decisions"] = [
+        {"name": "Drill?", "options": "Drill, Don't"}]
+    st.session_state["dz_chances"] = [
+        {"name": "Reservoir", "outcomes": "Wet, Dry", "parents": ""}]
+    st.session_state["dz_cpt"] = {"Reservoir": {(): [0.6, 0.4]}}
+    st.session_state["dz_sequence"] = ["Drill?", "Reservoir"]
+    st.session_state["dz_value_name"] = "NPV"
+    st.session_state["dz_value_units"] = "$MM"
+    st.session_state["dz_leaf_values"] = {
+        fdz.leaf_key([("Drill?", "Drill"), ("Reservoir", "Wet")]): 200.0,
+        fdz.leaf_key([("Drill?", "Drill"), ("Reservoir", "Dry")]): -120.0,
+        fdz.leaf_key([("Drill?", "Don't"), ("Reservoir", "Wet")]): 0.0,
+        fdz.leaf_key([("Drill?", "Don't"), ("Reservoir", "Dry")]): 0.0,
+    }
+
+
+def decision_tree_section():
+    """🎯 Decision tree — influence-diagram editor + tree solver."""
+    st.markdown("## 🎯 Decision tree & influence diagram")
+    st.caption(
+        "Build a discrete influence diagram — decision nodes (choices), "
+        "uncertainty nodes (outcomes with probabilities, optionally "
+        "conditional on parents), and a value node — then compile it to a "
+        "decision tree and solve it: expected value, optimal policy, EVPI "
+        "and Bayesian belief updating. Leaf values are typed in or pulled "
+        "from a Concept Selector result (engine-linked NPV). Editing is via "
+        "tables; the diagram and tree are drawn automatically.")
+
+    if "dz_decisions" not in st.session_state:
+        _dz_seed_example()
+
+    tcol1, tcol2 = st.columns([1, 4])
+    if tcol1.button("🧪 Load example", key="dz_example"):
+        _dz_seed_example()
+        st.rerun()
+    if tcol2.button("🧹 Clear all", key="dz_clear"):
+        for k in ("dz_decisions", "dz_chances", "dz_cpt", "dz_sequence",
+                  "dz_leaf_values", "dz_value_name", "dz_value_units"):
+            st.session_state.pop(k, None)
+        st.rerun()
+
+    # ---- Node editors ----
+    st.markdown("#### 1 · Nodes")
+    ec1, ec2 = st.columns(2)
+    with ec1:
+        st.markdown("**Decision nodes** (comma-separated options)")
+        dec_df = st.data_editor(
+            pd.DataFrame(st.session_state["dz_decisions"]),
+            num_rows="dynamic", use_container_width=True,
+            key="dz_dec_editor",
+            column_config={
+                "name": st.column_config.TextColumn("Decision name"),
+                "options": st.column_config.TextColumn(
+                    "Options (comma-sep)")})
+        st.session_state["dz_decisions"] = dec_df.to_dict("records")
+    with ec2:
+        st.markdown("**Uncertainty nodes** (outcomes + optional parents)")
+        ch_df = st.data_editor(
+            pd.DataFrame(st.session_state["dz_chances"]),
+            num_rows="dynamic", use_container_width=True,
+            key="dz_ch_editor",
+            column_config={
+                "name": st.column_config.TextColumn("Chance name"),
+                "outcomes": st.column_config.TextColumn(
+                    "Outcomes (comma-sep)"),
+                "parents": st.column_config.TextColumn(
+                    "Parents (comma-sep chance names)")})
+        st.session_state["dz_chances"] = ch_df.to_dict("records")
+
+    vc1, vc2 = st.columns(2)
+    st.session_state["dz_value_name"] = vc1.text_input(
+        "Value node name", value=st.session_state.get("dz_value_name",
+                                                       "NPV"),
+        key="dz_val_name_in")
+    st.session_state["dz_value_units"] = vc2.text_input(
+        "Value units", value=st.session_state.get("dz_value_units", "$MM"),
+        key="dz_val_units_in")
+
+    # ---- Sequence / ordering ----
+    st.markdown("#### 2 · Sequence (decision/observation order along a "
+                "branch)")
+    all_nodes = ([d["name"] for d in st.session_state["dz_decisions"]
+                  if d.get("name")]
+                 + [c["name"] for c in st.session_state["dz_chances"]
+                    if c.get("name")])
+    seq_default = [s for s in st.session_state.get("dz_sequence", [])
+                   if s in all_nodes] or all_nodes
+    st.session_state["dz_sequence"] = st.multiselect(
+        "Order nodes left→right. A chance node placed BEFORE a decision is "
+        "observed before that decision (informational arc).",
+        options=all_nodes, default=seq_default, key="dz_seq_in")
+
+    # ---- CPT editor for chance nodes with parents ----
+    diagram = _dz_get_diagram()
+    cpt_nodes = [c for c in diagram.chances.values() if c.parents]
+    plain_nodes = [c for c in diagram.chances.values() if not c.parents]
+    if plain_nodes or cpt_nodes:
+        st.markdown("#### 3 · Probabilities")
+    st.session_state.setdefault("dz_cpt", {})
+    # Unconditional chance nodes — simple probability row.
+    for c in plain_nodes:
+        st.markdown(f"**{c.name}** — P(outcome)")
+        cur = st.session_state["dz_cpt"].get(c.name, {}).get(
+            (), [1.0 / len(c.outcomes)] * len(c.outcomes))
+        row = {o: [cur[i] if i < len(cur) else 0.0]
+               for i, o in enumerate(c.outcomes)}
+        edf = st.data_editor(pd.DataFrame(row), hide_index=True,
+                             use_container_width=True,
+                             key=f"dz_p_{c.name}")
+        probs = [float(edf.iloc[0][o]) for o in c.outcomes]
+        st.session_state["dz_cpt"].setdefault(c.name, {})[()] = probs
+    # Conditional chance nodes — a CPT row per parent-state combination.
+    for c in cpt_nodes:
+        st.markdown(f"**{c.name}** — P({', '.join(c.outcomes)} | "
+                    f"{', '.join(c.parents)})")
+        parent_states = [diagram.states_of(p) for p in c.parents]
+        from itertools import product as _prod
+        rows = []
+        keys = []
+        for combo in _prod(*parent_states):
+            keys.append(combo)
+            cur = st.session_state["dz_cpt"].get(c.name, {}).get(
+                combo, [1.0 / len(c.outcomes)] * len(c.outcomes))
+            r = {p: combo[i] for i, p in enumerate(c.parents)}
+            for i, o in enumerate(c.outcomes):
+                r[o] = cur[i] if i < len(cur) else 0.0
+            rows.append(r)
+        cdf = st.data_editor(pd.DataFrame(rows), hide_index=True,
+                             use_container_width=True,
+                             key=f"dz_cpt_{c.name}",
+                             disabled=c.parents)
+        new_cpt = {}
+        for j, combo in enumerate(keys):
+            new_cpt[combo] = [float(cdf.iloc[j][o]) for o in c.outcomes]
+        st.session_state["dz_cpt"][c.name] = new_cpt
+
+    # rebuild with fresh CPTs
+    diagram = _dz_get_diagram()
+
+    # ---- Influence diagram SVG ----
+    st.markdown("#### 4 · Influence diagram")
+    problems = diagram.validate()
+    if problems:
+        st.warning("Diagram issues:\n\n- " + "\n- ".join(problems))
+    if diagram.sequence:
+        svg = _dz_influence_svg(diagram)
+        st.markdown(
+            f'<div style="overflow-x:auto;width:100%">{svg}</div>',
+            unsafe_allow_html=True)
+
+    # ---- Leaf values (typed or engine-linked) ----
+    st.markdown("#### 5 · Leaf values")
+    st.caption("One row per tree leaf (full scenario). Type a value, or pull "
+               "an NPV from a Concept Selector result.")
+    # engine-linked source options from concept_results
+    cres = st.session_state.get("concept_results", {}) or {}
+    linkable = {f"{r.get('dim','?')} · {r.get('label','?')}": r.get("npv_MM")
+                for r in cres.values()
+                if r.get("ok") and r.get("npv_MM") is not None}
+    leaves = fdz.enumerate_leaves(diagram)
+    st.session_state.setdefault("dz_leaf_values", {})
+    if leaves and diagram.sequence:
+        if st.button("🔗 Fill missing leaves with 0", key="dz_fill0"):
+            for scn in leaves:
+                k = fdz.leaf_key(scn)
+                st.session_state["dz_leaf_values"].setdefault(k, 0.0)
+            st.rerun()
+        with st.expander(f"✏️ Edit {len(leaves)} leaf value(s)",
+                         expanded=len(leaves) <= 16):
+            link_opts = ["(type below)"] + list(linkable.keys())
+            for scn in leaves:
+                k = fdz.leaf_key(scn)
+                label = "  →  ".join(f"{n}={s}" for n, s in scn)
+                lc1, lc2 = st.columns([3, 2])
+                cur_v = float(st.session_state["dz_leaf_values"].get(k, 0.0))
+                v = lc1.number_input(label, value=cur_v, step=10.0,
+                                     key=f"dz_lv_{hash(k)}")
+                if linkable:
+                    pick = lc2.selectbox(
+                        "link", link_opts, key=f"dz_lk_{hash(k)}",
+                        label_visibility="collapsed")
+                    if pick != "(type below)":
+                        v = float(linkable[pick])
+                st.session_state["dz_leaf_values"][k] = float(v)
+
+    # ---- Solve ----
+    st.markdown("#### 6 · Solve")
+    diagram = _dz_get_diagram()
+    if st.button("🧮 Calculate decision tree", type="primary",
+                 key="dz_solve"):
+        st.session_state["dz_solved"] = True
+        st.rerun()
+
+    if st.session_state.get("dz_solved") and diagram.sequence \
+            and not diagram.validate():
+        try:
+            tree = fdz.compile_tree(diagram)
+            ev = fdz.rollback(tree, maximize=True)
+            policy = fdz.optimal_policy(tree)
+            stats = fdz.tree_stats(tree)
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric(f"Expected value ({diagram.value.units})",
+                       f"{ev:,.1f}")
+            mc2.metric("Tree leaves", stats["leaves"])
+            mc3.metric("Optimal first decision",
+                       next(iter(policy.values()), "—") if policy else "—")
+            if policy:
+                st.success("**Optimal policy:** "
+                           + " · ".join(f"{k} → **{v}**"
+                                        for k, v in policy.items()))
+            st.markdown("##### Decision tree")
+            tsvg = _dz_tree_svg(tree)
+            st.markdown(
+                f'<div style="overflow-x:auto;width:100%">{tsvg}</div>',
+                unsafe_allow_html=True)
+            st.caption("Gold squares = decisions (thick gold branch = "
+                       "optimal), teal circles = chance nodes (branch "
+                       "probabilities shown), green dots = leaf values. "
+                       "Node numbers are rolled-back expected values.")
+
+            # ---- EVPI ----
+            if diagram.chances:
+                st.markdown("##### Value of information (EVPI)")
+                evpi_rows = []
+                for cn in diagram.chances:
+                    try:
+                        e = fdz.evpi_on_chance(diagram, cn, maximize=True)
+                        evpi_rows.append({
+                            "Uncertainty": cn,
+                            "EV (no info)": round(e["ev_base"], 1),
+                            "EV (perfect info)": round(e["ev_perfect"], 1),
+                            "EVPI": round(e["evpi"], 1)})
+                    except Exception:
+                        continue
+                if evpi_rows:
+                    st.dataframe(
+                        pd.DataFrame(evpi_rows).sort_values(
+                            "EVPI", ascending=False),
+                        use_container_width=True, hide_index=True)
+                    st.caption("**EVPI** = the most you'd pay to resolve each "
+                               "uncertainty *before* deciding. The highest "
+                               "EVPI points to where appraisal / data "
+                               "acquisition is worth most.")
+        except Exception as e:
+            st.error(f"Could not solve the tree: {e}")
+
+    # ---- Bayesian belief updating ----
+    if any(c.parents for c in diagram.chances.values()):
+        st.markdown("#### 7 · Bayesian belief updating")
+        st.caption("Observe an outcome of a conditional uncertainty and see "
+                   "the posterior over its parent(s).")
+        cond = [c for c in diagram.chances.values() if c.parents]
+        cnames = [c.name for c in cond]
+        sel = st.selectbox("Observed uncertainty", cnames, key="dz_obs_node")
+        cobj = diagram.chances[sel]
+        obs = st.selectbox("Observed outcome", cobj.outcomes,
+                           key="dz_obs_out")
+        # parent priors from each parent's own (marginal) distribution
+        priors = {}
+        for par in cobj.parents:
+            pobj = diagram.chances.get(par)
+            if pobj is not None:
+                dist = pobj.distribution({})
+                priors[par] = {st_: dist[i]
+                               for i, st_ in enumerate(pobj.outcomes)}
+        if st.button("↻ Update beliefs", key="dz_bayes"):
+            post = fdz.joint_to_posterior(cobj, {}, obs, priors)
+            for par, pp in post.items():
+                st.markdown(f"**Posterior over {par}** given "
+                            f"{sel}={obs}:")
+                st.dataframe(
+                    pd.DataFrame([{"State": s, "Prior": round(
+                        priors[par][s], 3), "Posterior": round(v, 3)}
+                        for s, v in pp.items()]),
+                    use_container_width=True, hide_index=True)
+
+
 def main():
     # ---- Styling ----
     st.markdown(fh.APP_CSS, unsafe_allow_html=True)
@@ -10737,7 +11217,7 @@ def main():
     # Guard against a stale persisted value from before the page was renamed
     # (an unknown active_page would make st.radio raise).
     _page_opts = ["🛢️ Business case builder", "🌳 Concept Selector",
-                  "🤖 Case from text"]
+                  "🤖 Case from text", "🎯 Decision tree"]
     if st.session_state.get("active_page") not in _page_opts:
         st.session_state["active_page"] = _page_opts[0]
     page = st.sidebar.radio(
@@ -10749,8 +11229,23 @@ def main():
              "each option links to its own case (YAML or saved case) and "
              "the batch runs them one by one. "
              "Case from text — describe a business case in plain language "
-             "and let an LLM (your own API key) build a runnable YAML case.")
+             "and let an LLM (your own API key) build a runnable YAML case. "
+             "Decision tree — build an influence diagram (decision / chance / "
+             "value nodes), compile it to a decision tree, and solve it "
+             "(expected value, optimal policy, EVPI, Bayesian updating).")
     st.sidebar.markdown("---")
+    if page == "🎯 Decision tree":
+        decision_tree_section()
+        st.markdown(
+            f"""
+            <div class="app-footer">
+                <b>FieldVista</b> — Decision tree ·
+                © 2026 <b>Merouane Hamdani</b> · MIT License
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
     if page == "🤖 Case from text":
         # Standalone page — natural-language case builder.
         case_from_text_section(date.today())
@@ -14139,6 +14634,13 @@ def run_payload_case(payload: dict, default_start_date,
             "breakeven_oil": be_oil,
             "capex_disc_MM": capex_disc_MM,
             "capex_total_MM": capex_total_MM,
+            # Profitability index (PI) = NPV ÷ discounted CAPEX — value created
+            # per dollar of (discounted) capital invested. PI > 0 is value-
+            # accretive; the investment-ratio convention (1 + NPV/CAPEX) is
+            # PI + 1. None when CAPEX is ~0 (e.g. a pure tariff case).
+            "profitability_index": (
+                float(npv_MM) / float(capex_disc_MM)
+                if capex_disc_MM and abs(capex_disc_MM) > 1e-9 else None),
             "capex_well_MM": capex_well_MM,
             "capex_facility_MM": capex_fac_MM,
             "capex_abandonment_MM": capex_aban_MM,
@@ -17834,6 +18336,104 @@ def _llm_chat(provider: str, cfg: dict, system: str, messages: list):
         return None, f"LLM call failed: {e}"
 
 
+_NL_STUDY_PROMPT = """You translate a petroleum CONCEPT-SCREENING idea into a \
+concept-selector study for a screening tool. The user describes several \
+development concepts (or the axes they want to compare). You produce a BASE \
+case plus a set of decision DIMENSIONS, each with discrete OPTIONS, exactly \
+like an NCS DG1 'hanging garden'. Respond with ONLY a JSON object (no markdown \
+fences, no prose):
+{"base_yaml": "<a base-case YAML string, same schema as a single case>",
+ "dimensions": [
+    {"name": "<dimension, e.g. Drainage strategy>",
+     "options": [
+        {"label": "<option, e.g. Water injection>",
+         "description": "<short>",
+         "patches": {"<key>": <value>, ...}}    // overrides vs the base case
+     ]}
+ ],
+ "questions": ["<question for each missing/ambiguous REQUIRED item>"],
+ "assumptions": ["<each default you assumed>"]}
+
+The base_yaml uses scalar: + tables: exactly like a single case (units, fluid,
+strategy, start_date, ooip/ogip, prices, fiscal regime, producers_df, fac_df,
+etc.). Each option's `patches` is a flat dict of overrides applied ON TOP of
+the base case for that option. Patch keys are the same scalar keys
+(oil_price_bbl, gas_price_mmbtu, rf_target, disc, fiscal_regime, opex_fixed,
+…) PLUS these special keys for structure:
+  _n_producers_override: <int>          set the producer count
+  _facility_capex_override_MM: <number> set total facility CAPEX ($MM)
+  _rf_multiplier: <0.8-1.3>             recovery uplift (injection raises RF)
+  _n_injectors_override: <int>          add N injectors (for injection options)
+
+Typical dimensions: Drainage strategy (Depletion / Water injection / Gas
+injection / WAG), Number of producers (4 / 6 / 8 wells via
+_n_producers_override), Host facility (Tie-back / New FPSO / Jacket via
+_facility_capex_override_MM), Oil price scenario (Low/Base/High via
+oil_price_bbl). Give each dimension 2-5 options. Use the user's stated unit
+system. Ask a question for every REQUIRED base-case field the text doesn't
+give; list every default in "assumptions". Numbers are plain (no units)."""
+
+
+def _nl_run_study(base_payload: dict, dimensions: list, start_date):
+    """Run one case per option (option patch applied on the base case) and
+    return (results_dict, selected) ready for the garden + analysis views.
+
+    results keyed by (dim_name, option_label) with the fields the garden and
+    comparison views read (dim, label, npv_MM, breakeven_oil, capex_*). This
+    mirrors the Concept Selector's one-case-per-option batch."""
+    results = {}
+    selected = {}
+    for di, d in enumerate(dimensions):
+        opts = d.get("options", [])
+        selected[di] = set(range(len(opts)))
+        for oi, o in enumerate(opts):
+            label = o.get("label", f"Option {oi+1}")
+            picks = [{"label": label, "patches": o.get("patches", {}) or {}}]
+            try:
+                case_payload = _apply_concept_patches(base_payload, picks)
+                case_payload.setdefault("_meta", {})["name"] = (
+                    f"{d.get('name','Dim')} · {label}")
+                r = run_payload_case(case_payload, start_date)
+                k = r.get("kpis", {})
+                results[(d["name"], label)] = {
+                    "name": f"{d.get('name','Dim')} · {label}",
+                    "dim": d["name"], "label": label,
+                    "picks": [(d["name"], label)],
+                    "npv_MM": k.get("npv_MM"),
+                    "npv_pretax_MM": k.get("npv_pretax_MM"),
+                    "irr": k.get("irr"),
+                    "final_rf": k.get("final_rf"),
+                    "resources_mmboe": k.get("resources_mmboe"),
+                    "breakeven_oil": k.get("breakeven_oil"),
+                    "capex_total_MM": k.get("capex_total_MM"),
+                    "capex_disc_MM": k.get("capex_disc_MM"),
+                    "co2_total_Mt": k.get("co2_total_Mt"),
+                    "profitability_index": k.get("profitability_index"),
+                    "ok": r.get("ok", False), "error": r.get("error"),
+                }
+            except Exception as e:
+                results[(d["name"], label)] = {
+                    "name": label, "dim": d["name"], "label": label,
+                    "ok": False, "error": str(e), "npv_MM": None}
+    return results, selected
+
+
+def _nl_dimensions_to_text(dimensions: list) -> str:
+    """Human-readable outline of the AI-proposed dimensions for the review
+    editor — the user can eyeball/refine the structure before running."""
+    lines = []
+    for d in dimensions:
+        lines.append(f"## {d.get('name','Dimension')}")
+        for o in d.get("options", []):
+            patch = o.get("patches", {}) or {}
+            patch_s = ", ".join(f"{k}={v}" for k, v in patch.items())
+            lines.append(f"  - {o.get('label','option')}"
+                         + (f"  [{patch_s}]" if patch_s else "")
+                         + (f"  — {o.get('description')}"
+                            if o.get("description") else ""))
+    return "\n".join(lines)
+
+
 def _nl_extract_envelope(text: str):
     """Parse the {"yaml","questions","assumptions"} JSON envelope robustly.
 
@@ -18207,15 +18807,306 @@ def _nl_demo_envelope(text: str) -> dict:
             "assumptions": assumptions}
 
 
+def _nl_demo_study_envelope(text: str) -> dict:
+    """Offline demo: build a base case from the text (reusing the single-case
+    demo parser) and propose a standard 3-dimension screening study around it
+    — no LLM, no network. Lets the study workflow be tested with a key."""
+    base = _nl_demo_envelope(text)   # base_yaml + questions + assumptions
+    import yaml as _yaml
+    try:
+        doc = _yaml.safe_load(base.get("yaml", "")) or {}
+        is_oil = str(doc.get("scalar", {}).get(
+            "fluid", "Oil")).startswith("Oil")
+    except Exception:
+        is_oil = True
+    # A standard NCS-style screening matrix. Patches are deltas vs the base.
+    dimensions = [
+        {"name": "Drainage strategy", "options": [
+            {"label": "Depletion", "description": "Primary depletion",
+             "patches": {}},
+            {"label": "Water injection",
+             "description": "Pressure support via WI",
+             "patches": {"strategy": "Injection", "_rf_multiplier": 1.15,
+                         "_n_injectors_override": 2}},
+            {"label": "WAG", "description": "Water-alternating-gas",
+             "patches": {"strategy": "Injection", "_rf_multiplier": 1.25,
+                         "_n_injectors_override": 3}},
+        ]},
+        {"name": "Number of producers", "options": [
+            {"label": "4 wells",
+             "patches": {"_n_producers_override": 4}},
+            {"label": "6 wells",
+             "patches": {"_n_producers_override": 6}},
+            {"label": "8 wells",
+             "patches": {"_n_producers_override": 8}},
+        ]},
+        {"name": "Host facility", "options": [
+            {"label": "Tie-back to existing",
+             "patches": {"_facility_capex_override_MM": 300}},
+            {"label": "New FPSO",
+             "patches": {"_facility_capex_override_MM": 1400}},
+            {"label": "New jacket/platform",
+             "patches": {"_facility_capex_override_MM": 850}},
+        ]},
+        {"name": "Oil price scenario", "options": [
+            {"label": "Low ($55)", "patches": {"oil_price_bbl": 55}},
+            {"label": "Base ($75)", "patches": {"oil_price_bbl": 75}},
+            {"label": "High ($95)", "patches": {"oil_price_bbl": 95}},
+        ]},
+    ]
+    asm = list(base.get("assumptions", []))
+    asm.append("Demo study proposes a standard 4-dimension NCS screening "
+               "matrix (drainage / well count / host / oil price). Edit the "
+               "dimensions below or refine via the answers box before "
+               "running.")
+    return {"base_yaml": base.get("yaml", ""), "dimensions": dimensions,
+            "questions": base.get("questions", []), "assumptions": asm}
+
+
+def _nl_render_study_builder(default_start_date):
+    """Review the AI-proposed study structure, let the user edit it, run every
+    option through the engine, and render the hanging garden + NPV-vs-CAPEX +
+    profitability-index + ranking inline (reusing the Concept Selector
+    helpers). Self-contained on the Case-from-text page."""
+    import yaml as _yaml
+    st.markdown("#### 🌳 Review the proposed concept study")
+    st.caption(
+        "The AI proposed the decision matrix below (dimensions × options, "
+        "each with patch overrides vs the base case). Edit the base-case "
+        "YAML or the structure, then run — every option is computed by the "
+        "engine and shown as a hanging garden with the same analysis as the "
+        "Concept Selector.")
+
+    # Base-case YAML editor.
+    base_yaml = st.text_area(
+        "Base-case YAML (each option's patches apply on top of this)",
+        value=st.session_state.get("nl_study_base_yaml", ""),
+        height=240, key="nl_study_base_editor")
+
+    # Structure editor — outline text the user can tweak. We parse it back
+    # into dimensions on run, so refining is as easy as editing lines.
+    dims = st.session_state.get("nl_study_dims", [])
+    outline = st.text_area(
+        "Decision matrix (one `## Dimension` per block, `  - Option "
+        "[key=value, …]` per option)",
+        value=_nl_dimensions_to_text(dims), height=240,
+        key="nl_study_outline",
+        help="Edit freely. Patches in [brackets] are key=value overrides "
+             "(e.g. _n_producers_override=8, oil_price_bbl=95, "
+             "_facility_capex_override_MM=1400).")
+
+    rc1, rc2 = st.columns([1, 1])
+    if rc1.button("🚀 Run the concept study", type="primary",
+                  key="nl_study_run"):
+        try:
+            base_payload, _ = fh.yaml_to_payload(base_yaml)
+        except Exception as e:
+            st.error(f"Base-case YAML did not validate: {e}")
+            return
+        parsed_dims = _nl_parse_outline(outline)
+        if not parsed_dims:
+            st.error("No dimensions parsed from the matrix outline.")
+            return
+        with st.spinner(f"Running {sum(len(d['options']) for d in parsed_dims)}"
+                        f" options through the engine…"):
+            results, selected = _nl_run_study(
+                base_payload, parsed_dims, default_start_date)
+        st.session_state["nl_study_results"] = results
+        st.session_state["nl_study_selected"] = selected
+        st.session_state["nl_study_dims_run"] = parsed_dims
+        st.session_state["nl_study_base_yaml"] = base_yaml
+        st.rerun()
+    rc2.download_button(
+        "💾 Download base YAML", data=base_yaml.encode(),
+        file_name="study_base_case.yaml", mime="text/yaml",
+        key="nl_study_dl")
+
+    # ---- Results: garden + analysis ----
+    results = st.session_state.get("nl_study_results")
+    if not results:
+        return
+    parsed_dims = st.session_state.get("nl_study_dims_run", [])
+    selected = st.session_state.get("nl_study_selected", {})
+
+    ok_n = sum(1 for r in results.values() if r.get("ok"))
+    err_n = len(results) - ok_n
+    st.markdown("---")
+    st.markdown(f"### 🌳 Concept study — {ok_n} options run"
+                + (f", {err_n} failed" if err_n else ""))
+    if err_n:
+        with st.expander(f"⚠️ {err_n} option(s) failed", expanded=False):
+            for r in results.values():
+                if not r.get("ok"):
+                    st.markdown(f"**{r.get('name')}** — `{r.get('error')}`")
+
+    # Hanging garden (reuses the Concept Selector renderer).
+    svg = _render_concept_garden_svg(parsed_dims, selected, results)
+    st.markdown(
+        f'<div style="overflow-x:auto;width:100%">'
+        f'<div style="min-width:900px">{svg}</div></div>',
+        unsafe_allow_html=True)
+
+    # Build per-option rows for the comparison + PI charts/table.
+    rows = []
+    for (dim, label), r in results.items():
+        if not r.get("ok") or r.get("npv_MM") is None:
+            continue
+        cap = r.get("capex_disc_MM") or 0.0
+        rows.append({
+            "concept": f"{dim} · {label}",
+            "npv_MM": r.get("npv_MM"),
+            "capex_disc_MM": cap,
+            "breakeven_oil": r.get("breakeven_oil"),
+            "co2_total_Mt": r.get("co2_total_Mt"),
+            "irr": r.get("irr"),
+            "pi": (r.get("profitability_index")
+                   if r.get("profitability_index") is not None
+                   else (r["npv_MM"] / cap if cap > 1e-9 else None)),
+        })
+    _study_figs = []
+    if rows:
+        rows.sort(key=lambda x: (x["npv_MM"] if x["npv_MM"] is not None
+                                 else -9e18), reverse=True)
+        # NPV vs CAPEX scatter
+        fig_cc = go.Figure()
+        fig_cc.add_trace(go.Scatter(
+            x=[r["capex_disc_MM"] for r in rows],
+            y=[r["npv_MM"] for r in rows], mode="markers+text",
+            text=[r["concept"] for r in rows], textposition="top center",
+            marker=dict(size=12, color=[r["npv_MM"] for r in rows],
+                        colorscale="RdYlGn", showscale=True,
+                        line=dict(color="black", width=1)),
+            hovertemplate=("<b>%{text}</b><br>CAPEX $%{x:,.0f}MM<br>"
+                           "NPV $%{y:,.0f}MM<extra></extra>")))
+        fig_cc.add_hline(y=0, line=dict(color="grey", dash="dot"))
+        fig_cc.update_layout(
+            title="NPV post-tax vs discounted CAPEX",
+            xaxis_title="Discounted CAPEX ($MM)",
+            yaxis_title="NPV after tax ($MM)", height=480)
+        _study_figs.append(("NPV vs CAPEX", fig_cc))
+        st.plotly_chart(fh.apply_plot_template(fig_cc),
+                        use_container_width=True)
+
+        # Profitability index bar
+        _pir = [r for r in rows if r.get("pi") is not None]
+        if _pir:
+            _pir.sort(key=lambda r: r["pi"], reverse=True)
+            fig_pi = go.Figure(go.Bar(
+                x=[r["concept"] for r in _pir],
+                y=[r["pi"] for r in _pir],
+                marker_color=["#9DBA00" if r["pi"] >= 0 else "#EB0037"
+                              for r in _pir],
+                text=[f"{r['pi']:,.2f}" for r in _pir],
+                textposition="outside"))
+            fig_pi.add_hline(y=0, line=dict(color="grey", dash="dot"))
+            fig_pi.update_layout(
+                title="Profitability index (NPV ÷ discounted CAPEX)",
+                yaxis_title="PI", height=360, xaxis_tickangle=-30)
+            _study_figs.append(("Profitability index", fig_pi))
+            st.plotly_chart(fh.apply_plot_template(fig_pi),
+                            use_container_width=True)
+
+        # Ranking table
+        df_rank = pd.DataFrame([{
+            "Concept": r["concept"],
+            "NPV ($MM)": f"{r['npv_MM']:,.0f}",
+            "CAPEX disc. ($MM)": f"{r['capex_disc_MM']:,.0f}",
+            "PI": f"{r['pi']:,.2f}" if r.get("pi") is not None else "—",
+            "IRR": f"{r['irr']*100:,.1f}%" if r.get("irr") else "—",
+            "BE oil ($/bbl)": (f"{r['breakeven_oil']:,.1f}"
+                               if r.get("breakeven_oil") is not None
+                               else "—"),
+            "CO₂ (Mt)": (f"{r['co2_total_Mt']:,.2f}"
+                         if r.get("co2_total_Mt") is not None else "—"),
+        } for r in rows])
+        st.dataframe(df_rank, use_container_width=True, hide_index=True)
+
+        # Export all charts
+        with st.expander("🖼️ Export all charts (SVG / PDF)", expanded=False):
+            e1, e2 = st.columns([1, 2])
+            _f = e1.radio("Format", ["PDF", "SVG"], key="nl_study_exfmt")
+            e2.caption(f"{len(_study_figs)} chart(s)")
+            if st.button("📦 Build export", key="nl_study_exbuild"):
+                try:
+                    data, mime, fname = _export_figs_bundle(_study_figs, _f)
+                    fname = fname.replace("concept_charts", "study_charts")
+                    st.session_state["_nl_study_blob"] = (data, mime, fname)
+                    st.success(f"Built {fname} ({len(data)/1024:,.0f} KB).")
+                except Exception as _ee:
+                    st.error(f"Export failed: {_ee}")
+            _b = st.session_state.get("_nl_study_blob")
+            if _b:
+                st.download_button(f"⬇️ Download {_b[2]}", data=_b[0],
+                                   mime=_b[1], file_name=_b[2],
+                                   key="nl_study_exdl")
+
+
+def _nl_parse_outline(text: str) -> list:
+    """Parse the editable matrix outline back into dimensions.
+
+    Format: `## Dimension name` lines start a dimension; `  - Option label
+    [k=v, k=v]  — description` lines add options. Patch values are coerced to
+    numbers where possible. Robust to extra whitespace."""
+    import re as _re
+    dims = []
+    cur = None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        m_dim = _re.match(r"\s*#+\s*(.+)$", line)
+        m_opt = _re.match(r"\s*[-*]\s*(.+)$", line)
+        if m_dim:
+            cur = {"name": m_dim.group(1).strip(), "options": []}
+            dims.append(cur)
+        elif m_opt and cur is not None:
+            body = m_opt.group(1).strip()
+            patches = {}
+            mb = _re.search(r"\[(.*?)\]", body)
+            if mb:
+                for kv in mb.group(1).split(","):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        k = k.strip()
+                        v = v.strip()
+                        try:
+                            v = float(v) if ("." in v or "e" in v.lower()) \
+                                else int(v)
+                        except ValueError:
+                            pass
+                        patches[k] = v
+                body = body[:mb.start()].strip()
+            # strip a trailing "— description"
+            label = _re.split(r"\s+[—-]\s+", body)[0].strip() or body
+            desc = ""
+            md = _re.search(r"[—-]\s+(.+)$", body)
+            if md:
+                desc = md.group(1).strip()
+            cur["options"].append({"label": label, "description": desc,
+                                   "patches": patches})
+    return [d for d in dims if d["options"]]
+
+
 def case_from_text_section(default_start_date):
     """🤖 Case from text — describe a business case, get a runnable YAML."""
     st.markdown("## 🤖 Case from text")
     st.caption(
         "Describe the business case in plain language. Your chosen LLM maps "
         "it onto the app's YAML case schema and asks for anything missing. "
-        "You review and edit the YAML before anything runs — the engine "
-        "recomputes all physics and economics; the LLM only fills in the "
-        "form. Your API key stays in this session only.")
+        "You review and edit before anything runs — the engine recomputes "
+        "all physics and economics; the LLM only fills in the form. Your API "
+        "key stays in this session only.")
+
+    # ---- Mode: single case vs multi-concept study (hanging garden) --------
+    _nl_mode = st.radio(
+        "Output", ["Single case", "Concept study (hanging garden)"],
+        horizontal=True, key="nl_mode",
+        help="**Single case** — one runnable case with KPIs + plots. "
+             "**Concept study** — describe several concepts (or the axes to "
+             "compare) and the AI proposes a decision matrix (dimensions × "
+             "options); the app runs every option and shows the hanging "
+             "garden, NPV-vs-CAPEX, profitability index and rankings inline.")
+    _study_mode = _nl_mode.startswith("Concept")
 
     # ---- Provider & key ----------------------------------------------------
     with st.expander("🔑 LLM provider & API key", expanded=True):
@@ -18258,51 +19149,93 @@ def case_from_text_section(default_start_date):
 
     # ---- Case description --------------------------------------------------
     case_text = st.text_area(
-        "📝 Business case description",
+        "📝 " + ("Concepts / comparison idea" if _study_mode
+                 else "Business case description"),
         height=180, key="nl_case_text",
-        placeholder=("e.g. A subsea tie-back oil development on the NCS, "
-                     "~120 MMbbl in place, 6 producers at ~8000 bbl/d "
-                     "initial each, water injection, first oil 2029, "
-                     "facility CAPEX about 900 MUSD, NCS fiscal terms, "
-                     "metric units."))
+        placeholder=(
+            ("e.g. Compare a subsea tie-back vs a new FPSO for a 120 MMbbl "
+             "NCS oil field; look at depletion vs water injection, 4 to 8 "
+             "producers, and low/base/high oil price. Metric units, first "
+             "oil 2029.") if _study_mode else
+            ("e.g. A subsea tie-back oil development on the NCS, ~120 MMbbl "
+             "in place, 6 producers at ~8000 bbl/d initial each, water "
+             "injection, first oil 2029, facility CAPEX about 900 MUSD, NCS "
+             "fiscal terms, metric units.")))
     if "nl_messages" not in st.session_state:
         st.session_state["nl_messages"] = []
 
+    _btn_label = ("🌳 Propose a concept study" if _study_mode
+                  else "🤖 Extract YAML from text")
     bcol1, bcol2 = st.columns([1, 1])
-    if bcol1.button("🤖 Extract YAML from text", type="primary",
+    if bcol1.button(_btn_label, type="primary",
                     disabled=not (case_text.strip()
                                   and (_is_demo
                                        or cfg.get("api_key", "").strip())),
                     key="nl_extract_btn"):
         st.session_state["nl_messages"] = [
             {"role": "user", "content": case_text}]
-        if _is_demo:
-            env = _nl_demo_envelope(case_text)
-            st.session_state["nl_yaml"] = env.get("yaml", "")
-            st.session_state["nl_questions"] = env.get("questions", [])
-            st.session_state["nl_assumptions"] = env.get("assumptions", [])
-            st.rerun()
-        with st.spinner(f"Asking {provider}…"):
-            content, err = _llm_chat(provider, cfg, _NL_SCHEMA_PROMPT,
-                                     st.session_state["nl_messages"])
-        if err:
-            st.error(err)
-        else:
-            st.session_state["nl_messages"].append(
-                {"role": "assistant", "content": content})
-            env, perr = _nl_extract_envelope(content)
-            if perr:
-                st.error(perr)
-                st.code(content[:3000])
+        if _study_mode:
+            # ---- Concept-study extraction ----
+            if _is_demo:
+                env = _nl_demo_study_envelope(case_text)
             else:
+                with st.spinner(f"Asking {provider} to propose a study…"):
+                    content, err = _llm_chat(
+                        provider, cfg, _NL_STUDY_PROMPT,
+                        st.session_state["nl_messages"])
+                if err:
+                    st.error(err)
+                    env = None
+                else:
+                    st.session_state["nl_messages"].append(
+                        {"role": "assistant", "content": content})
+                    env, perr = _nl_extract_envelope(content)
+                    if perr or not env or "dimensions" not in env:
+                        st.error(perr or "Model did not return a study "
+                                 "structure (missing 'dimensions').")
+                        st.code((content or "")[:3000])
+                        env = None
+            if env is not None:
+                st.session_state["nl_study_base_yaml"] = env.get(
+                    "base_yaml", env.get("yaml", ""))
+                st.session_state["nl_study_dims"] = env.get("dimensions", [])
+                st.session_state["nl_questions"] = env.get("questions", [])
+                st.session_state["nl_assumptions"] = env.get(
+                    "assumptions", [])
+                st.session_state.pop("nl_study_results", None)
+                st.rerun()
+        else:
+            # ---- Single-case extraction (unchanged) ----
+            if _is_demo:
+                env = _nl_demo_envelope(case_text)
                 st.session_state["nl_yaml"] = env.get("yaml", "")
                 st.session_state["nl_questions"] = env.get("questions", [])
                 st.session_state["nl_assumptions"] = env.get(
                     "assumptions", [])
                 st.rerun()
+            with st.spinner(f"Asking {provider}…"):
+                content, err = _llm_chat(provider, cfg, _NL_SCHEMA_PROMPT,
+                                         st.session_state["nl_messages"])
+            if err:
+                st.error(err)
+            else:
+                st.session_state["nl_messages"].append(
+                    {"role": "assistant", "content": content})
+                env, perr = _nl_extract_envelope(content)
+                if perr:
+                    st.error(perr)
+                    st.code(content[:3000])
+                else:
+                    st.session_state["nl_yaml"] = env.get("yaml", "")
+                    st.session_state["nl_questions"] = env.get(
+                        "questions", [])
+                    st.session_state["nl_assumptions"] = env.get(
+                        "assumptions", [])
+                    st.rerun()
     if bcol2.button("🧹 Start over", key="nl_reset"):
         for k in ("nl_messages", "nl_yaml", "nl_questions",
-                  "nl_assumptions", "nl_result"):
+                  "nl_assumptions", "nl_result", "nl_study_base_yaml",
+                  "nl_study_dims", "nl_study_results", "nl_study_selected"):
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -18315,20 +19248,53 @@ def case_from_text_section(default_start_date):
             a = st.text_input(q, key=f"nl_q_{i}")
             if a.strip():
                 answers.append(f"Q: {q}\nA: {a}")
-        if st.button("↩️ Send answers & refine the YAML",
-                     disabled=not answers, key="nl_refine_btn"):
+        if st.button("↩️ Send answers & refine", disabled=not answers,
+                     key="nl_refine_btn"):
             st.session_state["nl_messages"].append(
                 {"role": "user",
                  "content": ("Answers to your questions:\n"
                              + "\n".join(answers)
                              + "\nReturn the updated full JSON envelope.")})
+            _orig = next((mm["content"] for mm in
+                          st.session_state["nl_messages"]
+                          if mm["role"] == "user"), "")
+            if _study_mode:
+                if _is_demo:
+                    env = _nl_demo_study_envelope(
+                        _orig + "\n" + "\n".join(answers))
+                else:
+                    with st.spinner(f"Refining with {provider}…"):
+                        content, err = _llm_chat(
+                            provider, cfg, _NL_STUDY_PROMPT,
+                            st.session_state["nl_messages"])
+                    env = None
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["nl_messages"].append(
+                            {"role": "assistant", "content": content})
+                        env, perr = _nl_extract_envelope(content)
+                        if perr or not env or "dimensions" not in env:
+                            st.error(perr or "No 'dimensions' in response.")
+                            st.code((content or "")[:3000])
+                            env = None
+                if env is not None:
+                    st.session_state["nl_study_base_yaml"] = env.get(
+                        "base_yaml", env.get("yaml", ""))
+                    st.session_state["nl_study_dims"] = env.get(
+                        "dimensions", [])
+                    st.session_state["nl_questions"] = env.get(
+                        "questions", [])
+                    st.session_state["nl_assumptions"] = env.get(
+                        "assumptions", [])
+                    for i in range(len(qs)):
+                        st.session_state.pop(f"nl_q_{i}", None)
+                    st.rerun()
+                return
             if _is_demo:
                 # Re-run the offline extractor over the original text plus
                 # the answers — its regexes pick the numbers/keywords out of
                 # the answer lines the same way.
-                _orig = next((mm["content"] for mm in
-                              st.session_state["nl_messages"]
-                              if mm["role"] == "user"), "")
                 env = _nl_demo_envelope(_orig + "\n" + "\n".join(answers))
                 st.session_state["nl_yaml"] = env.get("yaml", "")
                 st.session_state["nl_questions"] = env.get("questions", [])
@@ -18365,8 +19331,13 @@ def case_from_text_section(default_start_date):
             for a in st.session_state["nl_assumptions"]:
                 st.markdown(f"- {a}")
 
-    # ---- Review, validate & run --------------------------------------------
-    if st.session_state.get("nl_yaml"):
+    # ---- CONCEPT STUDY: review structure, run, render garden inline --------
+    if _study_mode and st.session_state.get("nl_study_dims"):
+        _nl_render_study_builder(default_start_date)
+        return
+
+    # ---- SINGLE CASE: review, validate & run -------------------------------
+    if (not _study_mode) and st.session_state.get("nl_yaml"):
         st.markdown("#### 📝 Review & edit the YAML before running")
         yaml_text = st.text_area(
             "Case YAML (editable — this is what actually runs)",
@@ -18410,8 +19381,27 @@ def case_from_text_section(default_start_date):
         m5.metric("Recovery factor",
                   f"{k['final_rf']*100:,.1f}%"
                   if k.get("final_rf") is not None else "—")
+        # Second KPI row: profitability index (NPV ÷ discounted CAPEX).
+        _pi = k.get("profitability_index")
+        if _pi is None and k.get("capex_disc_MM"):
+            try:
+                _pi = float(k["npv_MM"]) / float(k["capex_disc_MM"])
+            except Exception:
+                _pi = None
+        n1, n2, n3, n4, n5 = st.columns(5)
+        n1.metric("Profitability index (NPV/CAPEX)",
+                  f"{_pi:,.2f}" if _pi is not None else "—",
+                  help="NPV ÷ discounted CAPEX — value created per $ of "
+                       "capital. PI > 0 is value-accretive; higher is more "
+                       "capital-efficient.")
+        n2.metric("CAPEX (disc.)",
+                  f"${(k.get('capex_disc_MM') or 0):,.0f} MM")
+        n3.metric("Payback",
+                  f"{k['payback_yrs']:,.1f} yr"
+                  if k.get("payback_yrs") is not None else "—")
         df = res.get("df")
         df_e = res.get("df_e")
+        _nl_figs = []   # (name, fig) for the export-all feature
         # Production profile
         if df is not None and "date" in df.columns:
             figp = go.Figure()
@@ -18423,6 +19413,7 @@ def case_from_text_section(default_start_date):
             figp.update_layout(title="Production profile (engine units)",
                                xaxis_title="Date", yaxis_title="rate",
                                height=300)
+            _nl_figs.append(("Production profile", figp))
             st.plotly_chart(fh.apply_plot_template(figp),
                             use_container_width=True)
         # Cashflow + NPV
@@ -18488,8 +19479,42 @@ def case_from_text_section(default_start_date):
                                               marker_color="#00243D"))
                 figh.update_layout(title="NPV distribution ($MM)",
                                    height=300, xaxis_title="NPV ($MM)")
+                _nl_figs.append(("Monte-Carlo distribution", figh))
                 st.plotly_chart(fh.apply_plot_template(figh),
                                 use_container_width=True)
+
+        # ---- Export all charts (SVG / PDF) ----
+        if _nl_figs:
+            with st.expander("🖼️ Export all charts (SVG / PDF)",
+                             expanded=False):
+                st.caption("Download every chart above as vector files. "
+                           "Pick the format, then build & download.")
+                ex1, ex2 = st.columns([1, 2])
+                _nlfmt = ex1.radio(
+                    "Format", ["PDF", "SVG"], key="nl_export_fmt",
+                    help="**PDF** — one multi-page document. **SVG** — a "
+                         ".zip of editable vector files, one per chart.")
+                ex2.caption(f"{len(_nl_figs)} chart(s): "
+                            + ", ".join(n for n, _ in _nl_figs))
+                if st.button("📦 Build export", key="nl_export_build"):
+                    try:
+                        data, mime, fname = _export_figs_bundle(
+                            _nl_figs, _nlfmt)
+                        fname = fname.replace("concept_charts",
+                                              "case_from_text_charts")
+                        st.session_state["_nl_export_blob"] = (
+                            data, mime, fname)
+                        st.success(f"Built {fname} "
+                                   f"({len(data)/1024:,.0f} KB).")
+                    except Exception as _ee:
+                        st.error(f"Export failed: {_ee}")
+                        st.session_state.pop("_nl_export_blob", None)
+                _nlblob = st.session_state.get("_nl_export_blob")
+                if _nlblob:
+                    st.download_button(
+                        f"⬇️ Download {_nlblob[2]}", data=_nlblob[0],
+                        mime=_nlblob[1], file_name=_nlblob[2],
+                        key="nl_export_dl")
 
 
 def _concept_unit_converter():
@@ -18547,6 +19572,109 @@ def _concept_unit_converter():
             "Reference: 1 MSm³ oil = 6.29 MMstb · 1 GSm³ gas = 35.31 Bscf · "
             "1 bar = 14.50 psi · 1 m = 3.281 ft · prices: $/Sm³ = $/bbl × "
             "6.29.")
+
+
+def _concept_register_fig(name: str, fig) -> None:
+    """Register a Plotly figure for the 'export all images' feature.
+
+    Figures are collected per render pass into a session list of (name, fig)
+    so the export button can bundle every chart the user is looking at into
+    one SVG zip or one multi-page PDF. The list is reset at the top of each
+    Concept Selector render (see _concept_reset_fig_registry)."""
+    try:
+        reg = st.session_state.setdefault("_concept_export_figs", [])
+        reg.append((name, fig))
+    except Exception:
+        pass
+
+
+def _concept_reset_fig_registry() -> None:
+    st.session_state["_concept_export_figs"] = []
+
+
+def _export_figs_bundle(figs: list, fmt: str) -> tuple:
+    """Bundle (name, fig) pairs into export bytes.
+
+    fmt = "SVG"  → a .zip of one .svg per figure.
+    fmt = "PDF"  → a single multi-page .pdf (one figure per page).
+    Returns (bytes, mime, filename) or raises with a clear message. Uses
+    Plotly's kaleido image export (pinned in requirements)."""
+    import io as _io
+    try:
+        import plotly.io as _pio
+    except Exception as e:
+        raise RuntimeError(f"Plotly image export unavailable: {e}")
+    if not figs:
+        raise RuntimeError("No figures to export yet — run a batch first.")
+
+    def _safe(n):
+        return "".join(c if c.isalnum() or c in "-_." else "_"
+                       for c in str(n))[:60]
+
+    if fmt == "SVG":
+        import zipfile as _zip
+        buf = _io.BytesIO()
+        with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as zf:
+            for i, (name, fig) in enumerate(figs, 1):
+                try:
+                    svg = _pio.to_image(fig, format="svg")
+                    zf.writestr(f"{i:02d}_{_safe(name)}.svg", svg)
+                except Exception as e:
+                    zf.writestr(f"{i:02d}_{_safe(name)}_ERROR.txt",
+                                f"Could not render: {e}")
+        return buf.getvalue(), "application/zip", "concept_charts_svg.zip"
+
+    if fmt == "PDF":
+        # Render each figure to a single-page PDF via kaleido, then merge the
+        # pages. Merge with pypdf if present, else fall back to embedding the
+        # PNGs into a reportlab PDF (always available).
+        pdf_pages = []
+        for name, fig in figs:
+            try:
+                pdf_pages.append(_pio.to_image(fig, format="pdf"))
+            except Exception:
+                pdf_pages.append(None)
+        if any(p is not None for p in pdf_pages):
+            try:
+                from pypdf import PdfWriter, PdfReader
+                w = PdfWriter()
+                for p in pdf_pages:
+                    if p is None:
+                        continue
+                    r = PdfReader(_io.BytesIO(p))
+                    for pg in r.pages:
+                        w.add_page(pg)
+                out = _io.BytesIO()
+                w.write(out)
+                return (out.getvalue(), "application/pdf",
+                        "concept_charts.pdf")
+            except Exception:
+                pass
+        # Fallback: reportlab with PNG images, one per page.
+        try:
+            from reportlab.pdfgen import canvas as _canvas
+            from reportlab.lib.pagesizes import landscape, A4
+            from reportlab.lib.utils import ImageReader
+            out = _io.BytesIO()
+            pw, ph = landscape(A4)
+            c = _canvas.Canvas(out, pagesize=landscape(A4))
+            for name, fig in figs:
+                try:
+                    png = _pio.to_image(fig, format="png", scale=2,
+                                        width=1100, height=620)
+                    img = ImageReader(_io.BytesIO(png))
+                    c.drawImage(img, 30, 60, width=pw - 60, height=ph - 110,
+                                preserveAspectRatio=True, anchor="c")
+                    c.setFont("Helvetica", 10)
+                    c.drawString(30, ph - 30, str(name))
+                    c.showPage()
+                except Exception:
+                    continue
+            c.save()
+            return out.getvalue(), "application/pdf", "concept_charts.pdf"
+        except Exception as e:
+            raise RuntimeError(f"PDF export failed: {e}")
+    raise RuntimeError(f"Unknown format: {fmt}")
 
 
 def concept_selector_section(default_start_date):
@@ -18710,6 +19838,10 @@ def concept_selector_section(default_start_date):
         st.session_state["concept_showstoppers"] = set()
     concept_showstoppers = st.session_state["concept_showstoppers"]
     results = st.session_state["concept_results"]
+    # Reset the per-render figure registry. Every chart built below registers
+    # itself via _concept_register_fig so the "export all images" feature can
+    # bundle them into one SVG zip or one multi-page PDF.
+    _concept_reset_fig_registry()
 
     # ---- Base case source -------------------------------------------------
     # The batch sweeps each combination ON TOP OF a base payload. By default
@@ -21505,6 +22637,9 @@ def concept_selector_section(default_start_date):
                     "emissions_Mt": em_med,
                     "n_cases": len(npvs),
                     "probabilistic": is_probabilistic,
+                    # Profitability index = mean NPV ÷ discounted CAPEX.
+                    "pi": (mean_npv / cap_med
+                           if cap_med and abs(cap_med) > 1e-9 else None),
                 })
 
             # ---- Pareto front (#7) ----
@@ -21555,7 +22690,8 @@ def concept_selector_section(default_start_date):
                         f"{_r.get('mean')}|{_r.get('p10')}|"
                         f"{_r.get('capex_disc_MM')}|{_r.get('emissions_Mt')}|"
                         f"{_r.get('breakeven_oil')}|{_r.get('pareto')}|"
-                        f"{_r.get('is_reference')}|{_r.get('probabilistic')}"
+                        f"{_r.get('is_reference')}|{_r.get('probabilistic')}|"
+                        f"{_r.get('pi')}"
                     ).encode())
                 _cc_sig = _ccsh.hexdigest()
                 _need_build = (st.session_state.get("_concept_cc_sig")
@@ -21742,6 +22878,7 @@ def concept_selector_section(default_start_date):
             _fig_show = (st.session_state.get("_concept_cc_fig")
                          if chart_rows else None)
             if _fig_show is not None:
+                _concept_register_fig("NPV vs CAPEX comparison", _fig_show)
                 st.plotly_chart(fh.apply_plot_template(_fig_show),
                                 use_container_width=True)
                 _any_prob = any(r.get("probabilistic")
@@ -21774,15 +22911,54 @@ def concept_selector_section(default_start_date):
                     "emissions_Mt"].map(
                         lambda v: f"{v:,.2f}" if pd.notna(v) else "—")
                 df_cc_show["# cases"] = df_cc_show["n_cases"]
+                df_cc_show["PI (NPV/CAPEX)"] = df_cc_show["pi"].map(
+                    lambda v: f"{v:,.2f}" if pd.notna(v) else "—")
                 df_cc_show = df_cc_show[[
                     "concept", "P90 NPV ($MM)", "Mean NPV ($MM)",
                     "P10 NPV ($MM)", "CAPEX ($MM disc.)",
+                    "PI (NPV/CAPEX)",
                     "BE oil ($/bbl)", "Emissions (Mt)", "# cases"]]
                 df_cc_show.columns = [
                     "Concept", "P90", "Mean", "P10", "CAPEX disc.",
-                    "BE oil", "Emissions", "# cases"]
+                    "PI", "BE oil", "Emissions", "# cases"]
                 st.dataframe(df_cc_show, use_container_width=True,
                               hide_index=True)
+
+                # ---- Profitability-index bar chart -----------------------
+                # PI = NPV ÷ discounted CAPEX per concept — the capital-
+                # efficiency ranking. Sorted best→worst; bars coloured by
+                # value-accretive (≥0, pistachio) vs value-destroying (<0,
+                # torch red), with a reference line at PI=0.
+                _pi_rows = [r for r in chart_rows if r.get("pi") is not None]
+                if _pi_rows:
+                    _pi_sorted = sorted(_pi_rows, key=lambda r: r["pi"],
+                                        reverse=True)
+                    _pi_names = [r["concept"] for r in _pi_sorted]
+                    _pi_vals = [r["pi"] for r in _pi_sorted]
+                    _pi_colors = ["#9DBA00" if v >= 0 else "#EB0037"
+                                  for v in _pi_vals]
+                    fig_pi = go.Figure(go.Bar(
+                        x=_pi_names, y=_pi_vals, marker_color=_pi_colors,
+                        text=[f"{v:,.2f}" for v in _pi_vals],
+                        textposition="outside",
+                        hovertemplate=("<b>%{x}</b><br>PI: "
+                                       "%{y:.2f}<extra></extra>")))
+                    fig_pi.add_hline(y=0, line=dict(color="grey",
+                                                    dash="dot"))
+                    fig_pi.update_layout(
+                        title="Profitability index by concept "
+                              "(NPV ÷ discounted CAPEX)",
+                        yaxis_title="PI (NPV/CAPEX)", height=340,
+                        xaxis_tickangle=-30)
+                    _concept_register_fig("Profitability index", fig_pi)
+                    st.plotly_chart(fh.apply_plot_template(fig_pi),
+                                    use_container_width=True)
+                    st.caption(
+                        "**Profitability index** = NPV ÷ discounted CAPEX — "
+                        "value created per dollar of capital. PI > 0 is "
+                        "value-accretive; the higher the bar, the more "
+                        "capital-efficient the concept. Complements the NPV "
+                        "ranking by penalising capital-heavy concepts.")
 
         # ============================================================
         # QUALITATIVE DECISION MATRIX
@@ -22201,6 +23377,52 @@ def concept_selector_section(default_start_date):
                     f"balance.")
 
         # ============================================================
+        # EXPORT ALL IMAGES (SVG / PDF)
+        # ============================================================
+        # Bundle every chart rendered above (NPV-vs-CAPEX comparison,
+        # profitability index) plus the staircase (registered on the prior
+        # render pass) into one downloadable file. The user picks the format:
+        # SVG (a .zip of vector files) or PDF (one multi-page document).
+        _live_figs = list(st.session_state.get("_concept_export_figs", []))
+        _prev_figs = list(st.session_state.get("_concept_export_figs_done",
+                                               []))
+        _by_name = {n: f for (n, f) in _prev_figs}
+        for n, f in _live_figs:
+            _by_name[n] = f
+        _all_figs = list(_by_name.items())
+        if _all_figs:
+            with st.expander("🖼️ Export all charts (SVG / PDF)",
+                             expanded=False):
+                st.caption(
+                    "Download every chart on this page as vector files. "
+                    "Choose the format, then build & download.")
+                ex1, ex2 = st.columns([1, 2])
+                _fmt = ex1.radio(
+                    "Format", ["PDF", "SVG"], key="concept_export_fmt",
+                    help="**PDF** — one multi-page document (one chart per "
+                         "page). **SVG** — a .zip of editable vector files, "
+                         "one per chart.")
+                ex2.caption(f"{len(_all_figs)} chart(s) ready: "
+                            + ", ".join(n for n, _ in _all_figs))
+                if st.button("📦 Build export", key="concept_export_build"):
+                    try:
+                        data, mime, fname = _export_figs_bundle(
+                            _all_figs, _fmt)
+                        st.session_state["_concept_export_blob"] = (
+                            data, mime, fname)
+                        st.success(f"Built {fname} "
+                                   f"({len(data)/1024:,.0f} KB).")
+                    except Exception as _ee:
+                        st.error(f"Export failed: {_ee}")
+                        st.session_state.pop("_concept_export_blob", None)
+                _blob = st.session_state.get("_concept_export_blob")
+                if _blob:
+                    st.download_button(
+                        f"⬇️ Download {_blob[2]}", data=_blob[0],
+                        mime=_blob[1], file_name=_blob[2],
+                        key="concept_export_dl")
+
+        # ============================================================
         # DESIGN-TO-COST STAIRCASE
         # ============================================================
         # Classic NCS DG1 "Design to Cost" plot: rank the concepts left
@@ -22500,6 +23722,11 @@ def concept_selector_section(default_start_date):
                     margin=dict(l=80, r=40, t=80, b=140),
                 )
 
+                _concept_register_fig("Design-to-Cost staircase", fig_st)
+                # Persist the complete registry so the export feature (which
+                # renders above the staircase) can include it next pass.
+                st.session_state["_concept_export_figs_done"] = list(
+                    st.session_state.get("_concept_export_figs", []))
                 st.plotly_chart(fh.apply_plot_template(fig_st),
                                 use_container_width=True)
 
