@@ -10748,33 +10748,40 @@ def _dz_influence_svg(diagram):
     return "".join(parts)
 
 
-def _dz_tree_svg(tree, max_depth=6):
+def _dz_tree_svg(tree, max_depth=6, scale=1.0):
     """Render the compiled decision tree as a left→right SVG. Decision nodes
     are gold squares, chance nodes teal circles, leaves show their value. The
-    optimal branch out of each decision is drawn thick/gold."""
+    optimal branch out of each decision is drawn thick/gold. `scale` enlarges
+    spacing and fonts so the tree is readable (1.0 = base, 1.5/2.0 = bigger)."""
     import html as _html
-    # First pass: assign y positions to leaves, then parents = mean of kids.
-    leaf_gap = 26
-    x_step = 150
-    counter = {"y": 20}
+    leaf_gap = int(54 * scale)
+    x_step = int(240 * scale)
+    fs_node = max(11, int(13 * scale))     # node label font
+    fs_edge = max(10, int(12 * scale))     # branch label font
+    fs_val = max(11, int(13 * scale))      # value font
+    dec_half = int(11 * scale)             # decision square half-size
+    chance_r = int(11 * scale)             # chance circle radius
+    leaf_r = int(6 * scale)
+    pad = int(30 * scale)
+    counter = {"y": pad + int(20 * scale)}
 
     def layout(node, depth):
         if node.kind == "leaf" or depth >= max_depth:
             y = counter["y"]
             counter["y"] += leaf_gap
             node._y = y
-            node._x = 20 + depth * x_step
+            node._x = pad + depth * x_step
             return y
         ys = []
         for _, _, ch in node.branches:
             ys.append(layout(ch, depth + 1))
         node._y = sum(ys) / len(ys) if ys else counter["y"]
-        node._x = 20 + depth * x_step
+        node._x = pad + depth * x_step
         return node._y
 
     layout(tree, 0)
-    height = counter["y"] + 20
-    width = (max_depth + 1) * x_step + 120
+    height = counter["y"] + pad
+    width = (max_depth + 1) * x_step + int(140 * scale)
     parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
              f'height="{height}" viewBox="0 0 {width} {height}" '
              f'font-family="Inter,Segoe UI,Arial">']
@@ -10785,37 +10792,44 @@ def _dz_tree_svg(tree, max_depth=6):
         if parent_xy is not None:
             px, py = parent_xy
             col = "#E0A500" if is_opt else "#6f8aa0"
-            w = 3 if is_opt else 1.5
+            w = (4 if is_opt else 2) * (scale ** 0.5)
             parts.append(
                 f'<path d="M{px},{py} C{(px+x)/2},{py} {(px+x)/2},{y} '
-                f'{x},{y}" stroke="{col}" stroke-width="{w}" fill="none"/>')
-            lbl = _html.escape(str(edge_label)[:16])
+                f'{x},{y}" stroke="{col}" stroke-width="{w:.1f}" '
+                f'fill="none"/>')
+            lbl = _html.escape(str(edge_label)[:18])
             if prob is not None:
-                lbl += f" ({prob:.2f})"
+                lbl += f" (p={prob:.2f})"
             parts.append(
-                f'<text x="{(px+x)/2}" y="{(py+y)/2-3}" fill="#9fb4c4" '
-                f'font-size="9" text-anchor="middle">{lbl}</text>')
+                f'<text x="{(px+x)/2}" y="{(py+y)/2-4*scale}" '
+                f'fill="#aebfcd" font-size="{fs_edge}" '
+                f'text-anchor="middle">{lbl}</text>')
         if node.kind == "leaf" or depth >= max_depth:
             v = node.value or 0.0
-            parts.append(f'<circle cx="{x}" cy="{y}" r="4" fill="#9DBA00"/>')
+            parts.append(f'<circle cx="{x}" cy="{y}" r="{leaf_r}" '
+                         f'fill="#9DBA00"/>')
             parts.append(
-                f'<text x="{x+8}" y="{y+4}" fill="#dfe8c0" font-size="10">'
-                f'{v:,.0f}</text>')
+                f'<text x="{x+leaf_r+4}" y="{y+4}" fill="#e6efce" '
+                f'font-size="{fs_val}" font-weight="bold">{v:,.0f}</text>')
             return
         if node.kind == "decision":
             parts.append(
-                f'<rect x="{x-7}" y="{y-7}" width="14" height="14" '
-                f'fill="#E0A500"/>')
+                f'<rect x="{x-dec_half}" y="{y-dec_half}" '
+                f'width="{dec_half*2}" height="{dec_half*2}" rx="2" '
+                f'fill="#E0A500" stroke="#fff" stroke-width="1"/>')
         else:
             parts.append(
-                f'<circle cx="{x}" cy="{y}" r="7" fill="#3aa6c4"/>')
+                f'<circle cx="{x}" cy="{y}" r="{chance_r}" fill="#3aa6c4" '
+                f'stroke="#fff" stroke-width="1"/>')
         if node.value is not None:
             parts.append(
-                f'<text x="{x-10}" y="{y-10}" fill="#cfe0ec" font-size="9" '
-                f'text-anchor="end">{node.value:,.0f}</text>')
+                f'<text x="{x}" y="{y-chance_r-6*scale}" fill="#cfe0ec" '
+                f'font-size="{fs_val}" font-weight="bold" '
+                f'text-anchor="middle">{node.value:,.0f}</text>')
         parts.append(
-            f'<text x="{x}" y="{y-12}" fill="#ffffff" font-size="9" '
-            f'text-anchor="middle">{_html.escape(node.label[:14])}</text>')
+            f'<text x="{x}" y="{y+chance_r+fs_node+2}" fill="#ffffff" '
+            f'font-size="{fs_node}" text-anchor="middle">'
+            f'{_html.escape(node.label[:18])}</text>')
         for i, (blabel, bprob, ch) in enumerate(node.branches):
             opt = (node.kind == "decision" and node.optimal_branch == i)
             draw(ch, depth + 1, (x, y), blabel, bprob, opt)
@@ -10872,6 +10886,46 @@ def _dz_seed_example():
     }
 
 
+def _dz_parse_patch(text: str) -> dict:
+    """Parse a 'key=value, key=value' patch string into a dict, coercing
+    numeric values to int/float and leaving strings as-is."""
+    out = {}
+    for kv in str(text or "").split(","):
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if not k:
+            continue
+        try:
+            v = float(v) if ("." in v or "e" in v.lower()) else int(v)
+        except ValueError:
+            pass
+        out[k] = v
+    return out
+
+
+def _dz_load_doc_into_session(doc: dict) -> None:
+    """Load a saved diagram doc (from YAML/JSON) into the editor session
+    state, converting the engine's structures back to the table format the
+    editors use (comma-joined options/outcomes/parents, CPT dict)."""
+    diagram = fdz.doc_to_diagram(doc)
+    st.session_state["dz_decisions"] = [
+        {"name": d.name, "options": ", ".join(d.options)}
+        for d in diagram.decisions.values()]
+    st.session_state["dz_chances"] = [
+        {"name": c.name, "outcomes": ", ".join(c.outcomes),
+         "parents": ", ".join(c.parents)}
+        for c in diagram.chances.values()]
+    st.session_state["dz_cpt"] = {
+        c.name: dict(c.cpt) for c in diagram.chances.values()}
+    st.session_state["dz_sequence"] = list(diagram.sequence)
+    st.session_state["dz_value_name"] = diagram.value.name
+    st.session_state["dz_value_units"] = diagram.value.units
+    st.session_state["dz_leaf_values"] = dict(diagram.leaf_values)
+    st.session_state["dz_solved"] = False
+
+
 def decision_tree_section():
     """🎯 Decision tree — influence-diagram editor + tree solver."""
     st.markdown("## 🎯 Decision tree & influence diagram")
@@ -10897,25 +10951,54 @@ def decision_tree_section():
             st.session_state.pop(k, None)
         st.rerun()
 
-    # ---- Node editors ----
+    # ---- Save / load the whole diagram (nodes + CPTs + leaf values) --------
+    with st.expander("💾 Save / load this diagram", expanded=False):
+        import yaml as _yaml
+        _doc = fdz.diagram_to_doc(_dz_get_diagram())
+        sc1, sc2 = st.columns(2)
+        sc1.download_button(
+            "⬇️ Download as YAML",
+            data=_yaml.safe_dump(_doc, sort_keys=False).encode(),
+            file_name="decision_diagram.yaml", mime="text/yaml",
+            key="dz_dl_yaml")
+        sc2.download_button(
+            "⬇️ Download as JSON",
+            data=json.dumps(_doc, indent=2).encode(),
+            file_name="decision_diagram.json", mime="application/json",
+            key="dz_dl_json")
+        up = st.file_uploader("Load a saved diagram (.yaml / .json)",
+                              type=["yaml", "yml", "json"], key="dz_upload")
+        if up is not None and st.button("📂 Load uploaded diagram",
+                                        key="dz_load_btn"):
+            try:
+                raw = up.read().decode("utf-8")
+                doc = (json.loads(raw) if up.name.lower().endswith("json")
+                       else _yaml.safe_load(raw))
+                _dz_load_doc_into_session(doc)
+                st.success(f"Loaded '{up.name}'.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not load diagram: {e}")
+
+    # ---- Node editors (edit-then-Apply: the Apply button is ORANGE while
+    # the table has unsaved edits and GREEN once committed) ----
     st.markdown("#### 1 · Nodes")
+    _dec_committed = pd.DataFrame(st.session_state["dz_decisions"])
+    _ch_committed = pd.DataFrame(st.session_state["dz_chances"])
     ec1, ec2 = st.columns(2)
     with ec1:
         st.markdown("**Decision nodes** (comma-separated options)")
-        dec_df = st.data_editor(
-            pd.DataFrame(st.session_state["dz_decisions"]),
-            num_rows="dynamic", use_container_width=True,
+        dec_buf = st.data_editor(
+            _dec_committed, num_rows="dynamic", use_container_width=True,
             key="dz_dec_editor",
             column_config={
                 "name": st.column_config.TextColumn("Decision name"),
                 "options": st.column_config.TextColumn(
                     "Options (comma-sep)")})
-        st.session_state["dz_decisions"] = dec_df.to_dict("records")
     with ec2:
         st.markdown("**Uncertainty nodes** (outcomes + optional parents)")
-        ch_df = st.data_editor(
-            pd.DataFrame(st.session_state["dz_chances"]),
-            num_rows="dynamic", use_container_width=True,
+        ch_buf = st.data_editor(
+            _ch_committed, num_rows="dynamic", use_container_width=True,
             key="dz_ch_editor",
             column_config={
                 "name": st.column_config.TextColumn("Chance name"),
@@ -10923,16 +11006,47 @@ def decision_tree_section():
                     "Outcomes (comma-sep)"),
                 "parents": st.column_config.TextColumn(
                     "Parents (comma-sep chance names)")})
-        st.session_state["dz_chances"] = ch_df.to_dict("records")
 
     vc1, vc2 = st.columns(2)
-    st.session_state["dz_value_name"] = vc1.text_input(
-        "Value node name", value=st.session_state.get("dz_value_name",
-                                                       "NPV"),
+    _vname = vc1.text_input(
+        "Value node name", value=st.session_state.get("dz_value_name", "NPV"),
         key="dz_val_name_in")
-    st.session_state["dz_value_units"] = vc2.text_input(
+    _vunits = vc2.text_input(
         "Value units", value=st.session_state.get("dz_value_units", "$MM"),
         key="dz_val_units_in")
+
+    # Dirty if either table differs from committed, or the value node changed.
+    _nodes_dirty = (_table_is_dirty(dec_buf, _dec_committed)
+                    or _table_is_dirty(ch_buf, _ch_committed)
+                    or _vname != st.session_state.get("dz_value_name", "NPV")
+                    or _vunits != st.session_state.get("dz_value_units",
+                                                       "$MM"))
+    if _nodes_dirty:
+        _ap = st.button("🟠 Apply node changes — unsaved", key="dz_nodes_apply",
+                        type="primary")
+        st.caption(":orange[● Nodes edited — click Apply to commit. The "
+                   "sequence, CPTs and leaf values rebuild from the "
+                   "committed nodes.]")
+    else:
+        _ap = st.button("🟢 Nodes up to date", key="dz_nodes_apply",
+                        type="secondary")
+        st.caption(":green[✓ All node changes applied.]")
+    if _ap:
+        st.session_state["dz_decisions"] = [
+            r for r in dec_buf.to_dict("records") if str(r.get("name", ""))
+            .strip()]
+        st.session_state["dz_chances"] = [
+            r for r in ch_buf.to_dict("records") if str(r.get("name", ""))
+            .strip()]
+        st.session_state["dz_value_name"] = _vname
+        st.session_state["dz_value_units"] = _vunits
+        # Drop CPT entries for chance nodes that no longer exist.
+        _live = {r["name"] for r in st.session_state["dz_chances"]}
+        st.session_state["dz_cpt"] = {
+            k: v for k, v in st.session_state.get("dz_cpt", {}).items()
+            if k in _live}
+        st.session_state["dz_solved"] = False
+        st.rerun()
 
     # ---- Sequence / ordering ----
     st.markdown("#### 2 · Sequence (decision/observation order along a "
@@ -10948,33 +11062,39 @@ def decision_tree_section():
         "observed before that decision (informational arc).",
         options=all_nodes, default=seq_default, key="dz_seq_in")
 
-    # ---- CPT editor for chance nodes with parents ----
+    # ---- CPT editor for chance nodes with parents (edit-then-Apply) ----
     diagram = _dz_get_diagram()
     cpt_nodes = [c for c in diagram.chances.values() if c.parents]
     plain_nodes = [c for c in diagram.chances.values() if not c.parents]
     if plain_nodes or cpt_nodes:
         st.markdown("#### 3 · Probabilities")
     st.session_state.setdefault("dz_cpt", {})
+    from itertools import product as _prod
+    _pending_cpt = {}     # node -> {combo_key: [probs]} from the editors
+    _cpt_dirty = False
     # Unconditional chance nodes — simple probability row.
     for c in plain_nodes:
-        st.markdown(f"**{c.name}** — P(outcome)")
+        st.markdown(f"**{c.name}** — P(outcome) — must sum to 1")
         cur = st.session_state["dz_cpt"].get(c.name, {}).get(
             (), [1.0 / len(c.outcomes)] * len(c.outcomes))
         row = {o: [cur[i] if i < len(cur) else 0.0]
                for i, o in enumerate(c.outcomes)}
         edf = st.data_editor(pd.DataFrame(row), hide_index=True,
-                             use_container_width=True,
-                             key=f"dz_p_{c.name}")
+                             use_container_width=True, key=f"dz_p_{c.name}")
         probs = [float(edf.iloc[0][o]) for o in c.outcomes]
-        st.session_state["dz_cpt"].setdefault(c.name, {})[()] = probs
+        _pending_cpt.setdefault(c.name, {})[()] = probs
+        if [round(x, 6) for x in probs] != [round(x, 6) for x in cur]:
+            _cpt_dirty = True
+        _s = sum(probs)
+        if abs(_s - 1.0) > 1e-6:
+            st.caption(f":orange[Σ = {_s:.3f} — will be normalised to 1.0 "
+                       f"on Apply.]")
     # Conditional chance nodes — a CPT row per parent-state combination.
     for c in cpt_nodes:
         st.markdown(f"**{c.name}** — P({', '.join(c.outcomes)} | "
                     f"{', '.join(c.parents)})")
         parent_states = [diagram.states_of(p) for p in c.parents]
-        from itertools import product as _prod
-        rows = []
-        keys = []
+        rows, keys = [], []
         for combo in _prod(*parent_states):
             keys.append(combo)
             cur = st.session_state["dz_cpt"].get(c.name, {}).get(
@@ -10985,14 +11105,34 @@ def decision_tree_section():
             rows.append(r)
         cdf = st.data_editor(pd.DataFrame(rows), hide_index=True,
                              use_container_width=True,
-                             key=f"dz_cpt_{c.name}",
-                             disabled=c.parents)
+                             key=f"dz_cpt_{c.name}", disabled=c.parents)
         new_cpt = {}
         for j, combo in enumerate(keys):
-            new_cpt[combo] = [float(cdf.iloc[j][o]) for o in c.outcomes]
-        st.session_state["dz_cpt"][c.name] = new_cpt
+            vals = [float(cdf.iloc[j][o]) for o in c.outcomes]
+            new_cpt[combo] = vals
+            prev = st.session_state["dz_cpt"].get(c.name, {}).get(combo)
+            if prev is None or [round(x, 6) for x in vals] != \
+                    [round(x, 6) for x in prev]:
+                _cpt_dirty = True
+        _pending_cpt[c.name] = new_cpt
 
-    # rebuild with fresh CPTs
+    if plain_nodes or cpt_nodes:
+        if _cpt_dirty:
+            _cap = st.button("🟠 Apply probabilities — unsaved",
+                             key="dz_cpt_apply", type="primary")
+            st.caption(":orange[● Probabilities edited — click Apply to "
+                       "commit (rows are normalised to sum 1).]")
+        else:
+            _cap = st.button("🟢 Probabilities up to date",
+                             key="dz_cpt_apply", type="secondary")
+            st.caption(":green[✓ All probabilities applied.]")
+        if _cap:
+            for nm, table in _pending_cpt.items():
+                st.session_state["dz_cpt"][nm] = table
+            st.session_state["dz_solved"] = False
+            st.rerun()
+
+    # rebuild with committed CPTs
     diagram = _dz_get_diagram()
 
     # ---- Influence diagram SVG ----
@@ -11006,17 +11146,143 @@ def decision_tree_section():
             f'<div style="overflow-x:auto;width:100%">{svg}</div>',
             unsafe_allow_html=True)
 
-    # ---- Leaf values (typed or engine-linked) ----
+    # ---- Leaf values (typed, engine-linked per-scenario, or from a concept)
     st.markdown("#### 5 · Leaf values")
+
+    leaves = fdz.enumerate_leaves(diagram)
+    st.session_state.setdefault("dz_leaf_values", {})
+
+    # ===== 5a · Engine link: run a FieldVista case per leaf scenario ========
+    with st.expander("⚙️ Compute leaf values from the engine "
+                     "(per-scenario cases)", expanded=False):
+        st.caption(
+            "Map each node STATE to a patch (key=value overrides vs a base "
+            "case). For every tree leaf, the patches of its states are merged "
+            "onto the base case, the engine runs it, and the leaf value is set "
+            "to the resulting NPV — so the tree is driven by real economics, "
+            "not typed guesses. Patch keys are the same as the Concept "
+            "Selector (oil_price_bbl, rf_target, disc, opex_fixed, "
+            "_n_producers_override, _facility_capex_override_MM, "
+            "_rf_multiplier, …).")
+        # Base case: a YAML payload the patches apply on top of.
+        _base_default = st.session_state.get(
+            "dz_base_yaml",
+            st.session_state.get("nl_study_base_yaml",
+                                 st.session_state.get("nl_yaml", "")))
+        dz_base_yaml = st.text_area(
+            "Base-case YAML", value=_base_default, height=160,
+            key="dz_base_yaml_editor",
+            help="Same schema as a single case (scalar: + tables:). Leave "
+                 "blank to start from the current Business-case sidebar via "
+                 "an exported case.")
+        # Per-state patch table.
+        state_rows = []
+        for nm in diagram.sequence:
+            for sstate in diagram.states_of(nm):
+                key = f"{nm}||{sstate}"
+                state_rows.append({
+                    "node": nm, "state": sstate,
+                    "patches": st.session_state.get(
+                        "dz_state_patches", {}).get(key, "")})
+        if state_rows:
+            sp_df = st.data_editor(
+                pd.DataFrame(state_rows), hide_index=True,
+                use_container_width=True, key="dz_state_patch_editor",
+                column_config={
+                    "node": st.column_config.TextColumn("Node",
+                                                        disabled=True),
+                    "state": st.column_config.TextColumn("State",
+                                                         disabled=True),
+                    "patches": st.column_config.TextColumn(
+                        "Patches (key=value, comma-sep)")})
+            # persist edits
+            sp = {}
+            for _, r in sp_df.iterrows():
+                sp[f"{r['node']}||{r['state']}"] = str(r.get("patches", ""))
+            st.session_state["dz_state_patches"] = sp
+
+            if st.button("🧮 Compute all leaf values from engine",
+                         key="dz_engine_compute",
+                         disabled=not dz_base_yaml.strip()):
+                try:
+                    base_payload, _ = fh.yaml_to_payload(dz_base_yaml)
+                except Exception as e:
+                    st.error(f"Base-case YAML did not validate: {e}")
+                    base_payload = None
+                if base_payload is not None:
+                    import hashlib as _hl
+                    # Cache the engine NPV per (base-case, merged-patch)
+                    # signature. Two leaves that reduce to the same merged
+                    # patch run ONCE, and a re-compute after editing a single
+                    # state's patch only re-runs the leaves whose merged patch
+                    # actually changed — everything else is a cache hit.
+                    _base_sig = _hl.md5(
+                        dz_base_yaml.encode()).hexdigest()[:12]
+                    cache = st.session_state.setdefault("dz_npv_cache", {})
+                    if st.session_state.get("dz_npv_cache_base") != _base_sig:
+                        # base case changed → previous NPVs are stale
+                        cache = {}
+                        st.session_state["dz_npv_cache"] = cache
+                        st.session_state["dz_npv_cache_base"] = _base_sig
+                    prog = st.progress(0.0)
+                    n = len(leaves)
+                    done = ok = hits = runs = 0
+                    for scn in leaves:
+                        merged = {}
+                        for (nm, sstate) in scn:
+                            merged.update(_dz_parse_patch(
+                                sp.get(f"{nm}||{sstate}", "")))
+                        # signature of the merged patch (order-independent)
+                        msig = _hl.md5(
+                            repr(sorted(merged.items())).encode()
+                        ).hexdigest()[:16]
+                        npv = cache.get(msig)
+                        if npv is not None:
+                            hits += 1
+                        else:
+                            try:
+                                cp = _apply_concept_patches(
+                                    base_payload,
+                                    [{"label": "leaf", "patches": merged}])
+                                r = run_payload_case(cp, date.today())
+                                npv = r.get("kpis", {}).get("npv_MM")
+                                if npv is not None:
+                                    cache[msig] = float(npv)
+                                    runs += 1
+                            except Exception:
+                                npv = None
+                        if npv is not None:
+                            st.session_state["dz_leaf_values"][
+                                fdz.leaf_key(scn)] = float(npv)
+                            ok += 1
+                        done += 1
+                        prog.progress(done / max(1, n))
+                    st.session_state["dz_solved"] = False
+                    st.success(
+                        f"Computed {ok}/{n} leaf values from the engine "
+                        f"({runs} engine run(s), {hits} cached). Review them "
+                        f"below, then Calculate.")
+                    st.rerun()
+            if st.session_state.get("dz_npv_cache"):
+                cc1, cc2 = st.columns([3, 1])
+                cc1.caption(
+                    f"🗃️ {len(st.session_state['dz_npv_cache'])} unique "
+                    f"patch-case result(s) cached — re-computing only re-runs "
+                    f"leaves whose patches changed.")
+                if cc2.button("Clear cache", key="dz_cache_clear"):
+                    st.session_state.pop("dz_npv_cache", None)
+                    st.session_state.pop("dz_npv_cache_base", None)
+                    st.rerun()
+
+    # ===== 5b · Manual / concept-linked leaf values =========================
     st.caption("One row per tree leaf (full scenario). Type a value, or pull "
-               "an NPV from a Concept Selector result.")
+               "an NPV from a Concept Selector result. Engine-computed values "
+               "(5a) appear here and can be overridden.")
     # engine-linked source options from concept_results
     cres = st.session_state.get("concept_results", {}) or {}
     linkable = {f"{r.get('dim','?')} · {r.get('label','?')}": r.get("npv_MM")
                 for r in cres.values()
                 if r.get("ok") and r.get("npv_MM") is not None}
-    leaves = fdz.enumerate_leaves(diagram)
-    st.session_state.setdefault("dz_leaf_values", {})
     if leaves and diagram.sequence:
         if st.button("🔗 Fill missing leaves with 0", key="dz_fill0"):
             for scn in leaves:
@@ -11067,14 +11333,22 @@ def decision_tree_section():
                            + " · ".join(f"{k} → **{v}**"
                                         for k, v in policy.items()))
             st.markdown("##### Decision tree")
-            tsvg = _dz_tree_svg(tree)
+            _zoom = st.select_slider(
+                "Tree size", options=["Fit", "Large", "Extra large"],
+                value="Large", key="dz_tree_zoom",
+                help="Enlarge the tree for readability. Use the horizontal "
+                     "scrollbar to pan a wide tree.")
+            _scale = {"Fit": 1.0, "Large": 1.5, "Extra large": 2.2}[_zoom]
+            tsvg = _dz_tree_svg(tree, scale=_scale)
             st.markdown(
-                f'<div style="overflow-x:auto;width:100%">{tsvg}</div>',
+                f'<div style="overflow:auto;width:100%;max-height:680px;'
+                f'border:1px solid #234;border-radius:8px;'
+                f'background:#0a1722;padding:8px">{tsvg}</div>',
                 unsafe_allow_html=True)
             st.caption("Gold squares = decisions (thick gold branch = "
                        "optimal), teal circles = chance nodes (branch "
                        "probabilities shown), green dots = leaf values. "
-                       "Node numbers are rolled-back expected values.")
+                       "Numbers above nodes are rolled-back expected values.")
 
             # ---- EVPI ----
             if diagram.chances:

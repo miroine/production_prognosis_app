@@ -398,3 +398,63 @@ def tree_stats(tree: TreeNode) -> dict:
         for _, _, ch in t.branches:
             stack.append(ch)
     return {"decisions": n_dec, "chances": n_chance, "leaves": n_leaf}
+
+
+# ---------------------------------------------------------------------------
+# Serialization (save / load a diagram to a plain dict → YAML/JSON)
+# ---------------------------------------------------------------------------
+def diagram_to_doc(diagram: "InfluenceDiagram") -> dict:
+    """Serialise a diagram to a plain, JSON/YAML-safe dict.
+
+    The only non-trivial part is `leaf_values`, whose keys are frozensets of
+    (node, state) tuples; we store each as an ordered scenario list so the
+    round-trip is exact. CPT keys (tuples of parent states) become lists, with
+    the unconditional row keyed by the empty list."""
+    decisions = [{"name": d.name, "options": list(d.options)}
+                 for d in diagram.decisions.values()]
+    chances = []
+    for c in diagram.chances.values():
+        cpt = []
+        for combo, probs in c.cpt.items():
+            cpt.append({"parents": list(combo), "probs": list(probs)})
+        chances.append({"name": c.name, "outcomes": list(c.outcomes),
+                        "parents": list(c.parents), "cpt": cpt})
+    leaves = []
+    for key, val in diagram.leaf_values.items():
+        # key is a frozenset of (node, state); order it by the sequence.
+        scn = sorted(key, key=lambda ns: (diagram.sequence.index(ns[0])
+                     if ns[0] in diagram.sequence else 999))
+        leaves.append({"scenario": [list(ns) for ns in scn],
+                       "value": float(val)})
+    return {"fieldvista_decision_diagram": {
+        "version": FP_DECISION_VERSION,
+        "value": {"name": diagram.value.name, "units": diagram.value.units},
+        "sequence": list(diagram.sequence),
+        "decisions": decisions, "chances": chances, "leaf_values": leaves}}
+
+
+def doc_to_diagram(doc: dict) -> "InfluenceDiagram":
+    """Inverse of diagram_to_doc. Accepts either the wrapped doc or the inner
+    dict."""
+    root = doc.get("fieldvista_decision_diagram", doc)
+    decisions = {}
+    for d in root.get("decisions", []):
+        decisions[d["name"]] = DecisionNode(d["name"],
+                                            list(d.get("options", [])))
+    chances = {}
+    for c in root.get("chances", []):
+        cpt = {}
+        for row in c.get("cpt", []):
+            cpt[tuple(row.get("parents", []))] = list(row.get("probs", []))
+        chances[c["name"]] = ChanceNode(
+            c["name"], list(c.get("outcomes", [])),
+            parents=list(c.get("parents", [])), cpt=cpt)
+    v = root.get("value", {})
+    value = ValueNode(v.get("name", "NPV"), v.get("units", "$MM"))
+    leaf_values = {}
+    for lf in root.get("leaf_values", []):
+        scn = [tuple(ns) for ns in lf.get("scenario", [])]
+        leaf_values[frozenset(scn)] = float(lf.get("value", 0.0))
+    return InfluenceDiagram(
+        decisions=decisions, chances=chances, value=value,
+        sequence=list(root.get("sequence", [])), leaf_values=leaf_values)

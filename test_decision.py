@@ -145,6 +145,23 @@ leaves = dz.enumerate_leaves(diag)
 check("enumerate_leaves count = tree leaves",
       len(leaves), dz.tree_stats(dz.compile_tree(diag))["leaves"])
 
+section("8. Diagram serialization round-trip (save/load)")
+_doc = dz.diagram_to_doc(diag)
+_d2 = dz.doc_to_diagram(_doc)
+check("round-trip sequence", _d2.sequence, diag.sequence)
+check("round-trip decision options",
+      _d2.decisions["Drill?"].options, ["Drill", "Don't"])
+check("round-trip chance distribution",
+      _d2.chances["Reservoir"].distribution({}), [0.6, 0.4])
+# EV must be identical after a save/load cycle.
+check("round-trip EV preserved",
+      dz.rollback(dz.compile_tree(_d2)), 72.0)
+# CPT diagram (conditional) round-trips too.
+_doc_c = dz.diagram_to_doc(cd)
+_cd2 = dz.doc_to_diagram(_doc_c)
+check("round-trip CPT EV = 142.5",
+      dz.rollback(dz.compile_tree(_cd2)), 142.5)
+
 print(f"\n{'='*52}")
 print(f"DECISION-ANALYSIS TESTS: {_passed} passed, {_failed} failed")
 print(f"{'='*52}")
