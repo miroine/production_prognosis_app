@@ -10886,6 +10886,40 @@ def _dz_seed_example():
     }
 
 
+def _dz_saved_case_npv(filename: str):
+    """NPV ($MM) of a saved case from the case database. Cached by filename."""
+    cache = st.session_state.setdefault("dz_case_npv_cache", {})
+    if filename in cache:
+        return cache[filename]
+    try:
+        case = fh.load_case(filename)
+        r = run_payload_case(case["payload"], date.today())
+        npv = r.get("kpis", {}).get("npv_MM")
+        cache[filename] = float(npv) if npv is not None else None
+    except Exception:
+        cache[filename] = None
+    return cache[filename]
+
+
+def _dz_stea_npv(file_bytes: bytes, filename: str, scalar: dict):
+    """NPV ($MM) from a STEA profile upload: parse → run_stea_case. Cached by
+    a hash of the file bytes so re-renders don't re-parse/re-run."""
+    import hashlib as _hl
+    sig = _hl.md5(file_bytes).hexdigest()[:16]
+    cache = st.session_state.setdefault("dz_stea_npv_cache", {})
+    if sig in cache:
+        return cache[sig]
+    try:
+        profiles = fh.parse_stea_profiles(file_bytes, filename)
+        r = run_stea_case(profiles, scalar,
+                          default_units=scalar.get("units", "field"))
+        npv = r.get("kpis", {}).get("npv_MM")
+        cache[sig] = float(npv) if npv is not None else None
+    except Exception:
+        cache[sig] = None
+    return cache[sig]
+
+
 def _dz_parse_patch(text: str) -> dict:
     """Parse a 'key=value, key=value' patch string into a dict, coercing
     numeric values to int/float and leaving strings as-is."""
@@ -11306,6 +11340,86 @@ def decision_tree_section():
                     if pick != "(type below)":
                         v = float(linkable[pick])
                 st.session_state["dz_leaf_values"][k] = float(v)
+
+    # ===== 5c · Assign each leaf a source (concept / saved case / STEA) =====
+    if leaves and diagram.sequence:
+        with st.expander("🔗 Assign each leaf a value source "
+                         "(Concept Selector · Saved case · STEA file)",
+                         expanded=False):
+            st.caption(
+                "Point each leaf at a value source. **Concept** uses an "
+                "already-run Concept Selector option's NPV. **Saved case** "
+                "loads a case from the database and runs it. **STEA** parses "
+                "an uploaded STEA profile to YAML and runs it. The resulting "
+                "NPV becomes that leaf's value. Results are cached.")
+            # source pools
+            cres = st.session_state.get("concept_results", {}) or {}
+            concept_pool = {
+                f"{r.get('dim','?')} · {r.get('label','?')}": r.get("npv_MM")
+                for r in cres.values()
+                if r.get("ok") and r.get("npv_MM") is not None}
+            cases = fh.list_cases()
+            case_pool = {c["name"]: c["filename"] for c in cases}
+            # STEA upload pool — one or more files, referenced by name
+            stea_files = st.file_uploader(
+                "STEA profile file(s) — referenced by name in the leaf "
+                "pickers below", type=["xlsx", "xls", "csv"],
+                accept_multiple_files=True, key="dz_stea_uploads")
+            stea_pool = {}
+            if stea_files:
+                _sc = {"units": st.session_state.get("units", "field"),
+                       "oil_price_bbl": st.session_state.get(
+                           "oil_price_bbl", 75.0),
+                       "gas_price_mmbtu": st.session_state.get(
+                           "gas_price_mmbtu", 4.0),
+                       "disc": st.session_state.get("disc", 0.08),
+                       "fiscal_regime": st.session_state.get(
+                           "fiscal_regime", "NCS"),
+                       "usd_to_nok": st.session_state.get("usd_to_nok", 10.5)}
+                for f in stea_files:
+                    stea_pool[f.name] = (f.getvalue(), _sc)
+
+            st.session_state.setdefault("dz_leaf_source", {})
+            src_kinds = ["(keep typed)", "Concept", "Saved case", "STEA"]
+            for scn in leaves:
+                k = fdz.leaf_key(scn)
+                kid = str(hash(k))
+                label = "  →  ".join(f"{n}={s}" for n, s in scn)
+                st.markdown(f"**{label}**")
+                a1, a2 = st.columns([1, 3])
+                kind = a1.selectbox("source", src_kinds,
+                                    key=f"dz_src_kind_{kid}",
+                                    label_visibility="collapsed")
+                npv = None
+                if kind == "Concept" and concept_pool:
+                    pick = a2.selectbox("concept", list(concept_pool),
+                                        key=f"dz_src_concept_{kid}",
+                                        label_visibility="collapsed")
+                    npv = concept_pool.get(pick)
+                elif kind == "Saved case" and case_pool:
+                    pick = a2.selectbox("case", list(case_pool),
+                                        key=f"dz_src_case_{kid}",
+                                        label_visibility="collapsed")
+                    npv = _dz_saved_case_npv(case_pool[pick])
+                elif kind == "STEA" and stea_pool:
+                    pick = a2.selectbox("stea", list(stea_pool),
+                                        key=f"dz_src_stea_{kid}",
+                                        label_visibility="collapsed")
+                    fb, sc = stea_pool[pick]
+                    npv = _dz_stea_npv(fb, pick, sc)
+                elif kind != "(keep typed)":
+                    a2.caption("No sources of this type available yet.")
+                if npv is not None:
+                    a2.caption(f"→ NPV **{npv:,.1f}** "
+                               f"{diagram.value.units}")
+                    st.session_state["dz_leaf_source"][k] = float(npv)
+            if st.button("📥 Apply assigned sources to leaf values",
+                         key="dz_apply_sources"):
+                for k, val in st.session_state["dz_leaf_source"].items():
+                    st.session_state["dz_leaf_values"][k] = float(val)
+                st.session_state["dz_solved"] = False
+                st.success("Applied source NPVs to leaf values.")
+                st.rerun()
 
     # ---- Solve ----
     st.markdown("#### 6 · Solve")
