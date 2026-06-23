@@ -10886,6 +10886,26 @@ def _dz_seed_example():
     }
 
 
+def _dz_yaml_npv(yaml_text: str):
+    """NPV ($MM) from a single YAML case string: yaml_to_payload → run. Cached
+    by a hash of the text so re-renders don't re-run an unchanged YAML."""
+    import hashlib as _hl
+    if not str(yaml_text or "").strip():
+        return None
+    sig = _hl.md5(yaml_text.encode()).hexdigest()[:16]
+    cache = st.session_state.setdefault("dz_yaml_npv_cache", {})
+    if sig in cache:
+        return cache[sig]
+    try:
+        payload, _ = fh.yaml_to_payload(yaml_text)
+        r = run_payload_case(payload, date.today())
+        npv = r.get("kpis", {}).get("npv_MM")
+        cache[sig] = float(npv) if npv is not None else None
+    except Exception:
+        cache[sig] = None
+    return cache[sig]
+
+
 def _dz_saved_case_npv(filename: str):
     """NPV ($MM) of a saved case from the case database. Cached by filename."""
     cache = st.session_state.setdefault("dz_case_npv_cache", {})
@@ -11344,14 +11364,27 @@ def decision_tree_section():
     # ===== 5c · Assign each leaf a source (concept / saved case / STEA) =====
     if leaves and diagram.sequence:
         with st.expander("🔗 Assign each leaf a value source "
-                         "(Concept Selector · Saved case · STEA file)",
+                         "(YAML · Concept · Saved case · STEA)",
                          expanded=False):
             st.caption(
-                "Point each leaf at a value source. **Concept** uses an "
+                "Point each leaf at a value source. **YAML** runs a single "
+                "case you paste or upload for that leaf. **Concept** uses an "
                 "already-run Concept Selector option's NPV. **Saved case** "
-                "loads a case from the database and runs it. **STEA** parses "
-                "an uploaded STEA profile to YAML and runs it. The resulting "
-                "NPV becomes that leaf's value. Results are cached.")
+                "loads a case from the database and runs it. **STEA** parses a "
+                "STEA profile to YAML and runs it — either from the shared "
+                "pool below or a file uploaded on the leaf itself. The "
+                "resulting NPV becomes that leaf's value. Results are cached.")
+            # economic basis used for STEA / YAML runs (STEA carries volumes &
+            # costs but not prices, so we apply the current sidebar basis)
+            _sc = {"units": st.session_state.get("units", "field"),
+                   "oil_price_bbl": st.session_state.get(
+                       "oil_price_bbl", 75.0),
+                   "gas_price_mmbtu": st.session_state.get(
+                       "gas_price_mmbtu", 4.0),
+                   "disc": st.session_state.get("disc", 0.08),
+                   "fiscal_regime": st.session_state.get(
+                       "fiscal_regime", "NCS"),
+                   "usd_to_nok": st.session_state.get("usd_to_nok", 10.5)}
             # source pools
             cres = st.session_state.get("concept_results", {}) or {}
             concept_pool = {
@@ -11360,27 +11393,19 @@ def decision_tree_section():
                 if r.get("ok") and r.get("npv_MM") is not None}
             cases = fh.list_cases()
             case_pool = {c["name"]: c["filename"] for c in cases}
-            # STEA upload pool — one or more files, referenced by name
+            # STEA shared pool — one or more files, referenced by name
             stea_files = st.file_uploader(
-                "STEA profile file(s) — referenced by name in the leaf "
-                "pickers below", type=["xlsx", "xls", "csv"],
+                "Shared STEA profile pool — file(s) any leaf can reference by "
+                "name (or upload per-leaf below)", type=["xlsx", "xls", "csv"],
                 accept_multiple_files=True, key="dz_stea_uploads")
             stea_pool = {}
             if stea_files:
-                _sc = {"units": st.session_state.get("units", "field"),
-                       "oil_price_bbl": st.session_state.get(
-                           "oil_price_bbl", 75.0),
-                       "gas_price_mmbtu": st.session_state.get(
-                           "gas_price_mmbtu", 4.0),
-                       "disc": st.session_state.get("disc", 0.08),
-                       "fiscal_regime": st.session_state.get(
-                           "fiscal_regime", "NCS"),
-                       "usd_to_nok": st.session_state.get("usd_to_nok", 10.5)}
                 for f in stea_files:
                     stea_pool[f.name] = (f.getvalue(), _sc)
 
             st.session_state.setdefault("dz_leaf_source", {})
-            src_kinds = ["(keep typed)", "Concept", "Saved case", "STEA"]
+            src_kinds = ["(keep typed)", "YAML", "Concept", "Saved case",
+                         "STEA (shared pool)", "STEA (upload here)"]
             for scn in leaves:
                 k = fdz.leaf_key(scn)
                 kid = str(hash(k))
@@ -11391,7 +11416,24 @@ def decision_tree_section():
                                     key=f"dz_src_kind_{kid}",
                                     label_visibility="collapsed")
                 npv = None
-                if kind == "Concept" and concept_pool:
+                if kind == "YAML":
+                    # paste OR upload a single YAML case for this leaf
+                    up = a2.file_uploader(
+                        "Upload a YAML case", type=["yaml", "yml"],
+                        key=f"dz_src_yaml_up_{kid}")
+                    ytxt = ""
+                    if up is not None:
+                        try:
+                            ytxt = up.getvalue().decode("utf-8")
+                        except Exception:
+                            ytxt = ""
+                    ytxt = a2.text_area(
+                        "…or paste YAML", value=ytxt, height=120,
+                        key=f"dz_src_yaml_txt_{kid}",
+                        label_visibility="collapsed",
+                        placeholder="scalar:\n  units: field\n  ...")
+                    npv = _dz_yaml_npv(ytxt)
+                elif kind == "Concept" and concept_pool:
                     pick = a2.selectbox("concept", list(concept_pool),
                                         key=f"dz_src_concept_{kid}",
                                         label_visibility="collapsed")
@@ -11401,18 +11443,28 @@ def decision_tree_section():
                                         key=f"dz_src_case_{kid}",
                                         label_visibility="collapsed")
                     npv = _dz_saved_case_npv(case_pool[pick])
-                elif kind == "STEA" and stea_pool:
+                elif kind == "STEA (shared pool)" and stea_pool:
                     pick = a2.selectbox("stea", list(stea_pool),
                                         key=f"dz_src_stea_{kid}",
                                         label_visibility="collapsed")
                     fb, sc = stea_pool[pick]
                     npv = _dz_stea_npv(fb, pick, sc)
-                elif kind != "(keep typed)":
+                elif kind == "STEA (upload here)":
+                    up = a2.file_uploader(
+                        "Upload a STEA profile for this leaf",
+                        type=["xlsx", "xls", "csv"],
+                        key=f"dz_src_stea_up_{kid}")
+                    if up is not None:
+                        npv = _dz_stea_npv(up.getvalue(), up.name, _sc)
+                elif kind not in ("(keep typed)", "YAML",
+                                  "STEA (upload here)"):
                     a2.caption("No sources of this type available yet.")
                 if npv is not None:
                     a2.caption(f"→ NPV **{npv:,.1f}** "
                                f"{diagram.value.units}")
                     st.session_state["dz_leaf_source"][k] = float(npv)
+                elif kind in ("YAML", "STEA (upload here)"):
+                    a2.caption("Provide a file/text above to compute NPV.")
             if st.button("📥 Apply assigned sources to leaf values",
                          key="dz_apply_sources"):
                 for k, val in st.session_state["dz_leaf_source"].items():
