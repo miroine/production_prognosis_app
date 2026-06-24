@@ -11794,6 +11794,55 @@ def decision_tree_section():
                     use_container_width=True, hide_index=True)
 
 
+def _render_landing_menu(page_opts):
+    """The home landing page: four large cards, one per sub-app, with a short
+    description and an Open button. Sets active_page on click."""
+    cards = {
+        "🛢️ Business case builder": (
+            "The full field-development model — units, fluids, PVT, "
+            "material-balance, drilling schedule, facilities, and the "
+            "complete economics (NPV, IRR, breakeven, reserves). Start here "
+            "to build a single detailed case.",
+            "#00243D"),
+        "🌳 Concept Selector": (
+            "A hanging-garden screening tool: define decision dimensions × "
+            "options, run every concept, and compare them on NPV vs CAPEX, "
+            "profitability index, emissions and a Design-to-Cost staircase.",
+            "#9DBA00"),
+        "🤖 Case from text": (
+            "Describe a case — or a whole concept study — in plain language "
+            "and let an LLM (your own API key) build the runnable YAML. Then "
+            "review, run, and see KPIs, plots, tornado and Monte-Carlo.",
+            "#E0A500"),
+        "🎯 Decision tree": (
+            "Build an influence diagram (decision / uncertainty / value "
+            "nodes), compile it to a decision tree, and solve it: expected "
+            "value, optimal policy, EVPI, sensitivity tornadoes, risk "
+            "profiles and Bayesian updating.",
+            "#EB0037"),
+    }
+    st.markdown("## Choose a tool")
+    st.caption("FieldVista bundles four tools. Pick one to begin — you can "
+               "return here any time with the **🏠 Menu** button.")
+    cols = st.columns(2)
+    for i, opt in enumerate(page_opts):
+        desc, color = cards.get(opt, ("", "#00243D"))
+        with cols[i % 2]:
+            st.markdown(
+                f'<div style="border:1px solid #d9e1e8;border-left:6px solid '
+                f'{color};border-radius:10px;padding:16px 18px;margin:8px 0;'
+                f'min-height:170px;background:#ffffff09">'
+                f'<div style="font-size:1.25rem;font-weight:700;'
+                f'margin-bottom:6px">{opt}</div>'
+                f'<div style="font-size:0.9rem;line-height:1.4;opacity:0.85">'
+                f'{desc}</div></div>',
+                unsafe_allow_html=True)
+            if st.button(f"Open {opt}", key=f"menu_open_{i}",
+                         use_container_width=True, type="primary"):
+                st.session_state["active_page"] = opt
+                st.rerun()
+
+
 def main():
     # ---- Styling ----
     st.markdown(fh.APP_CSS, unsafe_allow_html=True)
@@ -11871,30 +11920,51 @@ def main():
     )
 
     # ---- Page navigation ----
-    # FieldVista has two top-level pages: the main field-development
-    # prognosis (production + economics + all the results tabs), and the
-    # standalone Concept Selector (a hanging-garden batch tool that runs
-    # independent cases, not derived from the current sidebar run).
-    # Guard against a stale persisted value from before the page was renamed
-    # (an unknown active_page would make st.radio raise).
+    # FieldVista has a landing MENU plus four sub-apps. The menu is the
+    # default landing page (big cards to choose a sub-app); each sub-app shows
+    # a prominent header with a "🏠 Menu" button to return. The Field Setup
+    # sidebar is built only on the Business case builder (further below), so
+    # the other three sub-apps get a clean, relevant screen.
     _page_opts = ["🛢️ Business case builder", "🌳 Concept Selector",
                   "🤖 Case from text", "🎯 Decision tree"]
-    if st.session_state.get("active_page") not in _page_opts:
-        st.session_state["active_page"] = _page_opts[0]
-    page = st.sidebar.radio(
-        "📑 Page",
-        _page_opts,
-        key="active_page",
-        help="Business case builder — the full production + economics model. "
-             "Concept Selector — a standalone hanging-garden tool where "
-             "each option links to its own case (YAML or saved case) and "
-             "the batch runs them one by one. "
-             "Case from text — describe a business case in plain language "
-             "and let an LLM (your own API key) build a runnable YAML case. "
-             "Decision tree — build an influence diagram (decision / chance / "
-             "value nodes), compile it to a decision tree, and solve it "
-             "(expected value, optimal policy, EVPI, Bayesian updating).")
-    st.sidebar.markdown("---")
+    _MENU = "🏠 Menu"
+    if st.session_state.get("active_page") not in _page_opts + [_MENU]:
+        st.session_state["active_page"] = _MENU
+    page = st.session_state.get("active_page", _MENU)
+
+    # Sidebar: a compact navigator that's always available, plus a Menu link.
+    with st.sidebar:
+        if st.button("🏠 Main menu", use_container_width=True,
+                     key="nav_menu_btn",
+                     type="primary" if page != _MENU else "secondary"):
+            st.session_state["active_page"] = _MENU
+            st.rerun()
+        st.caption("Jump to a sub-app:")
+        for _opt in _page_opts:
+            if st.button(_opt, use_container_width=True,
+                         key=f"nav_{_opt}",
+                         type="primary" if page == _opt else "secondary"):
+                st.session_state["active_page"] = _opt
+                st.rerun()
+        st.markdown("---")
+
+    # ---- Landing menu -----------------------------------------------------
+    if page == _MENU:
+        _render_landing_menu(_page_opts)
+        st.markdown(
+            '<div class="app-footer"><b>FieldVista</b> · © 2026 '
+            '<b>Merouane Hamdani</b> · MIT License</div>',
+            unsafe_allow_html=True)
+        return
+
+    # Per-sub-app: a slim top bar with a Menu button (the sub-app renders its
+    # own title below). Keeps a prominent way back to the menu on every page.
+    _hc1, _hc2 = st.columns([5, 1])
+    if _hc2.button("🏠 Menu", key="page_menu_btn",
+                   use_container_width=True):
+        st.session_state["active_page"] = _MENU
+        st.rerun()
+
     if page == "🎯 Decision tree":
         decision_tree_section()
         st.markdown(
