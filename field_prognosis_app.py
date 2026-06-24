@@ -11531,14 +11531,235 @@ def decision_tree_section():
                     except Exception:
                         continue
                 if evpi_rows:
-                    st.dataframe(
-                        pd.DataFrame(evpi_rows).sort_values(
-                            "EVPI", ascending=False),
-                        use_container_width=True, hide_index=True)
+                    _edf = pd.DataFrame(evpi_rows).sort_values(
+                        "EVPI", ascending=False)
+                    st.dataframe(_edf, use_container_width=True,
+                                 hide_index=True)
+                    # EVPI bar chart
+                    fig_ev = go.Figure(go.Bar(
+                        x=_edf["EVPI"], y=_edf["Uncertainty"],
+                        orientation="h", marker_color="#3aa6c4",
+                        text=[f"{v:,.1f}" for v in _edf["EVPI"]],
+                        textposition="outside"))
+                    fig_ev.update_layout(
+                        title="EVPI by uncertainty",
+                        xaxis_title=f"EVPI ({diagram.value.units})",
+                        height=max(220, 60 + 38 * len(_edf)),
+                        yaxis=dict(autorange="reversed"))
+                    st.plotly_chart(fh.apply_plot_template(fig_ev),
+                                    use_container_width=True)
                     st.caption("**EVPI** = the most you'd pay to resolve each "
                                "uncertainty *before* deciding. The highest "
                                "EVPI points to where appraisal / data "
                                "acquisition is worth most.")
+
+            # ================= SENSITIVITY & COMPARISON SUITE ===============
+            st.markdown("##### 📊 Sensitivity & comparison analysis")
+            _sw = st.slider(
+                "Sensitivity swing (± fraction applied to probabilities / "
+                "leaf values)", 0.05, 0.50, 0.20, 0.05, key="dz_sens_delta")
+
+            sa_tabs = st.tabs([
+                "🌪️ Probability tornado", "💰 Value tornado",
+                "🎚️ Decision-flip threshold", "📈 Risk profile (CDF)",
+                "📋 Policy comparison"])
+
+            # --- 1 · Probability tornado ---
+            with sa_tabs[0]:
+                pt = fdz.probability_tornado(diagram, delta=_sw)
+                if pt:
+                    figp = go.Figure()
+                    for r in pt:
+                        figp.add_trace(go.Bar(
+                            y=[r["node"]],
+                            x=[r["high"] - r["low"]], base=r["low"],
+                            orientation="h", marker_color="#E0A500",
+                            showlegend=False,
+                            hovertemplate=(f"{r['node']}<br>EV "
+                                           f"{r['low']:.1f} → "
+                                           f"{r['high']:.1f}<extra></extra>")))
+                    figp.add_vline(x=pt[0]["base"],
+                                   line=dict(color="#9DBA00", dash="dash"),
+                                   annotation_text="base EV")
+                    figp.update_layout(
+                        title=f"Optimal-policy EV swing per uncertainty "
+                              f"(±{_sw:.0%} on probabilities)",
+                        xaxis_title=f"EV ({diagram.value.units})",
+                        height=max(240, 70 + 42 * len(pt)),
+                        yaxis=dict(autorange="reversed"), barmode="overlay")
+                    st.plotly_chart(fh.apply_plot_template(figp),
+                                    use_container_width=True)
+                    st.caption("Which **uncertainty** the decision's value is "
+                               "most sensitive to. Longest bar = top priority "
+                               "to de-risk. The dashed line is the base EV.")
+                else:
+                    st.info("Add chance nodes with ≥2 outcomes to see this.")
+
+            # --- 2 · Value tornado ---
+            with sa_tabs[1]:
+                vt = fdz.value_tornado(diagram, delta=_sw)
+                if vt:
+                    top = vt[:12]
+                    figv = go.Figure()
+                    for r in top:
+                        figv.add_trace(go.Bar(
+                            y=[r["leaf"]],
+                            x=[r["high"] - r["low"]], base=r["low"],
+                            orientation="h", marker_color="#EB0037",
+                            showlegend=False,
+                            hovertemplate=(f"{r['leaf']}<br>EV "
+                                           f"{r['low']:.1f} → "
+                                           f"{r['high']:.1f}<extra></extra>")))
+                    figv.add_vline(x=vt[0]["base"],
+                                   line=dict(color="#9DBA00", dash="dash"),
+                                   annotation_text="base EV")
+                    figv.update_layout(
+                        title=f"Optimal-policy EV swing per leaf value "
+                              f"(±{_sw:.0%})",
+                        xaxis_title=f"EV ({diagram.value.units})",
+                        height=max(240, 70 + 34 * len(top)),
+                        yaxis=dict(autorange="reversed"), barmode="overlay")
+                    st.plotly_chart(fh.apply_plot_template(figv),
+                                    use_container_width=True)
+                    st.caption("Which **payoff** matters most to the decision "
+                               "value (top 12 leaves). Long bars are the "
+                               "estimates worth refining.")
+                else:
+                    st.info("Add leaf values to see this.")
+
+            # --- 3 · Decision-flip threshold ---
+            with sa_tabs[2]:
+                ch_names = list(diagram.chances)
+                fd = fdz.first_decision_name(diagram)
+                if ch_names and fd:
+                    fcn = st.selectbox("Vary probability of",
+                                       ch_names, key="dz_flip_node")
+                    cobj = diagram.chances[fcn]
+                    oi = st.selectbox(
+                        "Outcome", list(range(len(cobj.outcomes))),
+                        format_func=lambda i: cobj.outcomes[i],
+                        key="dz_flip_outcome")
+                    ft = fdz.decision_flip_threshold(diagram, fcn,
+                                                     outcome_index=oi)
+                    sweep = ft["sweep"]
+                    if sweep:
+                        figf = go.Figure()
+                        figf.add_trace(go.Scatter(
+                            x=[s["p"] for s in sweep],
+                            y=[s["ev"] for s in sweep], mode="lines",
+                            line=dict(color="#00243D", width=3),
+                            name="Optimal EV"))
+                        # shade decision regions by colour of the choice
+                        choices = sorted({s["choice"] for s in sweep
+                                          if s["choice"]})
+                        palette = ["#9DBA00", "#EB0037", "#E0A500",
+                                   "#3aa6c4", "#7a5cff"]
+                        cmap = {c: palette[i % len(palette)]
+                                for i, c in enumerate(choices)}
+                        for s in sweep:
+                            figf.add_vrect(
+                                x0=s["p"] - 0.005, x1=s["p"] + 0.005,
+                                fillcolor=cmap.get(s["choice"], "#ccc"),
+                                opacity=0.12, line_width=0)
+                        for fl in ft["flips"]:
+                            figf.add_vline(
+                                x=fl["p"], line=dict(color="#EB0037",
+                                                     dash="dash"),
+                                annotation_text=(f"flip {fl['from']}→"
+                                                 f"{fl['to']} @ "
+                                                 f"{fl['p']:.2f}"))
+                        figf.update_layout(
+                            title=(f"Optimal '{fd}' EV vs "
+                                   f"P({cobj.outcomes[oi]})"),
+                            xaxis_title=f"P({cobj.outcomes[oi]})",
+                            yaxis_title=f"EV ({diagram.value.units})",
+                            height=420)
+                        st.plotly_chart(fh.apply_plot_template(figf),
+                                        use_container_width=True)
+                        if ft["flips"]:
+                            for fl in ft["flips"]:
+                                st.success(
+                                    f"**Decision flips** from "
+                                    f"**{fl['from']}** to **{fl['to']}** at "
+                                    f"P({cobj.outcomes[oi]}) = "
+                                    f"**{fl['p']:.2f}** — below this you'd "
+                                    f"choose one option, above it the other.")
+                        else:
+                            st.info(f"The optimal '{fd}' does not change over "
+                                    f"the full 0→1 range of "
+                                    f"P({cobj.outcomes[oi]}) — the decision is "
+                                    f"robust to this uncertainty.")
+                        st.caption("Background colour shows which option is "
+                                   "optimal at each probability; dashed lines "
+                                   "mark the breakeven (flip) probability.")
+                else:
+                    st.info("Needs at least one decision and one chance node.")
+
+            # --- 4 · Risk profile (CDF) ---
+            with sa_tabs[3]:
+                fd = fdz.first_decision_name(diagram)
+                figc = go.Figure()
+                if fd:
+                    opts = diagram.decisions[fd].options
+                    palette = ["#9DBA00", "#EB0037", "#E0A500", "#3aa6c4",
+                               "#7a5cff"]
+                    for i, opt in enumerate(opts):
+                        oc = fdz.policy_outcomes(
+                            diagram, first_decision=fd, forced_option=opt)
+                        cdf = fdz.cdf_points(oc)
+                        if cdf:
+                            figc.add_trace(go.Scatter(
+                                x=[v for v, _ in cdf],
+                                y=[c for _, c in cdf], mode="lines",
+                                line=dict(shape="hv", width=3,
+                                          color=palette[i % len(palette)]),
+                                name=f"{fd}={opt}"))
+                    figc.update_layout(
+                        title="Risk profile (cumulative probability of "
+                              "value ≤ x) per first decision",
+                        xaxis_title=f"Value ({diagram.value.units})",
+                        yaxis_title="Cumulative probability", height=420)
+                    st.plotly_chart(fh.apply_plot_template(figc),
+                                    use_container_width=True)
+                    st.caption("Each curve is a first-decision strategy. A "
+                               "curve sitting to the RIGHT dominates (higher "
+                               "values); a steeper curve is less risky. Where "
+                               "curves cross, the preferred strategy depends "
+                               "on risk appetite.")
+                else:
+                    st.info("Needs at least one decision node.")
+
+            # --- 5 · Policy comparison table ---
+            with sa_tabs[4]:
+                fd = fdz.first_decision_name(diagram)
+                if fd:
+                    rows = []
+                    for opt in diagram.decisions[fd].options:
+                        oc = fdz.policy_outcomes(
+                            diagram, first_decision=fd, forced_option=opt)
+                        s = fdz.policy_stats(oc)
+                        rows.append({
+                            f"{fd}": opt,
+                            f"EV ({diagram.value.units})": round(
+                                s.get("ev", 0), 1),
+                            "P90 (downside)": round(s.get("p10", 0), 1),
+                            "P50": round(s.get("p50", 0), 1),
+                            "P10 (upside)": round(s.get("p90", 0), 1),
+                            "P(loss)": f"{s.get('p_loss', 0)*100:.0f}%",
+                            "Min": round(s.get("min", 0), 1),
+                            "Max": round(s.get("max", 0), 1)})
+                    _pdf = pd.DataFrame(rows).sort_values(
+                        f"EV ({diagram.value.units})", ascending=False)
+                    st.dataframe(_pdf, use_container_width=True,
+                                 hide_index=True)
+                    st.caption("Each first-decision strategy compared on "
+                               "expected value AND risk: P90 is the downside "
+                               "(10% chance of worse), P10 the upside, "
+                               "P(loss) the probability of a negative "
+                               "outcome. The highest-EV option isn't always "
+                               "the best once downside matters.")
+                else:
+                    st.info("Needs at least one decision node.")
         except Exception as e:
             st.error(f"Could not solve the tree: {e}")
 

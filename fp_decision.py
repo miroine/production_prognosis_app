@@ -458,3 +458,208 @@ def doc_to_diagram(doc: dict) -> "InfluenceDiagram":
     return InfluenceDiagram(
         decisions=decisions, chances=chances, value=value,
         sequence=list(root.get("sequence", [])), leaf_values=leaf_values)
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity & comparison analytics (built on the core compile/rollback)
+# ---------------------------------------------------------------------------
+def policy_outcomes(diagram: "InfluenceDiagram", first_decision: str = None,
+                    forced_option: str = None) -> list:
+    """Enumerate (probability, value) outcome pairs under a policy.
+
+    With no constraint, the policy is the rolled-back OPTIMAL policy. If
+    `first_decision`/`forced_option` are given, that decision is FORCED to the
+    option (other decisions still optimised), letting us compare alternative
+    first decisions. Returns list[(prob, value)] over all chance combinations
+    consistent with the policy."""
+    tree = compile_tree(diagram)
+    rollback(tree, maximize=True)
+
+    out = []
+
+    def walk(node, prob, forced):
+        if node.kind == "leaf":
+            out.append((prob, float(node.value or 0.0)))
+            return
+        if node.kind == "decision":
+            if (forced is not None and node.label == first_decision):
+                # take the forced option
+                idx = 0
+                for i, (lbl, _, _) in enumerate(node.branches):
+                    if lbl == forced_option:
+                        idx = i
+                        break
+            else:
+                idx = node.optimal_branch or 0
+            _, _, child = node.branches[idx]
+            walk(child, prob, forced)
+        else:  # chance: branch on every outcome carrying its probability
+            for _, p, child in node.branches:
+                walk(child, prob * (p or 0.0), forced)
+
+    walk(tree, 1.0, forced_option)
+    return out
+
+
+def policy_stats(outcomes: list) -> dict:
+    """Summary statistics of a list[(prob, value)] outcome distribution:
+    expected value, P10/P50/P90 (value-at-probability), probability of loss
+    (value < 0), min/max."""
+    if not outcomes:
+        return {}
+    pts = sorted(outcomes, key=lambda pv: pv[1])
+    ev = sum(p * v for p, v in pts)
+    total_p = sum(p for p, _ in pts) or 1.0
+    # cumulative distribution
+    cum = 0.0
+    p10 = p50 = p90 = pts[0][1]
+    got10 = got50 = got90 = False
+    for p, v in pts:
+        cum += p / total_p
+        if not got10 and cum >= 0.10:
+            p10, got10 = v, True
+        if not got50 and cum >= 0.50:
+            p50, got50 = v, True
+        if not got90 and cum >= 0.90:
+            p90, got90 = v, True
+    p_loss = sum(p for p, v in pts if v < 0) / total_p
+    return {"ev": ev, "p10": p10, "p50": p50, "p90": p90,
+            "p_loss": p_loss, "min": pts[0][1], "max": pts[-1][1]}
+
+
+def cdf_points(outcomes: list) -> list:
+    """Return [(value, cumulative_probability)] for a risk-profile / CDF plot,
+    normalised so cumulative probability ends at 1.0."""
+    if not outcomes:
+        return []
+    pts = sorted(outcomes, key=lambda pv: pv[1])
+    total = sum(p for p, _ in pts) or 1.0
+    cum = 0.0
+    res = []
+    for p, v in pts:
+        cum += p / total
+        res.append((v, cum))
+    return res
+
+
+def first_decision_name(diagram: "InfluenceDiagram"):
+    """Name of the first decision node along the sequence (or None)."""
+    for nm in diagram.sequence:
+        if nm in diagram.decisions:
+            return nm
+    return None
+
+
+def probability_tornado(diagram: "InfluenceDiagram", delta: float = 0.2,
+                        maximize: bool = True) -> list:
+    """For each chance node, swing its outcome probabilities by ±delta (shift
+    mass toward, then away from, the first outcome, renormalised) and record
+    the optimal-policy EV at each end. Returns rows sorted by swing magnitude
+    so the biggest driver of the DECISION's value is first."""
+    base = rollback(compile_tree(diagram), maximize)
+    rows = []
+    for nm, c in diagram.chances.items():
+        if len(c.outcomes) < 2:
+            continue
+        evs = []
+        for sign in (+1, -1):
+            # build a perturbed copy of this node's CPT
+            new_cpt = {}
+            for key, probs in (c.cpt.items() or [((), None)]):
+                pr = list(probs) if probs else \
+                    [1.0 / len(c.outcomes)] * len(c.outcomes)
+                shift = sign * delta
+                pr2 = list(pr)
+                pr2[0] = min(1.0, max(0.0, pr2[0] + shift))
+                # take the complement of the shift off the others pro-rata
+                rest = sum(pr[1:]) or 1.0
+                for i in range(1, len(pr2)):
+                    pr2[i] = max(0.0, pr[i] - shift * (pr[i] / rest))
+                s = sum(pr2) or 1.0
+                new_cpt[key] = [x / s for x in pr2]
+            c2 = ChanceNode(c.name, c.outcomes, parents=c.parents,
+                            cpt=new_cpt)
+            chances2 = dict(diagram.chances)
+            chances2[nm] = c2
+            d2 = InfluenceDiagram(
+                decisions=diagram.decisions, chances=chances2,
+                value=diagram.value, sequence=diagram.sequence,
+                leaf_values=diagram.leaf_values)
+            evs.append(rollback(compile_tree(d2), maximize))
+        low, high = min(evs), max(evs)
+        rows.append({"node": nm, "low": low, "high": high,
+                     "swing": high - low, "base": base})
+    rows.sort(key=lambda r: r["swing"], reverse=True)
+    return rows
+
+
+def value_tornado(diagram: "InfluenceDiagram", delta: float = 0.2,
+                  maximize: bool = True) -> list:
+    """For each leaf value, swing it by ±delta (relative) and record the
+    optimal-policy EV swing. Returns rows sorted by swing so the payoff the
+    decision is most sensitive to is first."""
+    base = rollback(compile_tree(diagram), maximize)
+    rows = []
+    for key, v0 in diagram.leaf_values.items():
+        evs = []
+        for sign in (+1, -1):
+            lv2 = dict(diagram.leaf_values)
+            lv2[key] = v0 * (1.0 + sign * delta)
+            d2 = InfluenceDiagram(
+                decisions=diagram.decisions, chances=diagram.chances,
+                value=diagram.value, sequence=diagram.sequence,
+                leaf_values=lv2)
+            evs.append(rollback(compile_tree(d2), maximize))
+        low, high = min(evs), max(evs)
+        label = " · ".join(f"{n}={s}" for n, s in
+                           sorted(key, key=lambda ns: ns[0]))
+        rows.append({"leaf": label, "low": low, "high": high,
+                     "swing": high - low, "base": base})
+    rows.sort(key=lambda r: r["swing"], reverse=True)
+    return rows
+
+
+def decision_flip_threshold(diagram: "InfluenceDiagram", chance_name: str,
+                            outcome_index: int = 0, steps: int = 101,
+                            maximize: bool = True) -> dict:
+    """Sweep the probability of one outcome of `chance_name` from 0→1 (mass
+    traded against the other outcomes pro-rata) and find the probability at
+    which the optimal FIRST decision changes. Returns the sweep and any flip
+    point(s)."""
+    c = diagram.chances.get(chance_name)
+    fd = first_decision_name(diagram)
+    if c is None or fd is None or len(c.outcomes) < 2:
+        return {"sweep": [], "flips": [], "first_decision": fd}
+    base_probs = c.cpt.get((), None) or \
+        [1.0 / len(c.outcomes)] * len(c.outcomes)
+    sweep = []
+    flips = []
+    prev_choice = None
+    for i in range(steps):
+        p = i / (steps - 1)
+        pr = [0.0] * len(c.outcomes)
+        pr[outcome_index] = p
+        rest = sum(base_probs) - base_probs[outcome_index]
+        for j in range(len(pr)):
+            if j != outcome_index:
+                share = (base_probs[j] / rest) if rest > 0 else \
+                    1.0 / (len(c.outcomes) - 1)
+                pr[j] = (1.0 - p) * share
+        c2 = ChanceNode(c.name, c.outcomes, parents=c.parents,
+                        cpt={(): pr})
+        chances2 = dict(diagram.chances)
+        chances2[chance_name] = c2
+        d2 = InfluenceDiagram(
+            decisions=diagram.decisions, chances=chances2,
+            value=diagram.value, sequence=diagram.sequence,
+            leaf_values=diagram.leaf_values)
+        tree = compile_tree(d2)
+        ev = rollback(tree, maximize)
+        pol = optimal_policy(tree)
+        choice = pol.get(fd)
+        sweep.append({"p": p, "ev": ev, "choice": choice})
+        if prev_choice is not None and choice != prev_choice:
+            flips.append({"p": p, "from": prev_choice, "to": choice})
+        prev_choice = choice
+    return {"sweep": sweep, "flips": flips, "first_decision": fd,
+            "outcome": c.outcomes[outcome_index]}

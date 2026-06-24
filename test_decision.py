@@ -162,6 +162,48 @@ _cd2 = dz.doc_to_diagram(_doc_c)
 check("round-trip CPT EV = 142.5",
       dz.rollback(dz.compile_tree(_cd2)), 142.5)
 
+section("9. Sensitivity & comparison analytics")
+# Reuse the Drill/Don't tree (diag): EV=72, Drill optimal.
+# Policy outcomes under optimal (Drill): Wet 0.6→200, Dry 0.4→-120.
+_oc = dz.policy_outcomes(diag)
+check("policy outcomes count = 2", len(_oc), 2)
+check("policy EV from outcomes = 72",
+      sum(p * v for p, v in _oc), 72.0)
+_st = dz.policy_stats(_oc)
+check("policy stats EV = 72", _st["ev"], 72.0)
+check("policy P(loss) = 0.4 (Dry is negative)", _st["p_loss"], 0.4)
+# Forced 'Don't' first decision → all outcomes 0.
+_oc_dont = dz.policy_outcomes(diag, first_decision="Drill?",
+                              forced_option="Don't")
+check("forced Don't → EV 0", sum(p * v for p, v in _oc_dont), 0.0)
+# CDF ends at 1.0
+_cdf = dz.cdf_points(_oc)
+check("CDF cumulative ends at 1.0", _cdf[-1][1], 1.0, tol=1e-9)
+# Probability tornado: Reservoir is the only chance → non-zero swing.
+_pt = dz.probability_tornado(diag, delta=0.2)
+check("prob tornado has Reservoir", _pt[0]["node"], "Reservoir")
+check("prob tornado swing > 0", _pt[0]["swing"] > 0, True)
+# Value tornado: 4 leaves, biggest swing from the Drill/Wet payoff.
+_vt = dz.value_tornado(diag, delta=0.2)
+check("value tornado non-empty", len(_vt) > 0, True)
+check("value tornado swing >= 0", _vt[0]["swing"] >= 0, True)
+# Decision-flip threshold on Reservoir P(Wet): at low P(Wet) Don't wins,
+# at high P(Wet) Drill wins → at least one flip in (0,1).
+_ft = dz.decision_flip_threshold(diag, "Reservoir", outcome_index=0)
+check("flip threshold first decision = Drill?",
+      _ft["first_decision"], "Drill?")
+check("decision flips as P(Wet) rises", len(_ft["flips"]) >= 1, True)
+# Flip should be near P(Wet) where 200*p -120*(1-p) = 0 → p = 120/320 = 0.375
+if _ft["flips"]:
+    check("flip near P(Wet)=0.375", _ft["flips"][0]["p"], 0.375, tol=0.03)
+
+section("10. Analytics serialization independence")
+# analytics must not mutate the original diagram
+_ev_before = dz.rollback(dz.compile_tree(diag))
+dz.probability_tornado(diag); dz.value_tornado(diag)
+check("diagram EV unchanged after analytics",
+      dz.rollback(dz.compile_tree(diag)), _ev_before)
+
 print(f"\n{'='*52}")
 print(f"DECISION-ANALYSIS TESTS: {_passed} passed, {_failed} failed")
 print(f"{'='*52}")
