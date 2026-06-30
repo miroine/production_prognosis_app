@@ -10886,27 +10886,27 @@ def _dz_seed_example():
     }
 
 
-def _dz_seed_brime_example():
-    """Seed an NCS Brime extended-reach-well decision, mirroring the Prisma
-    influence diagram: a Development decision and a 2nd extended-reach-well
-    decision, with Brime production uncertainty and uncertain development
-    cost, valued on Cashflow (NPV). Discretised to keep the tree readable."""
+def _dz_seed_field_a_example():
+    """Seed a generic NCS extended-reach-well decision ("Field A"): a
+    Development decision and a 2nd extended-reach-well decision, with
+    production uncertainty and uncertain development cost, valued on Cashflow
+    (NPV). Discretised to keep the tree readable. Figures are illustrative."""
     st.session_state["dz_decisions"] = [
         {"name": "Develop?", "options": "Develop, Defer"},
-        {"name": "2nd Brime well?", "options": "Drill 2nd, Single well"},
+        {"name": "2nd well?", "options": "Drill 2nd, Single well"},
     ]
     st.session_state["dz_chances"] = [
-        {"name": "Brime production", "outcomes": "Low, Base, High",
+        {"name": "Field A production", "outcomes": "Low, Base, High",
          "parents": ""},
         {"name": "Development cost", "outcomes": "Under, On, Over",
          "parents": ""},
     ]
     st.session_state["dz_cpt"] = {
-        "Brime production": {(): [0.3, 0.4, 0.3]},
+        "Field A production": {(): [0.3, 0.4, 0.3]},
         "Development cost": {(): [0.25, 0.5, 0.25]},
     }
     st.session_state["dz_sequence"] = [
-        "Develop?", "2nd Brime well?", "Brime production",
+        "Develop?", "2nd well?", "Field A production",
         "Development cost"]
     st.session_state["dz_value_name"] = "Cashflow (NPV)"
     st.session_state["dz_value_units"] = "$MM"
@@ -10922,8 +10922,8 @@ def _dz_seed_brime_example():
             for prod in ("Low", "Base", "High"):
                 for cost in ("Under", "On", "Over"):
                     key = fdz.leaf_key([
-                        ("Develop?", dev), ("2nd Brime well?", w2),
-                        ("Brime production", prod),
+                        ("Develop?", dev), ("2nd well?", w2),
+                        ("Field A production", prod),
                         ("Development cost", cost)])
                     if dev == "Defer":
                         lv[key] = 0.0
@@ -11078,8 +11078,8 @@ def decision_tree_section():
     if tcol1.button("🧪 Drill example", key="dz_example"):
         _dz_seed_example()
         st.rerun()
-    if tcol2.button("🛢️ NCS Brime example", key="dz_example_brime"):
-        _dz_seed_brime_example()
+    if tcol2.button("🛢️ Field A example", key="dz_example_field_a"):
+        _dz_seed_field_a_example()
         st.rerun()
     if tcol3.button("🧹 Clear all", key="dz_clear"):
         for k in ("dz_decisions", "dz_chances", "dz_cpt", "dz_sequence",

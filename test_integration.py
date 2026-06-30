@@ -252,10 +252,10 @@ def _dt():
     _guard(app.decision_tree_section)
 check("decision_tree_section renders", _dt)
 
-def _dt_brime():
-    app._dz_seed_brime_example()
+def _dt_field_a():
+    app._dz_seed_field_a_example()
     _guard(app.decision_tree_section)
-check("decision_tree_section (Brime example) renders", _dt_brime)
+check("decision_tree_section (Field A example) renders", _dt_field_a)
 
 # Concept Selector
 check("concept_selector_section renders",
