@@ -10936,6 +10936,96 @@ def _dz_seed_field_a_example():
     st.session_state["dz_solved"] = False
 
 
+def _dz_source_pools():
+    """Build the value-source pools (concept results, saved cases) and the
+    shared economic basis used for STEA/YAML runs. Returns a dict the unified
+    leaf editor and the distribution editor both use."""
+    _sc = {"units": st.session_state.get("units", "field"),
+           "oil_price_bbl": st.session_state.get("oil_price_bbl", 75.0),
+           "gas_price_mmbtu": st.session_state.get("gas_price_mmbtu", 4.0),
+           "disc": st.session_state.get("disc", 0.08),
+           "fiscal_regime": st.session_state.get("fiscal_regime", "NCS"),
+           "usd_to_nok": st.session_state.get("usd_to_nok", 10.5)}
+    cres = st.session_state.get("concept_results", {}) or {}
+    concept_pool = {
+        f"{r.get('dim','?')} · {r.get('label','?')}": r.get("npv_MM")
+        for r in cres.values()
+        if r.get("ok") and r.get("npv_MM") is not None}
+    cases = fh.list_cases()
+    case_pool = {c["name"]: c["filename"] for c in cases}
+    return {"sc": _sc, "concept_pool": concept_pool, "case_pool": case_pool}
+
+
+# The value-source kinds offered by the unified leaf / percentile editor.
+_DZ_SRC_KINDS = ["Constant value", "YAML", "Concept", "Saved case",
+                 "STEA (shared pool)", "STEA (upload here)"]
+
+
+def _dz_resolve_source(kind, key_id, pools, stea_pool, *,
+                       constant_default=0.0, col=None, label_prefix=""):
+    """Render the input(s) for one value source and RETURN the resolved value
+    (or None if not yet available). `kind` is one of _DZ_SRC_KINDS. `col` is
+    the Streamlit column to render into (defaults to st). This is the single
+    place that turns a source choice into a number, used by both the leaf
+    editor and the P10/P50/P90 editor so behaviour is identical everywhere."""
+    c = col if col is not None else st
+    if kind == "Constant value":
+        return float(c.number_input(
+            f"{label_prefix}value", value=float(constant_default),
+            step=10.0, key=f"dz_const_{key_id}",
+            label_visibility="collapsed"))
+    if kind == "YAML":
+        up = c.file_uploader(f"{label_prefix}Upload a YAML case",
+                             type=["yaml", "yml"],
+                             key=f"dz_src_yaml_up_{key_id}")
+        ytxt = ""
+        if up is not None:
+            try:
+                ytxt = up.getvalue().decode("utf-8")
+            except Exception as _ex:
+                _fv_debug_error("YAML source decode", _ex)
+        ytxt = c.text_area(f"{label_prefix}…or paste YAML", value=ytxt,
+                           height=120, key=f"dz_src_yaml_txt_{key_id}",
+                           label_visibility="collapsed",
+                           placeholder="scalar:\n  units: field\n  ...")
+        return _dz_yaml_npv(ytxt)
+    if kind == "Concept":
+        pool = pools["concept_pool"]
+        if not pool:
+            c.caption("No Concept Selector results yet.")
+            return None
+        pick = c.selectbox(f"{label_prefix}concept", list(pool),
+                           key=f"dz_src_concept_{key_id}",
+                           label_visibility="collapsed")
+        return pool.get(pick)
+    if kind == "Saved case":
+        pool = pools["case_pool"]
+        if not pool:
+            c.caption("No saved cases in the database.")
+            return None
+        pick = c.selectbox(f"{label_prefix}case", list(pool),
+                           key=f"dz_src_case_{key_id}",
+                           label_visibility="collapsed")
+        return _dz_saved_case_npv(pool[pick])
+    if kind == "STEA (shared pool)":
+        if not stea_pool:
+            c.caption("Upload to the shared STEA pool above.")
+            return None
+        pick = c.selectbox(f"{label_prefix}stea", list(stea_pool),
+                           key=f"dz_src_stea_{key_id}",
+                           label_visibility="collapsed")
+        fb, sc = stea_pool[pick]
+        return _dz_stea_npv(fb, pick, sc)
+    if kind == "STEA (upload here)":
+        up = c.file_uploader(f"{label_prefix}Upload a STEA profile",
+                             type=["xlsx", "xls", "csv"],
+                             key=f"dz_src_stea_up_{key_id}")
+        if up is not None:
+            return _dz_stea_npv(up.getvalue(), up.name, pools["sc"])
+        return None
+    return None
+
+
 def _dz_yaml_npv(yaml_text: str):
     """NPV ($MM) from a single YAML case string: yaml_to_payload → run. Cached
     by a hash of the text so re-renders don't re-run an unchanged YAML."""
@@ -11422,150 +11512,51 @@ def decision_tree_section():
                     st.session_state.pop("dz_npv_cache_base", None)
                     st.rerun()
 
-    # ===== 5b · Manual / concept-linked leaf values =========================
-    st.caption("One row per tree leaf (full scenario). Type a value, or pull "
-               "an NPV from a Concept Selector result. Engine-computed values "
-               "(5a) appear here and can be overridden.")
-    # engine-linked source options from concept_results
-    cres = st.session_state.get("concept_results", {}) or {}
-    linkable = {f"{r.get('dim','?')} · {r.get('label','?')}": r.get("npv_MM")
-                for r in cres.values()
-                if r.get("ok") and r.get("npv_MM") is not None}
+    # ===== 5b · Leaf values — one unified source picker per leaf ===========
+    # Each leaf chooses ONE source: a typed constant, or a value pulled from a
+    # YAML case / Concept result / saved case / STEA profile. The chosen
+    # source's value is applied straight to the leaf (no separate constant
+    # table to compete with it), so what you pick is what the tree uses.
     if leaves and diagram.sequence:
-        if st.button("🔗 Fill missing leaves with 0", key="dz_fill0"):
-            for scn in leaves:
-                k = fdz.leaf_key(scn)
-                st.session_state["dz_leaf_values"].setdefault(k, 0.0)
-            st.rerun()
-        with st.expander(f"✏️ Edit {len(leaves)} leaf value(s)",
+        st.caption("Each leaf takes its value from ONE source. Default is a "
+                   "typed constant; switch the dropdown to pull an NPV from a "
+                   "YAML case, a Concept Selector result, a saved case, or a "
+                   "STEA profile. Engine-computed values (5a) seed the "
+                   "constants and can be overridden here.")
+        pools = _dz_source_pools()
+        # Shared STEA pool (any leaf can reference an uploaded profile by name)
+        stea_files = st.file_uploader(
+            "Shared STEA profile pool — file(s) any leaf can reference by "
+            "name (optional; you can also upload per-leaf)",
+            type=["xlsx", "xls", "csv"], accept_multiple_files=True,
+            key="dz_stea_uploads")
+        stea_pool = {}
+        if stea_files:
+            for f in stea_files:
+                stea_pool[f.name] = (f.getvalue(), pools["sc"])
+
+        st.session_state.setdefault("dz_leaf_values", {})
+        with st.expander(f"✏️ Leaf values — {len(leaves)} leaf(s)",
                          expanded=len(leaves) <= 16):
-            link_opts = ["(type below)"] + list(linkable.keys())
-            for scn in leaves:
-                k = fdz.leaf_key(scn)
-                label = "  →  ".join(f"{n}={s}" for n, s in scn)
-                lc1, lc2 = st.columns([3, 2])
-                cur_v = float(st.session_state["dz_leaf_values"].get(k, 0.0))
-                v = lc1.number_input(label, value=cur_v, step=10.0,
-                                     key=f"dz_lv_{hash(k)}")
-                if linkable:
-                    pick = lc2.selectbox(
-                        "link", link_opts, key=f"dz_lk_{hash(k)}",
-                        label_visibility="collapsed")
-                    if pick != "(type below)":
-                        v = float(linkable[pick])
-                st.session_state["dz_leaf_values"][k] = float(v)
-
-    # ===== 5c · Assign each leaf a source (concept / saved case / STEA) =====
-    if leaves and diagram.sequence:
-        with st.expander("🔗 Assign each leaf a value source "
-                         "(YAML · Concept · Saved case · STEA)",
-                         expanded=False):
-            st.caption(
-                "Point each leaf at a value source. **YAML** runs a single "
-                "case you paste or upload for that leaf. **Concept** uses an "
-                "already-run Concept Selector option's NPV. **Saved case** "
-                "loads a case from the database and runs it. **STEA** parses a "
-                "STEA profile to YAML and runs it — either from the shared "
-                "pool below or a file uploaded on the leaf itself. The "
-                "resulting NPV becomes that leaf's value. Results are cached.")
-            # economic basis used for STEA / YAML runs (STEA carries volumes &
-            # costs but not prices, so we apply the current sidebar basis)
-            _sc = {"units": st.session_state.get("units", "field"),
-                   "oil_price_bbl": st.session_state.get(
-                       "oil_price_bbl", 75.0),
-                   "gas_price_mmbtu": st.session_state.get(
-                       "gas_price_mmbtu", 4.0),
-                   "disc": st.session_state.get("disc", 0.08),
-                   "fiscal_regime": st.session_state.get(
-                       "fiscal_regime", "NCS"),
-                   "usd_to_nok": st.session_state.get("usd_to_nok", 10.5)}
-            # source pools
-            cres = st.session_state.get("concept_results", {}) or {}
-            concept_pool = {
-                f"{r.get('dim','?')} · {r.get('label','?')}": r.get("npv_MM")
-                for r in cres.values()
-                if r.get("ok") and r.get("npv_MM") is not None}
-            cases = fh.list_cases()
-            case_pool = {c["name"]: c["filename"] for c in cases}
-            # STEA shared pool — one or more files, referenced by name
-            stea_files = st.file_uploader(
-                "Shared STEA profile pool — file(s) any leaf can reference by "
-                "name (or upload per-leaf below)", type=["xlsx", "xls", "csv"],
-                accept_multiple_files=True, key="dz_stea_uploads")
-            stea_pool = {}
-            if stea_files:
-                for f in stea_files:
-                    stea_pool[f.name] = (f.getvalue(), _sc)
-
-            st.session_state.setdefault("dz_leaf_source", {})
-            src_kinds = ["(keep typed)", "YAML", "Concept", "Saved case",
-                         "STEA (shared pool)", "STEA (upload here)"]
             for scn in leaves:
                 k = fdz.leaf_key(scn)
                 kid = str(hash(k))
                 label = "  →  ".join(f"{n}={s}" for n, s in scn)
                 st.markdown(f"**{label}**")
                 a1, a2 = st.columns([1, 3])
-                kind = a1.selectbox("source", src_kinds,
+                kind = a1.selectbox("source", _DZ_SRC_KINDS,
                                     key=f"dz_src_kind_{kid}",
                                     label_visibility="collapsed")
-                npv = None
-                if kind == "YAML":
-                    # paste OR upload a single YAML case for this leaf
-                    up = a2.file_uploader(
-                        "Upload a YAML case", type=["yaml", "yml"],
-                        key=f"dz_src_yaml_up_{kid}")
-                    ytxt = ""
-                    if up is not None:
-                        try:
-                            ytxt = up.getvalue().decode("utf-8")
-                        except Exception:
-                            ytxt = ""
-                    ytxt = a2.text_area(
-                        "…or paste YAML", value=ytxt, height=120,
-                        key=f"dz_src_yaml_txt_{kid}",
-                        label_visibility="collapsed",
-                        placeholder="scalar:\n  units: field\n  ...")
-                    npv = _dz_yaml_npv(ytxt)
-                elif kind == "Concept" and concept_pool:
-                    pick = a2.selectbox("concept", list(concept_pool),
-                                        key=f"dz_src_concept_{kid}",
-                                        label_visibility="collapsed")
-                    npv = concept_pool.get(pick)
-                elif kind == "Saved case" and case_pool:
-                    pick = a2.selectbox("case", list(case_pool),
-                                        key=f"dz_src_case_{kid}",
-                                        label_visibility="collapsed")
-                    npv = _dz_saved_case_npv(case_pool[pick])
-                elif kind == "STEA (shared pool)" and stea_pool:
-                    pick = a2.selectbox("stea", list(stea_pool),
-                                        key=f"dz_src_stea_{kid}",
-                                        label_visibility="collapsed")
-                    fb, sc = stea_pool[pick]
-                    npv = _dz_stea_npv(fb, pick, sc)
-                elif kind == "STEA (upload here)":
-                    up = a2.file_uploader(
-                        "Upload a STEA profile for this leaf",
-                        type=["xlsx", "xls", "csv"],
-                        key=f"dz_src_stea_up_{kid}")
-                    if up is not None:
-                        npv = _dz_stea_npv(up.getvalue(), up.name, _sc)
-                elif kind not in ("(keep typed)", "YAML",
-                                  "STEA (upload here)"):
-                    a2.caption("No sources of this type available yet.")
-                if npv is not None:
-                    a2.caption(f"→ NPV **{npv:,.1f}** "
-                               f"{diagram.value.units}")
-                    st.session_state["dz_leaf_source"][k] = float(npv)
-                elif kind in ("YAML", "STEA (upload here)"):
-                    a2.caption("Provide a file/text above to compute NPV.")
-            if st.button("📥 Apply assigned sources to leaf values",
-                         key="dz_apply_sources"):
-                for k, val in st.session_state["dz_leaf_source"].items():
+                cur = float(st.session_state["dz_leaf_values"].get(k, 0.0))
+                val = _dz_resolve_source(
+                    kind, kid, pools, stea_pool,
+                    constant_default=cur, col=a2)
+                if val is not None:
+                    if kind != "Constant value":
+                        a2.caption(f"→ **{val:,.1f}** {diagram.value.units}")
                     st.session_state["dz_leaf_values"][k] = float(val)
-                st.session_state["dz_solved"] = False
-                st.success("Applied source NPVs to leaf values.")
-                st.rerun()
+                else:
+                    a2.caption("Provide an input above to resolve a value.")
 
     # ===== 5d · Distribution-valued leaves (P10/P50/P90) ====================
     if leaves and diagram.sequence:
@@ -11573,30 +11564,54 @@ def decision_tree_section():
                          "point value)", expanded=False):
             st.caption(
                 "Give a leaf a low/mid/high spread instead of a single "
-                "number. At solve time each marked leaf expands via Swanson's "
-                "rule (0.30·P10 + 0.40·P50 + 0.30·P90) into a small "
-                "'Outcome spread' chance node — so subsurface uncertainty "
-                "flows into the EV and the risk profile. P10 = low value, "
-                "P90 = high value.")
+                "number. Each of P10/P50/P90 takes its value from the SAME "
+                "kind of source as a leaf — a typed constant, or an NPV from "
+                "a YAML case / Concept / saved case / STEA profile. At solve "
+                "time each marked leaf expands via Swanson's rule "
+                "(0.30·P10 + 0.40·P50 + 0.30·P90) into an 'Outcome spread' "
+                "chance node. P10 = low value, P90 = high value.")
+            _dpools = _dz_source_pools()
+            _dstea_files = st.file_uploader(
+                "Shared STEA pool for distribution percentiles (optional)",
+                type=["xlsx", "xls", "csv"], accept_multiple_files=True,
+                key="dz_dist_stea_uploads")
+            _dstea_pool = {}
+            if _dstea_files:
+                for f in _dstea_files:
+                    _dstea_pool[f.name] = (f.getvalue(), _dpools["sc"])
             st.session_state.setdefault("dz_leaf_dist", {})
             for scn in leaves:
                 k = fdz.leaf_key(scn)
+                kid = str(hash(k))
                 lab = "  →  ".join(f"{n}={s}" for n, s in scn)
                 use = st.checkbox(
-                    f"Distribution for: {lab}", key=f"dz_distchk_{hash(k)}",
+                    f"Distribution for: {lab}", key=f"dz_distchk_{kid}",
                     value=(k in st.session_state["dz_leaf_dist"]))
                 if use:
                     cur = st.session_state["dz_leaf_dist"].get(
                         k, (0.0, float(st.session_state["dz_leaf_values"]
                                        .get(k, 0.0)), 0.0))
-                    d1, d2, d3 = st.columns(3)
-                    p10 = d1.number_input("P10 (low)", value=float(cur[0]),
-                                          step=10.0, key=f"dz_p10_{hash(k)}")
-                    p50 = d2.number_input("P50 (mid)", value=float(cur[1]),
-                                          step=10.0, key=f"dz_p50_{hash(k)}")
-                    p90 = d3.number_input("P90 (high)", value=float(cur[2]),
-                                          step=10.0, key=f"dz_p90_{hash(k)}")
-                    st.session_state["dz_leaf_dist"][k] = (p10, p50, p90)
+                    pvals = []
+                    for pi, (pname, pdef) in enumerate(
+                            (("P10 (low)", cur[0]), ("P50 (mid)", cur[1]),
+                             ("P90 (high)", cur[2]))):
+                        pc1, pc2 = st.columns([1, 3])
+                        pc1.markdown(f"&nbsp;&nbsp;**{pname}**",
+                                     unsafe_allow_html=True)
+                        pcol_a, pcol_b = pc2.columns([1, 2])
+                        pkind = pcol_a.selectbox(
+                            "src", _DZ_SRC_KINDS,
+                            key=f"dz_pct_kind_{kid}_{pi}",
+                            label_visibility="collapsed")
+                        pval = _dz_resolve_source(
+                            pkind, f"{kid}_{pi}", _dpools, _dstea_pool,
+                            constant_default=pdef, col=pcol_b)
+                        if pval is None:
+                            pval = float(pdef)
+                        elif pkind != "Constant value":
+                            pcol_b.caption(f"→ **{pval:,.1f}**")
+                        pvals.append(float(pval))
+                    st.session_state["dz_leaf_dist"][k] = tuple(pvals)
                 else:
                     st.session_state["dz_leaf_dist"].pop(k, None)
             if st.session_state["dz_leaf_dist"]:
