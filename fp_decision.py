@@ -663,3 +663,300 @@ def decision_flip_threshold(diagram: "InfluenceDiagram", chance_name: str,
         prev_choice = choice
     return {"sweep": sweep, "flips": flips, "first_decision": fd,
             "outcome": c.outcomes[outcome_index]}
+
+
+# ---------------------------------------------------------------------------
+# Risk attitude — exponential utility & certainty equivalent
+# ---------------------------------------------------------------------------
+import math as _math
+
+
+def exp_utility(value: float, risk_tolerance: float) -> float:
+    """Exponential utility U(x) = 1 - exp(-x / R). R = risk tolerance (same
+    units as value). As R → ∞ the decision-maker is risk-neutral (U≈x/R).
+    A finite R penalises downside (risk aversion)."""
+    if risk_tolerance is None or risk_tolerance <= 0:
+        return float(value)            # risk-neutral fallback
+    # scale so the function is numerically stable for large |value|
+    z = -float(value) / float(risk_tolerance)
+    z = max(-700.0, min(700.0, z))     # avoid overflow
+    return 1.0 - _math.exp(z)
+
+
+def certainty_equivalent(utility: float, risk_tolerance: float) -> float:
+    """Inverse of exp_utility: the certain value with the same utility as a
+    lottery's expected utility. CE = -R * ln(1 - U)."""
+    if risk_tolerance is None or risk_tolerance <= 0:
+        return float(utility)
+    arg = 1.0 - float(utility)
+    if arg <= 0:
+        return float("inf")
+    return -float(risk_tolerance) * _math.log(arg)
+
+
+def rollback_utility(tree: TreeNode, risk_tolerance: float,
+                     maximize: bool = True) -> float:
+    """Backward induction in UTILITY space: expected utility at chance nodes,
+    max/min utility at decision nodes. Annotates each node's `value` with its
+    certainty equivalent (so the tree shows $-equivalents, not raw utils).
+    Returns the root certainty equivalent."""
+    def eu(node):
+        if node.kind == "leaf":
+            return exp_utility(node.value or 0.0, risk_tolerance)
+        if node.kind == "chance":
+            u = 0.0
+            for _, p, child in node.branches:
+                u += (p or 0.0) * eu(child)
+            node.value = certainty_equivalent(u, risk_tolerance)
+            return u
+        # decision: pick the option with best expected utility
+        best_u = None
+        best_i = 0
+        for i, (_, _, child) in enumerate(node.branches):
+            cu = eu(child)
+            if best_u is None or (cu > best_u if maximize else cu < best_u):
+                best_u, best_i = cu, i
+        node.value = certainty_equivalent(best_u if best_u is not None
+                                          else 0.0, risk_tolerance)
+        node.optimal_branch = best_i
+        return best_u if best_u is not None else 0.0
+
+    root_u = eu(tree)
+    return certainty_equivalent(root_u, risk_tolerance)
+
+
+def solve(diagram: "InfluenceDiagram", risk_tolerance: float = None,
+          maximize: bool = True) -> dict:
+    """Solve a diagram either risk-neutrally (risk_tolerance None/<=0 → EV) or
+    with exponential utility (finite R → certainty equivalent). Returns
+    {tree, value, policy}."""
+    tree = compile_tree(diagram)
+    if risk_tolerance and risk_tolerance > 0:
+        val = rollback_utility(tree, risk_tolerance, maximize)
+    else:
+        val = rollback(tree, maximize)
+    return {"tree": tree, "value": val, "policy": optimal_policy(tree)}
+
+
+# ---------------------------------------------------------------------------
+# EVII — expected value of imperfect (sample) information
+# ---------------------------------------------------------------------------
+def evii_on_chance(diagram: "InfluenceDiagram", chance_name: str,
+                   reliability: dict, maximize: bool = True) -> dict:
+    """Expected value of IMPERFECT information about `chance_name`.
+
+    `reliability` is a likelihood matrix P(signal | true state): a dict
+    {true_state: {signal_label: prob}}. Perfect information is the special
+    case of an identity matrix. We:
+      1. compute P(signal) and the Bayesian posterior P(state | signal),
+      2. for each signal, re-solve the tree with the chance node's prior
+         replaced by the posterior, take the best decision EV,
+      3. average those over P(signal) → EV_with_info,
+      4. EVII = EV_with_info − EV_base.
+
+    Returns EV_base, EV_with_info, evii, and the per-signal breakdown."""
+    c = diagram.chances.get(chance_name)
+    if c is None:
+        raise ValueError(f"'{chance_name}' is not a chance node.")
+    prior = c.cpt.get((), None) or [1.0 / len(c.outcomes)] * len(c.outcomes)
+    states = c.outcomes
+    # collect the signal space from the reliability matrix
+    signals = []
+    for s in states:
+        for sig in reliability.get(s, {}):
+            if sig not in signals:
+                signals.append(sig)
+    if not signals:
+        return {"evii": 0.0, "ev_base": 0.0, "ev_with_info": 0.0,
+                "signals": []}
+    base_tree = compile_tree(diagram)
+    ev_base = (rollback_utility(base_tree, None, maximize)
+               if False else rollback(base_tree, maximize))
+    ev_info = 0.0
+    rows = []
+    for sig in signals:
+        # P(signal) = Σ_state P(state) P(signal|state)
+        p_sig = sum(prior[i] * reliability.get(states[i], {}).get(sig, 0.0)
+                    for i in range(len(states)))
+        if p_sig <= 0:
+            continue
+        # posterior P(state|signal) ∝ prior * likelihood
+        post = [prior[i] * reliability.get(states[i], {}).get(sig, 0.0)
+                / p_sig for i in range(len(states))]
+        c2 = ChanceNode(c.name, c.outcomes, parents=c.parents,
+                        cpt={(): post})
+        chances2 = dict(diagram.chances)
+        chances2[chance_name] = c2
+        d2 = InfluenceDiagram(
+            decisions=diagram.decisions, chances=chances2,
+            value=diagram.value, sequence=diagram.sequence,
+            leaf_values=diagram.leaf_values)
+        ev_s = rollback(compile_tree(d2), maximize)
+        ev_info += p_sig * ev_s
+        rows.append({"signal": sig, "p_signal": p_sig, "ev_given": ev_s,
+                     "posterior": dict(zip(states, post))})
+    return {"chance": chance_name, "ev_base": ev_base,
+            "ev_with_info": ev_info, "evii": ev_info - ev_base,
+            "signals": rows}
+
+
+# ---------------------------------------------------------------------------
+# Distribution-valued leaves (P10/P50/P90 → discrete branches)
+# ---------------------------------------------------------------------------
+def leaf_distribution_branches(p10: float, p50: float, p90: float) -> list:
+    """Swanson's-rule discretisation of a P10/P50/P90 into 3 weighted points:
+    0.30·P10 + 0.40·P50 + 0.30·P90. Returns [(value, weight), ...]. (Note the
+    petroleum convention P10<P50<P90 by VALUE — low/mid/high — is assumed.)"""
+    return [(float(p10), 0.30), (float(p50), 0.40), (float(p90), 0.30)]
+
+
+def expand_distribution_leaves(diagram: "InfluenceDiagram",
+                               dist_leaves: dict) -> "InfluenceDiagram":
+    """Return a NEW diagram where leaves with a distribution become an extra
+    chance node 'Outcome spread'. `dist_leaves` maps a leaf key (frozenset) to
+    (p10, p50, p90). Leaves not in the map keep their point value.
+
+    Implementation: we add a synthetic chance node at the END of the sequence
+    whose CPT depends on nothing but whose value is read from a augmented
+    leaf_values keyed by the spread state. This keeps the core engine intact.
+    """
+    if not dist_leaves:
+        return diagram
+    spread = ChanceNode("Outcome spread", ["Low", "Mid", "High"], parents=[],
+                        cpt={(): [0.30, 0.40, 0.30]})
+    chances2 = dict(diagram.chances)
+    chances2["Outcome spread"] = spread
+    seq2 = list(diagram.sequence) + ["Outcome spread"]
+    lv2 = {}
+    spread_labels = ["Low", "Mid", "High"]
+    for key, base_val in diagram.leaf_values.items():
+        if key in dist_leaves:
+            p10, p50, p90 = dist_leaves[key]
+            vals = [p10, p50, p90]
+        else:
+            vals = [base_val, base_val, base_val]
+        for lab, v in zip(spread_labels, vals):
+            lv2[frozenset(set(key) | {("Outcome spread", lab)})] = float(v)
+    return InfluenceDiagram(
+        decisions=diagram.decisions, chances=chances2,
+        value=diagram.value, sequence=seq2, leaf_values=lv2)
+
+
+# ---------------------------------------------------------------------------
+# Monte-Carlo sampling of the outcome distribution under a policy
+# ---------------------------------------------------------------------------
+def sample_policy_outcomes(diagram: "InfluenceDiagram", n: int = 10000,
+                           first_decision: str = None,
+                           forced_option: str = None, seed: int = 0) -> list:
+    """Draw `n` samples of the leaf VALUE realised under a policy, by sampling
+    the (probability, value) outcome distribution from policy_outcomes. The
+    tree is discrete, so this is equivalent to (and a check on) the analytic
+    distribution — useful for a familiar NPV histogram with P10/P50/P90.
+
+    Returns a list of sampled values."""
+    import random as _random
+    outs = policy_outcomes(diagram, first_decision, forced_option)
+    if not outs:
+        return []
+    probs = [max(0.0, p) for p, _ in outs]
+    vals = [v for _, v in outs]
+    total = sum(probs) or 1.0
+    probs = [p / total for p in probs]
+    # cumulative for inverse-CDF sampling
+    cum = []
+    acc = 0.0
+    for p in probs:
+        acc += p
+        cum.append(acc)
+    rng = _random.Random(seed)
+    samples = []
+    for _ in range(int(n)):
+        r = rng.random()
+        for i, c in enumerate(cum):
+            if r <= c:
+                samples.append(vals[i])
+                break
+        else:
+            samples.append(vals[-1])
+    return samples
+
+
+def percentiles(values: list, ps=(10, 50, 90)) -> dict:
+    """Return {p: value} percentiles of a sample list (linear interpolation).
+    P10 is the low value, P90 the high value (statistical convention)."""
+    if not values:
+        return {p: 0.0 for p in ps}
+    s = sorted(values)
+    n = len(s)
+    out = {}
+    for p in ps:
+        k = (p / 100.0) * (n - 1)
+        lo = int(k)
+        hi = min(lo + 1, n - 1)
+        frac = k - lo
+        out[p] = s[lo] * (1 - frac) + s[hi] * frac
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Multi-objective: a secondary value (e.g. CO2) and a combined objective
+# ---------------------------------------------------------------------------
+def solve_multiobjective(diagram: "InfluenceDiagram", leaf_secondary: dict,
+                         carbon_price: float = 0.0,
+                         maximize: bool = True) -> dict:
+    """Solve with a combined objective value − carbon_price·secondary, where
+    `leaf_secondary` maps a leaf key (frozenset) to its secondary quantity
+    (e.g. tonnes CO2). Returns {value, policy, ev_primary, ev_secondary}.
+
+    The combined leaf value is primary − carbon_price·secondary; we then roll
+    back as usual. We also report the expected primary and secondary of the
+    chosen policy so you can see the trade-off."""
+    combined = {}
+    for key, v in diagram.leaf_values.items():
+        sec = float(leaf_secondary.get(key, 0.0))
+        combined[key] = float(v) - carbon_price * sec
+    d2 = InfluenceDiagram(
+        decisions=diagram.decisions, chances=diagram.chances,
+        value=diagram.value, sequence=diagram.sequence,
+        leaf_values=combined)
+    tree = compile_tree(d2)
+    val = rollback(tree, maximize)
+    policy = optimal_policy(tree)
+    # expected primary & secondary under this policy (force the first decision
+    # to the policy's choice so the expectations match the chosen branch)
+    fd = first_decision_name(diagram)
+    fopt = policy.get(fd) if fd else None
+    prim = policy_outcomes(diagram, fd, fopt)
+    ev_primary = sum(p * v for p, v in prim)
+    d_sec = InfluenceDiagram(
+        decisions=diagram.decisions, chances=diagram.chances,
+        value=diagram.value, sequence=diagram.sequence,
+        leaf_values={k: float(leaf_secondary.get(k, 0.0))
+                     for k in diagram.leaf_values})
+    sec_out = policy_outcomes(d_sec, fd, fopt)
+    ev_secondary = sum(p * v for p, v in sec_out)
+    return {"value": val, "policy": policy, "ev_primary": ev_primary,
+            "ev_secondary": ev_secondary, "carbon_price": carbon_price}
+
+
+def carbon_price_flip_scan(diagram: "InfluenceDiagram", leaf_secondary: dict,
+                           price_max: float, steps: int = 41,
+                           maximize: bool = True) -> dict:
+    """Sweep carbon price 0→price_max and record the optimal first decision +
+    combined value at each, flagging where the decision flips. Shows how the
+    recommendation shifts as carbon is priced in."""
+    fd = first_decision_name(diagram)
+    sweep, flips = [], []
+    prev = None
+    for i in range(steps):
+        cp = price_max * i / (steps - 1) if steps > 1 else 0.0
+        r = solve_multiobjective(diagram, leaf_secondary, cp, maximize)
+        choice = r["policy"].get(fd) if fd else None
+        sweep.append({"carbon_price": cp, "value": r["value"],
+                      "choice": choice,
+                      "ev_primary": r["ev_primary"],
+                      "ev_secondary": r["ev_secondary"]})
+        if prev is not None and choice != prev:
+            flips.append({"carbon_price": cp, "from": prev, "to": choice})
+        prev = choice
+    return {"sweep": sweep, "flips": flips, "first_decision": fd}

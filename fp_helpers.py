@@ -8158,3 +8158,48 @@ def stea_profiles_to_monthly_df(profiles: dict, usd_to_nok: float = 10.5):
             })
     df = pd.DataFrame(rows)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Concept-study save / load (dimensions + selections + reference + flags)
+# ---------------------------------------------------------------------------
+def concept_study_to_doc(dimensions, selected, reference, showstoppers,
+                         base_payload=None, name="Concept study") -> dict:
+    """Serialise a Concept Selector study to a plain JSON/YAML-safe dict.
+
+    `selected` maps dim index → set of option indices; `reference` maps dim
+    index → option index; `showstoppers` is a set of (dim, opt) tuples. These
+    index-keyed structures are converted to lists so they round-trip cleanly.
+    """
+    return {
+        "fieldvista_concept_study": {
+            "name": name,
+            "dimensions": dimensions,
+            "selected": {str(di): sorted(list(s))
+                         for di, s in (selected or {}).items()},
+            "reference": {str(di): oi
+                          for di, oi in (reference or {}).items()},
+            "showstoppers": [list(t) for t in (showstoppers or set())],
+            "base_payload": base_payload,
+        }
+    }
+
+
+def concept_study_from_doc(doc: dict) -> dict:
+    """Inverse of concept_study_to_doc. Returns a dict with keys dimensions,
+    selected, reference, showstoppers, base_payload, name — ready to drop into
+    session state."""
+    root = doc.get("fieldvista_concept_study", doc)
+    selected = {int(di): set(s)
+                for di, s in (root.get("selected", {}) or {}).items()}
+    reference = {int(di): oi
+                 for di, oi in (root.get("reference", {}) or {}).items()}
+    showstoppers = {tuple(t) for t in (root.get("showstoppers", []) or [])}
+    return {
+        "name": root.get("name", "Concept study"),
+        "dimensions": root.get("dimensions", []),
+        "selected": selected,
+        "reference": reference,
+        "showstoppers": showstoppers,
+        "base_payload": root.get("base_payload"),
+    }

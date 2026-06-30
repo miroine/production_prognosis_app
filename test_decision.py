@@ -204,6 +204,94 @@ dz.probability_tornado(diag); dz.value_tornado(diag)
 check("diagram EV unchanged after analytics",
       dz.rollback(dz.compile_tree(diag)), _ev_before)
 
+section("11. Risk attitude — utility & certainty equivalent")
+# Utility round-trip: CE(U(x)) == x.
+check("CE inverts utility (x=100, R=500)",
+      dz.certainty_equivalent(dz.exp_utility(100.0, 500.0), 500.0), 100.0)
+# Risk-neutral (R=None) → utility solve == EV solve == 72.
+_sn = dz.solve(diag, risk_tolerance=None)
+check("risk-neutral solve EV = 72", _sn["value"], 72.0)
+# Risk-averse: CE of the Drill lottery must be BELOW its EV (72).
+# Drill: 0.6·200 + 0.4·(-120). With finite R the CE < 72.
+_sa = dz.solve(diag, risk_tolerance=200.0)
+check("risk-averse CE < EV (downside penalised)", _sa["value"] < 72.0, True)
+# Strong risk aversion can flip the optimal decision to 'Don't' (CE 0).
+_sa2 = dz.solve(diag, risk_tolerance=60.0)
+check("strong risk aversion flips to Don't",
+      _sa2["policy"].get("Drill?"), "Don't")
+
+section("12. EVII — imperfect information")
+# Perfect reliability (identity) → EVII == EVPI (= 48).
+_perfect = {"Wet": {"Wet": 1.0, "Dry": 0.0},
+            "Dry": {"Wet": 0.0, "Dry": 1.0}}
+_e1 = dz.evii_on_chance(diag, "Reservoir", _perfect)
+check("EVII with perfect test = EVPI = 48", _e1["evii"], 48.0, tol=1e-6)
+# Useless test (no discrimination) → EVII = 0.
+_useless = {"Wet": {"good": 0.5, "bad": 0.5},
+            "Dry": {"good": 0.5, "bad": 0.5}}
+_e2 = dz.evii_on_chance(diag, "Reservoir", _useless)
+check("EVII with useless test = 0", _e2["evii"], 0.0, tol=1e-6)
+# Imperfect test (80% reliable) → 0 < EVII < EVPI.
+_imp = {"Wet": {"good": 0.8, "bad": 0.2},
+        "Dry": {"good": 0.3, "bad": 0.7}}
+_e3 = dz.evii_on_chance(diag, "Reservoir", _imp)
+check("imperfect EVII between 0 and EVPI",
+      0.0 < _e3["evii"] < 48.0, True)
+
+section("13. Distribution-valued leaves (Swanson)")
+_sw = dz.leaf_distribution_branches(10, 50, 90)
+check("Swanson weights 0.3/0.4/0.3", [w for _, w in _sw], [0.30, 0.40, 0.30])
+check("Swanson mean = 0.3·10+0.4·50+0.3·90 = 50",
+      sum(v * w for v, w in _sw), 50.0)
+# Expand a leaf into a distribution and check EV shifts by its mean.
+_dl = {dz.leaf_key([("Drill?", "Drill"), ("Reservoir", "Wet")]):
+       (150.0, 200.0, 260.0)}   # mean = 0.3·150+0.4·200+0.3·260 = 203
+_dd = dz.expand_distribution_leaves(diag, _dl)
+# new EV(Drill) = 0.6·203 + 0.4·(-120) = 121.8 - 48 = 73.8
+check("distribution-expanded EV = 73.8",
+      dz.rollback(dz.compile_tree(_dd)), 73.8, tol=1e-6)
+
+section("14. Monte-Carlo sampling of policy outcomes")
+# Sampling the Drill tree (Wet 0.6→200, Dry 0.4→-120) should reproduce the
+# analytic mean (72) and the two outcome values.
+_samp = dz.sample_policy_outcomes(diag, n=20000, seed=1)
+check("MC sample count = 20000", len(_samp), 20000)
+_mean = sum(_samp) / len(_samp)
+check("MC mean ≈ analytic EV 72", _mean, 72.0, tol=3.0)
+check("MC only yields leaf values {200,-120}",
+      set(round(v) for v in _samp) <= {200, -120}, True)
+_pct = dz.percentiles(_samp)
+# P10 should be the low (-120 region), P90 the high (200)
+check("MC P90 = 200 (upside)", _pct[90], 200.0)
+check("MC P10 = -120 (downside)", _pct[10], -120.0)
+
+section("15. Multi-objective (NPV − carbon·CO2)")
+# Add CO2 to the Drill leaves: Drilling emits, Don't emits nothing.
+_co2 = {
+    dz.leaf_key([("Drill?", "Drill"), ("Reservoir", "Wet")]): 100.0,
+    dz.leaf_key([("Drill?", "Drill"), ("Reservoir", "Dry")]): 100.0,
+    dz.leaf_key([("Drill?", "Don't"), ("Reservoir", "Wet")]): 0.0,
+    dz.leaf_key([("Drill?", "Don't"), ("Reservoir", "Dry")]): 0.0,
+}
+# At carbon_price=0 → same as before (Drill, EV 72).
+_m0 = dz.solve_multiobjective(diag, _co2, carbon_price=0.0)
+check("multiobj @0 carbon = EV 72", _m0["value"], 72.0)
+check("multiobj @0 picks Drill", _m0["policy"].get("Drill?"), "Drill")
+# At a high carbon price the 100 t CO2 penalty makes Drill's combined value
+# negative → flips to Don't. Combined Drill EV = 72 − cp·100.
+# Flip when 72 − 100·cp < 0 → cp > 0.72.
+_m1 = dz.solve_multiobjective(diag, _co2, carbon_price=1.0)
+check("multiobj @ high carbon flips to Don't",
+      _m1["policy"].get("Drill?"), "Don't")
+check("multiobj reports EV primary (NPV) separately",
+      _m0["ev_primary"], 72.0)
+# Flip scan should find the crossover near 0.72.
+_scan = dz.carbon_price_flip_scan(diag, _co2, price_max=2.0, steps=81)
+check("carbon flip scan finds a flip", len(_scan["flips"]) >= 1, True)
+if _scan["flips"]:
+    check("carbon flip near 0.72", _scan["flips"][0]["carbon_price"], 0.72,
+          tol=0.05)
+
 print(f"\n{'='*52}")
 print(f"DECISION-ANALYSIS TESTS: {_passed} passed, {_failed} failed")
 print(f"{'='*52}")

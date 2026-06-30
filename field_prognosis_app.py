@@ -10886,6 +10886,56 @@ def _dz_seed_example():
     }
 
 
+def _dz_seed_brime_example():
+    """Seed an NCS Brime extended-reach-well decision, mirroring the Prisma
+    influence diagram: a Development decision and a 2nd extended-reach-well
+    decision, with Brime production uncertainty and uncertain development
+    cost, valued on Cashflow (NPV). Discretised to keep the tree readable."""
+    st.session_state["dz_decisions"] = [
+        {"name": "Develop?", "options": "Develop, Defer"},
+        {"name": "2nd Brime well?", "options": "Drill 2nd, Single well"},
+    ]
+    st.session_state["dz_chances"] = [
+        {"name": "Brime production", "outcomes": "Low, Base, High",
+         "parents": ""},
+        {"name": "Development cost", "outcomes": "Under, On, Over",
+         "parents": ""},
+    ]
+    st.session_state["dz_cpt"] = {
+        "Brime production": {(): [0.3, 0.4, 0.3]},
+        "Development cost": {(): [0.25, 0.5, 0.25]},
+    }
+    st.session_state["dz_sequence"] = [
+        "Develop?", "2nd Brime well?", "Brime production",
+        "Development cost"]
+    st.session_state["dz_value_name"] = "Cashflow (NPV)"
+    st.session_state["dz_value_units"] = "$MM"
+    # Build leaf values: Defer → 0. Develop → base NPV by production, a 2nd
+    # well lifts production-driven upside but adds cost; cost overrun subtracts.
+    prod_npv = {"Low": -150.0, "Base": 250.0, "High": 600.0}
+    prod_npv_2well = {"Low": -120.0, "Base": 420.0, "High": 950.0}
+    well2_capex = 180.0
+    cost_delta = {"Under": +90.0, "On": 0.0, "Over": -160.0}
+    lv = {}
+    for dev in ("Develop", "Defer"):
+        for w2 in ("Drill 2nd", "Single well"):
+            for prod in ("Low", "Base", "High"):
+                for cost in ("Under", "On", "Over"):
+                    key = fdz.leaf_key([
+                        ("Develop?", dev), ("2nd Brime well?", w2),
+                        ("Brime production", prod),
+                        ("Development cost", cost)])
+                    if dev == "Defer":
+                        lv[key] = 0.0
+                    elif w2 == "Drill 2nd":
+                        lv[key] = (prod_npv_2well[prod] - well2_capex
+                                   + cost_delta[cost])
+                    else:
+                        lv[key] = prod_npv[prod] + cost_delta[cost]
+    st.session_state["dz_leaf_values"] = lv
+    st.session_state["dz_solved"] = False
+
+
 def _dz_yaml_npv(yaml_text: str):
     """NPV ($MM) from a single YAML case string: yaml_to_payload → run. Cached
     by a hash of the text so re-renders don't re-run an unchanged YAML."""
@@ -10898,10 +10948,11 @@ def _dz_yaml_npv(yaml_text: str):
         return cache[sig]
     try:
         payload, _ = fh.yaml_to_payload(yaml_text)
-        r = run_payload_case(payload, date.today())
+        r = run_payload_case_cached(payload, date.today())
         npv = r.get("kpis", {}).get("npv_MM")
         cache[sig] = float(npv) if npv is not None else None
-    except Exception:
+    except Exception as _ex:
+        _fv_debug_error("YAML leaf NPV", _ex)
         cache[sig] = None
     return cache[sig]
 
@@ -10913,10 +10964,11 @@ def _dz_saved_case_npv(filename: str):
         return cache[filename]
     try:
         case = fh.load_case(filename)
-        r = run_payload_case(case["payload"], date.today())
+        r = run_payload_case_cached(case["payload"], date.today())
         npv = r.get("kpis", {}).get("npv_MM")
         cache[filename] = float(npv) if npv is not None else None
-    except Exception:
+    except Exception as _ex:
+        _fv_debug_error("Saved-case leaf NPV", _ex)
         cache[filename] = None
     return cache[filename]
 
@@ -10935,9 +10987,36 @@ def _dz_stea_npv(file_bytes: bytes, filename: str, scalar: dict):
                           default_units=scalar.get("units", "field"))
         npv = r.get("kpis", {}).get("npv_MM")
         cache[sig] = float(npv) if npv is not None else None
-    except Exception:
+    except Exception as _ex:
+        _fv_debug_error("STEA leaf NPV", _ex)
         cache[sig] = None
     return cache[sig]
+
+
+def _dz_state_dependent_policy(tree):
+    """Walk the solved tree and collect, for each decision, the optimal option
+    under each distinct upstream chance context. Returns {decision: {context
+    string: chosen option}}. A decision with one entry is context-independent;
+    multiple entries mean the best choice depends on what was observed."""
+    out = {}
+
+    def walk(node, ctx):
+        if node.kind == "leaf":
+            return
+        if node.kind == "decision":
+            if node.optimal_branch is not None and node.branches:
+                opt = node.branches[node.optimal_branch][0]
+                out.setdefault(node.label, {})[ctx] = opt
+                _, _, child = node.branches[node.optimal_branch]
+                walk(child, ctx)
+        else:  # chance — extend the context with each observed outcome
+            for blabel, _, child in node.branches:
+                nctx = (f"{ctx}, {node.label}={blabel}" if ctx
+                        else f"{node.label}={blabel}")
+                walk(child, nctx)
+
+    walk(tree, "")
+    return out
 
 
 def _dz_parse_patch(text: str) -> dict:
@@ -10995,11 +11074,14 @@ def decision_tree_section():
     if "dz_decisions" not in st.session_state:
         _dz_seed_example()
 
-    tcol1, tcol2 = st.columns([1, 4])
-    if tcol1.button("🧪 Load example", key="dz_example"):
+    tcol1, tcol2, tcol3 = st.columns([1, 1, 3])
+    if tcol1.button("🧪 Drill example", key="dz_example"):
         _dz_seed_example()
         st.rerun()
-    if tcol2.button("🧹 Clear all", key="dz_clear"):
+    if tcol2.button("🛢️ NCS Brime example", key="dz_example_brime"):
+        _dz_seed_brime_example()
+        st.rerun()
+    if tcol3.button("🧹 Clear all", key="dz_clear"):
         for k in ("dz_decisions", "dz_chances", "dz_cpt", "dz_sequence",
                   "dz_leaf_values", "dz_value_name", "dz_value_units"):
             st.session_state.pop(k, None)
@@ -11161,14 +11243,26 @@ def decision_tree_section():
                              use_container_width=True,
                              key=f"dz_cpt_{c.name}", disabled=c.parents)
         new_cpt = {}
+        _bad_rows = []
         for j, combo in enumerate(keys):
             vals = [float(cdf.iloc[j][o]) for o in c.outcomes]
             new_cpt[combo] = vals
+            _rs = sum(vals)
+            if abs(_rs - 1.0) > 1e-6:
+                _bad_rows.append((combo, _rs))
             prev = st.session_state["dz_cpt"].get(c.name, {}).get(combo)
             if prev is None or [round(x, 6) for x in vals] != \
                     [round(x, 6) for x in prev]:
                 _cpt_dirty = True
         _pending_cpt[c.name] = new_cpt
+        if _bad_rows:
+            _msg = "; ".join(
+                f"[{', '.join(str(x) for x in combo)}] Σ={rs:.3f}"
+                for combo, rs in _bad_rows[:4])
+            _more = (f" (+{len(_bad_rows)-4} more)"
+                     if len(_bad_rows) > 4 else "")
+            st.caption(f":orange[⚠️ {len(_bad_rows)} row(s) don't sum to 1: "
+                       f"{_msg}{_more} — will be normalised on Apply.]")
 
     if plain_nodes or cpt_nodes:
         if _cpt_dirty:
@@ -11298,7 +11392,7 @@ def decision_tree_section():
                                 cp = _apply_concept_patches(
                                     base_payload,
                                     [{"label": "leaf", "patches": merged}])
-                                r = run_payload_case(cp, date.today())
+                                r = run_payload_case_cached(cp, date.today())
                                 npv = r.get("kpis", {}).get("npv_MM")
                                 if npv is not None:
                                     cache[msig] = float(npv)
@@ -11473,9 +11567,72 @@ def decision_tree_section():
                 st.success("Applied source NPVs to leaf values.")
                 st.rerun()
 
+    # ===== 5d · Distribution-valued leaves (P10/P50/P90) ====================
+    if leaves and diagram.sequence:
+        with st.expander("📊 Distribution leaves (P10/P50/P90 instead of a "
+                         "point value)", expanded=False):
+            st.caption(
+                "Give a leaf a low/mid/high spread instead of a single "
+                "number. At solve time each marked leaf expands via Swanson's "
+                "rule (0.30·P10 + 0.40·P50 + 0.30·P90) into a small "
+                "'Outcome spread' chance node — so subsurface uncertainty "
+                "flows into the EV and the risk profile. P10 = low value, "
+                "P90 = high value.")
+            st.session_state.setdefault("dz_leaf_dist", {})
+            for scn in leaves:
+                k = fdz.leaf_key(scn)
+                lab = "  →  ".join(f"{n}={s}" for n, s in scn)
+                use = st.checkbox(
+                    f"Distribution for: {lab}", key=f"dz_distchk_{hash(k)}",
+                    value=(k in st.session_state["dz_leaf_dist"]))
+                if use:
+                    cur = st.session_state["dz_leaf_dist"].get(
+                        k, (0.0, float(st.session_state["dz_leaf_values"]
+                                       .get(k, 0.0)), 0.0))
+                    d1, d2, d3 = st.columns(3)
+                    p10 = d1.number_input("P10 (low)", value=float(cur[0]),
+                                          step=10.0, key=f"dz_p10_{hash(k)}")
+                    p50 = d2.number_input("P50 (mid)", value=float(cur[1]),
+                                          step=10.0, key=f"dz_p50_{hash(k)}")
+                    p90 = d3.number_input("P90 (high)", value=float(cur[2]),
+                                          step=10.0, key=f"dz_p90_{hash(k)}")
+                    st.session_state["dz_leaf_dist"][k] = (p10, p50, p90)
+                else:
+                    st.session_state["dz_leaf_dist"].pop(k, None)
+            if st.session_state["dz_leaf_dist"]:
+                st.info(f"{len(st.session_state['dz_leaf_dist'])} leaf(s) "
+                        f"will expand into low/mid/high outcomes at solve.")
+
     # ---- Solve ----
     st.markdown("#### 6 · Solve")
     diagram = _dz_get_diagram()
+    # Apply distribution leaves (if any) — expands marked leaves into an
+    # 'Outcome spread' chance node before solving.
+    _dist = st.session_state.get("dz_leaf_dist", {})
+    if _dist:
+        diagram = fdz.expand_distribution_leaves(diagram, _dist)
+    # ---- Risk attitude (utility) ----
+    st.markdown("###### Risk attitude")
+    _ra1, _ra2 = st.columns([1, 2])
+    _risk_mode = _ra1.radio(
+        "Decision basis", ["Risk-neutral (EV)", "Risk-averse (utility)"],
+        key="dz_risk_mode",
+        help="**Risk-neutral** maximises expected value. **Risk-averse** "
+             "uses an exponential utility and reports the certainty "
+             "equivalent (CE) — the guaranteed value worth as much as the "
+             "risky policy. A low risk tolerance penalises downside and can "
+             "change the recommended decision.")
+    _risk_tol = None
+    if _risk_mode.startswith("Risk-averse"):
+        _risk_tol = _ra2.number_input(
+            f"Risk tolerance R ({diagram.value.units}) — smaller = more "
+            f"risk-averse", min_value=1.0, value=float(
+                st.session_state.get("dz_risk_tol", 500.0)), step=50.0,
+            key="dz_risk_tol",
+            help="R is the value at which you'd accept a 50/50 gamble of "
+                 "+R / −R/2. Rule of thumb: ~⅙ of the company's risk capital. "
+                 "As R → ∞ this converges to risk-neutral EV.")
+
     if st.button("🧮 Calculate decision tree", type="primary",
                  key="dz_solve"):
         st.session_state["dz_solved"] = True
@@ -11484,37 +11641,77 @@ def decision_tree_section():
     if st.session_state.get("dz_solved") and diagram.sequence \
             and not diagram.validate():
         try:
-            tree = fdz.compile_tree(diagram)
-            ev = fdz.rollback(tree, maximize=True)
-            policy = fdz.optimal_policy(tree)
+            # Solve risk-neutrally or in utility space per the chosen basis.
+            sol = fdz.solve(diagram, risk_tolerance=_risk_tol, maximize=True)
+            tree = sol["tree"]
+            ev = sol["value"]
+            policy = sol["policy"]
             stats = fdz.tree_stats(tree)
+            _val_label = ("Certainty equivalent" if _risk_tol
+                          else "Expected value")
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric(f"Expected value ({diagram.value.units})",
-                       f"{ev:,.1f}")
+            mc1.metric(f"{_val_label} ({diagram.value.units})", f"{ev:,.1f}")
             mc2.metric("Tree leaves", stats["leaves"])
             mc3.metric("Optimal first decision",
                        next(iter(policy.values()), "—") if policy else "—")
+            if _risk_tol:
+                # show the risk premium vs the risk-neutral EV
+                _ev_neutral = fdz.rollback(fdz.compile_tree(diagram), True)
+                st.caption(
+                    f"Risk-neutral EV would be **{_ev_neutral:,.1f}**; the "
+                    f"**risk premium** (EV − CE) is "
+                    f"**{_ev_neutral - ev:,.1f}** {diagram.value.units} — "
+                    f"what you implicitly 'pay' for certainty at R="
+                    f"{_risk_tol:,.0f}.")
             if policy:
                 st.success("**Optimal policy:** "
                            + " · ".join(f"{k} → **{v}**"
                                         for k, v in policy.items()))
+            # State-dependent policy: decisions downstream of a chance node
+            # can have different optimal choices per observed outcome.
+            _sdp = _dz_state_dependent_policy(tree)
+            if any(len(v) > 1 for v in _sdp.values()):
+                with st.expander("🔀 State-dependent optimal choices "
+                                 "(decisions that depend on what's observed)",
+                                 expanded=False):
+                    for dname, ctx_map in _sdp.items():
+                        if len(ctx_map) <= 1:
+                            continue
+                        st.markdown(f"**{dname}**")
+                        st.dataframe(pd.DataFrame(
+                            [{"Given": ctx or "(no prior observation)",
+                              "Choose": opt}
+                             for ctx, opt in ctx_map.items()]),
+                            use_container_width=True, hide_index=True)
+
             st.markdown("##### Decision tree")
-            _zoom = st.select_slider(
-                "Tree size", options=["Fit", "Large", "Extra large"],
-                value="Large", key="dz_tree_zoom",
-                help="Enlarge the tree for readability. Use the horizontal "
-                     "scrollbar to pan a wide tree.")
-            _scale = {"Fit": 1.0, "Large": 1.5, "Extra large": 2.2}[_zoom]
-            tsvg = _dz_tree_svg(tree, scale=_scale)
-            st.markdown(
-                f'<div style="overflow:auto;width:100%;max-height:680px;'
-                f'border:1px solid #234;border-radius:8px;'
-                f'background:#0a1722;padding:8px">{tsvg}</div>',
-                unsafe_allow_html=True)
-            st.caption("Gold squares = decisions (thick gold branch = "
-                       "optimal), teal circles = chance nodes (branch "
-                       "probabilities shown), green dots = leaf values. "
-                       "Numbers above nodes are rolled-back expected values.")
+            # Large-tree guard: a very wide tree renders an unreadable SVG.
+            if stats["leaves"] > 256:
+                st.warning(
+                    f"This tree has **{stats['leaves']} leaves** — the "
+                    f"diagram would be very large. Showing the summary, "
+                    f"analysis and policy instead of the full tree SVG. "
+                    f"Reduce node states or split the problem for a "
+                    f"readable tree.")
+            else:
+                _zoom = st.select_slider(
+                    "Tree size", options=["Fit", "Large", "Extra large"],
+                    value="Large", key="dz_tree_zoom",
+                    help="Enlarge the tree for readability. Use the "
+                         "horizontal scrollbar to pan a wide tree.")
+                _scale = {"Fit": 1.0, "Large": 1.5,
+                          "Extra large": 2.2}[_zoom]
+                tsvg = _dz_tree_svg(tree, scale=_scale)
+                st.session_state["_dz_tree_svg"] = tsvg   # for export
+                st.markdown(
+                    f'<div style="overflow:auto;width:100%;max-height:680px;'
+                    f'border:1px solid #234;border-radius:8px;'
+                    f'background:#0a1722;padding:8px">{tsvg}</div>',
+                    unsafe_allow_html=True)
+                st.caption("Gold squares = decisions (thick gold branch = "
+                           "optimal), teal circles = chance nodes (branch "
+                           "probabilities shown), green dots = leaf values. "
+                           "Numbers above nodes are rolled-back values.")
 
             # ---- EVPI ----
             if diagram.chances:
@@ -11562,7 +11759,8 @@ def decision_tree_section():
             sa_tabs = st.tabs([
                 "🌪️ Probability tornado", "💰 Value tornado",
                 "🎚️ Decision-flip threshold", "📈 Risk profile (CDF)",
-                "📋 Policy comparison"])
+                "📋 Policy comparison", "🔬 Imperfect info (EVII)",
+                "🎲 Monte-Carlo", "🌍 Carbon (NPV+CO₂)"])
 
             # --- 1 · Probability tornado ---
             with sa_tabs[0]:
@@ -11760,6 +11958,211 @@ def decision_tree_section():
                                "the best once downside matters.")
                 else:
                     st.info("Needs at least one decision node.")
+
+            # --- 6 · EVII: value of imperfect information ---
+            with sa_tabs[5]:
+                st.caption(
+                    "What an **imperfect** appraisal (well test, seismic) is "
+                    "worth. Pick the uncertainty it informs, define the test "
+                    "reliability P(signal | true state), and get the expected "
+                    "value of that information (EVII) — compare it to the "
+                    "test's cost. A perfect test's EVII equals the EVPI; a "
+                    "useless test's EVII is 0.")
+                ch_for_evii = [c for c in diagram.chances
+                               if not diagram.chances[c].parents]
+                if ch_for_evii:
+                    ecn = st.selectbox("Uncertainty the test informs",
+                                       ch_for_evii, key="dz_evii_node")
+                    cobj = diagram.chances[ecn]
+                    st.markdown("**Test reliability** — P(signal | true "
+                                "state). Rows = true state, columns = signal "
+                                "the test returns.")
+                    # default: an 80%-reliable test with a signal per state
+                    rkey = f"dz_evii_rel_{ecn}"
+                    if rkey not in st.session_state:
+                        rel0 = {}
+                        n = len(cobj.outcomes)
+                        for i, s in enumerate(cobj.outcomes):
+                            rel0[s] = {f"says {o}":
+                                       (0.8 if i == j else 0.2 / max(1, n - 1))
+                                       for j, o in enumerate(cobj.outcomes)}
+                        st.session_state[rkey] = rel0
+                    sig_cols = [f"says {o}" for o in cobj.outcomes]
+                    rel_rows = []
+                    for s in cobj.outcomes:
+                        row = {"true state": s}
+                        for sc in sig_cols:
+                            row[sc] = st.session_state[rkey].get(
+                                s, {}).get(sc, 0.0)
+                        rel_rows.append(row)
+                    rel_df = st.data_editor(
+                        pd.DataFrame(rel_rows), hide_index=True,
+                        use_container_width=True, key=f"dz_evii_edit_{ecn}",
+                        column_config={"true state":
+                                       st.column_config.TextColumn(
+                                           disabled=True)})
+                    # persist + build reliability dict
+                    reliability = {}
+                    for _, r in rel_df.iterrows():
+                        reliability[r["true state"]] = {
+                            o.replace("says ", ""): float(r[sc])
+                            for o, sc in zip(cobj.outcomes, sig_cols)}
+                    st.session_state[rkey] = {
+                        r["true state"]: {sc: float(r[sc]) for sc in sig_cols}
+                        for _, r in rel_df.iterrows()}
+                    if st.button("🔬 Compute EVII", key="dz_evii_btn"):
+                        try:
+                            e = fdz.evii_on_chance(diagram, ecn, reliability)
+                            ev_perfect = fdz.evpi_on_chance(
+                                diagram, ecn)["evpi"]
+                            m1, m2, m3 = st.columns(3)
+                            m1.metric("EVII (imperfect)",
+                                      f"{e['evii']:,.1f} "
+                                      f"{diagram.value.units}")
+                            m2.metric("EVPI (perfect)",
+                                      f"{ev_perfect:,.1f}")
+                            _eff = (e['evii'] / ev_perfect * 100
+                                    if ev_perfect else 0)
+                            m3.metric("Test efficiency", f"{_eff:.0f}%")
+                            if e["signals"]:
+                                st.dataframe(pd.DataFrame([{
+                                    "Signal": s["signal"],
+                                    "P(signal)": round(s["p_signal"], 3),
+                                    "EV | signal": round(s["ev_given"], 1),
+                                } for s in e["signals"]]),
+                                    use_container_width=True,
+                                    hide_index=True)
+                            st.caption(
+                                "**EVII** is the ceiling on what this test is "
+                                "worth before you run it. If EVII < the test "
+                                "cost, the appraisal doesn't pay for itself. "
+                                "Test efficiency = EVII / EVPI.")
+                        except Exception as _ex:
+                            st.error(f"EVII failed: {_ex}")
+                else:
+                    st.info("Needs an unconditional chance node to inform.")
+
+            # --- 7 · Monte-Carlo outcome histogram ---
+            with sa_tabs[6]:
+                st.caption(
+                    "Sample the NPV distribution under the optimal policy. "
+                    "The tree is discrete, so this is the exact outcome "
+                    "distribution shown as a familiar histogram with "
+                    "P10 / P50 / P90 markers.")
+                _mc_n = st.select_slider(
+                    "Samples", options=[1000, 5000, 10000, 50000],
+                    value=10000, key="dz_mc_n")
+                _fd_mc = fdz.first_decision_name(diagram)
+                # compare optimal vs each first-decision option
+                _opts_mc = (["(optimal policy)"]
+                            + (diagram.decisions[_fd_mc].options
+                               if _fd_mc else []))
+                _pick_mc = st.selectbox("Policy to sample", _opts_mc,
+                                        key="dz_mc_policy")
+                if _pick_mc == "(optimal policy)":
+                    samp = fdz.sample_policy_outcomes(diagram, n=_mc_n,
+                                                      seed=1)
+                else:
+                    samp = fdz.sample_policy_outcomes(
+                        diagram, n=_mc_n, first_decision=_fd_mc,
+                        forced_option=_pick_mc, seed=1)
+                if samp:
+                    pct = fdz.percentiles(samp, (10, 50, 90))
+                    _mean = sum(samp) / len(samp)
+                    h1, h2, h3, h4 = st.columns(4)
+                    h1.metric("Mean", f"{_mean:,.1f}")
+                    h2.metric("P10 (down)", f"{pct[10]:,.1f}")
+                    h3.metric("P50", f"{pct[50]:,.1f}")
+                    h4.metric("P90 (up)", f"{pct[90]:,.1f}")
+                    figmc = go.Figure()
+                    figmc.add_trace(go.Histogram(
+                        x=samp, nbinsx=40, marker_color="#3aa6c4",
+                        opacity=0.85, name="NPV"))
+                    for _p, _c, _lab in ((pct[10], "#EB0037", "P10"),
+                                         (pct[50], "#E0A500", "P50"),
+                                         (pct[90], "#9DBA00", "P90")):
+                        figmc.add_vline(x=_p, line=dict(color=_c, dash="dash"),
+                                        annotation_text=_lab)
+                    figmc.update_layout(
+                        title=f"NPV distribution — {_pick_mc}",
+                        xaxis_title=f"NPV ({diagram.value.units})",
+                        yaxis_title="Frequency", height=420,
+                        showlegend=False)
+                    st.plotly_chart(fh.apply_plot_template(figmc),
+                                    use_container_width=True)
+                    p_loss = sum(1 for v in samp if v < 0) / len(samp)
+                    st.caption(f"P(loss) = **{p_loss*100:.0f}%** of "
+                               f"realisations are negative. The spread "
+                               f"(P90 − P10 = {pct[90]-pct[10]:,.0f}) is the "
+                               f"outcome risk you carry under this policy.")
+                else:
+                    st.info("Solve a tree with leaf values first.")
+
+            # --- 8 · Carbon: multi-objective NPV + CO2 ---
+            with sa_tabs[7]:
+                st.caption(
+                    "Add CO₂ tonnes per leaf and see how the optimal decision "
+                    "shifts as carbon is priced in. The objective becomes "
+                    "NPV − carbon_price × tCO₂. Useful for NCS where emissions "
+                    "carry a real cost.")
+                st.session_state.setdefault("dz_leaf_co2", {})
+                _leaves_c = fdz.enumerate_leaves(diagram)
+                with st.expander(f"✏️ CO₂ per leaf "
+                                 f"({len(_leaves_c)} leaves)",
+                                 expanded=len(_leaves_c) <= 16):
+                    for scn in _leaves_c:
+                        k = fdz.leaf_key(scn)
+                        lab = "  →  ".join(f"{n}={s}" for n, s in scn)
+                        st.session_state["dz_leaf_co2"][k] = st.number_input(
+                            f"{lab} — tCO₂", value=float(
+                                st.session_state["dz_leaf_co2"].get(k, 0.0)),
+                            step=1000.0, key=f"dz_co2_{hash(k)}")
+                _cpmax = st.slider(
+                    "Max carbon price to scan ($/tCO₂)", 0.0, 500.0, 150.0,
+                    10.0, key="dz_carbon_max")
+                co2_map = st.session_state["dz_leaf_co2"]
+                if any(v for v in co2_map.values()):
+                    scan = fdz.carbon_price_flip_scan(
+                        diagram, co2_map, price_max=max(1.0, _cpmax),
+                        steps=41)
+                    sw = scan["sweep"]
+                    figc = go.Figure()
+                    figc.add_trace(go.Scatter(
+                        x=[s["carbon_price"] for s in sw],
+                        y=[s["value"] for s in sw], mode="lines",
+                        line=dict(color="#00243D", width=3),
+                        name="Combined value"))
+                    figc.add_trace(go.Scatter(
+                        x=[s["carbon_price"] for s in sw],
+                        y=[s["ev_primary"] for s in sw], mode="lines",
+                        line=dict(color="#9DBA00", width=2, dash="dot"),
+                        name="NPV (primary)"))
+                    for fl in scan["flips"]:
+                        figc.add_vline(
+                            x=fl["carbon_price"],
+                            line=dict(color="#EB0037", dash="dash"),
+                            annotation_text=(f"flip {fl['from']}→{fl['to']} "
+                                             f"@ ${fl['carbon_price']:.0f}"))
+                    figc.update_layout(
+                        title="Optimal value vs carbon price",
+                        xaxis_title="Carbon price ($/tCO₂)",
+                        yaxis_title=f"Value ({diagram.value.units})",
+                        height=420)
+                    st.plotly_chart(fh.apply_plot_template(figc),
+                                    use_container_width=True)
+                    if scan["flips"]:
+                        for fl in scan["flips"]:
+                            st.success(
+                                f"At **${fl['carbon_price']:.0f}/tCO₂** the "
+                                f"optimal {scan['first_decision']} switches "
+                                f"from **{fl['from']}** to **{fl['to']}** — "
+                                f"the carbon price at which emissions change "
+                                f"the decision.")
+                    else:
+                        st.info("The optimal decision doesn't change over "
+                                "this carbon-price range.")
+                else:
+                    st.info("Enter CO₂ tonnes for at least one leaf to scan.")
         except Exception as e:
             st.error(f"Could not solve the tree: {e}")
 
@@ -11792,6 +12195,107 @@ def decision_tree_section():
                         priors[par][s], 3), "Posterior": round(v, 3)}
                         for s, v in pp.items()]),
                     use_container_width=True, hide_index=True)
+
+    # ---- Export decision results (tree SVG + analysis plots) ----
+    if st.session_state.get("dz_solved") and diagram.sequence \
+            and not diagram.validate():
+        st.markdown("#### 8 · Export")
+        with st.expander("🖼️ Export decision results (SVG / PDF)",
+                         expanded=False):
+            st.caption("Bundle the decision tree and the analysis charts "
+                       "(EVPI, tornadoes, risk profile) into one file for a "
+                       "decision memo.")
+            try:
+                _ex_tree = fdz.compile_tree(diagram)
+                fdz.rollback(_ex_tree, maximize=True)
+                figs = []
+                # EVPI bar
+                _ev_rows = []
+                for cn in diagram.chances:
+                    try:
+                        _e = fdz.evpi_on_chance(diagram, cn)
+                        _ev_rows.append((cn, _e["evpi"]))
+                    except Exception:
+                        pass
+                if _ev_rows:
+                    _ev_rows.sort(key=lambda r: r[1], reverse=True)
+                    figs.append(("EVPI", go.Figure(go.Bar(
+                        x=[v for _, v in _ev_rows],
+                        y=[n for n, _ in _ev_rows], orientation="h",
+                        marker_color="#3aa6c4"))))
+                # probability tornado
+                _pt = fdz.probability_tornado(diagram, delta=0.2)
+                if _pt:
+                    _f = go.Figure()
+                    for r in _pt:
+                        _f.add_trace(go.Bar(
+                            y=[r["node"]], x=[r["high"] - r["low"]],
+                            base=r["low"], orientation="h",
+                            marker_color="#E0A500", showlegend=False))
+                    _f.update_layout(title="Probability tornado",
+                                     barmode="overlay")
+                    figs.append(("Probability tornado", _f))
+                # value tornado
+                _vt = fdz.value_tornado(diagram, delta=0.2)[:12]
+                if _vt:
+                    _f = go.Figure()
+                    for r in _vt:
+                        _f.add_trace(go.Bar(
+                            y=[r["leaf"]], x=[r["high"] - r["low"]],
+                            base=r["low"], orientation="h",
+                            marker_color="#EB0037", showlegend=False))
+                    _f.update_layout(title="Value tornado",
+                                     barmode="overlay")
+                    figs.append(("Value tornado", _f))
+                # risk profile CDF
+                _fd = fdz.first_decision_name(diagram)
+                if _fd:
+                    _f = go.Figure()
+                    for opt in diagram.decisions[_fd].options:
+                        _cdf = fdz.cdf_points(fdz.policy_outcomes(
+                            diagram, _fd, opt))
+                        if _cdf:
+                            _f.add_trace(go.Scatter(
+                                x=[v for v, _ in _cdf],
+                                y=[c for _, c in _cdf], mode="lines",
+                                line=dict(shape="hv"), name=f"{_fd}={opt}"))
+                    _f.update_layout(title="Risk profile (CDF)")
+                    figs.append(("Risk profile", _f))
+
+                ec1, ec2 = st.columns([1, 2])
+                _fmt = ec1.radio("Format", ["PDF", "SVG"],
+                                 key="dz_export_fmt")
+                ec2.caption(f"{len(figs)} chart(s) + tree SVG")
+                if st.button("📦 Build export", key="dz_export_build"):
+                    try:
+                        # tree SVG → its own file alongside the plot bundle
+                        data, mime, fname = _export_figs_bundle(figs, _fmt)
+                        fname = fname.replace("concept_charts",
+                                              "decision_analysis")
+                        st.session_state["_dz_export_blob"] = (
+                            data, mime, fname)
+                        # also offer the raw tree SVG
+                        tsvg = st.session_state.get("_dz_tree_svg", "")
+                        if tsvg:
+                            st.session_state["_dz_tree_svg_blob"] = (
+                                tsvg.encode(), "image/svg+xml",
+                                "decision_tree.svg")
+                        st.success(f"Built {fname} "
+                                   f"({len(data)/1024:,.0f} KB).")
+                    except Exception as _ee:
+                        st.error(f"Export failed: {_ee}")
+                _b = st.session_state.get("_dz_export_blob")
+                if _b:
+                    st.download_button(f"⬇️ Download {_b[2]}", data=_b[0],
+                                       mime=_b[1], file_name=_b[2],
+                                       key="dz_export_dl")
+                _tb = st.session_state.get("_dz_tree_svg_blob")
+                if _tb:
+                    st.download_button("⬇️ Download decision_tree.svg",
+                                       data=_tb[0], mime=_tb[1],
+                                       file_name=_tb[2], key="dz_tree_dl")
+            except Exception as _e:
+                st.error(f"Export setup failed: {_e}")
 
 
 def _render_landing_menu(page_opts):
@@ -11841,6 +12345,69 @@ def _render_landing_menu(page_opts):
                          use_container_width=True, type="primary"):
                 st.session_state["active_page"] = opt
                 st.rerun()
+
+
+def _fv_scenario_presets() -> dict:
+    """Return named starting cases as flat session_state-key dicts. Keys match
+    the sidebar widget keys so applying a preset then rerunning populates the
+    inputs. '_desc' is shown next to the picker and is not applied."""
+    return {
+        "NCS oil — mid-size subsea tie-back": {
+            "_desc": "≈120 MMstb oil, 6 producers, depletion, NCS fiscal.",
+            "units": "field",
+            "fluid": "Oil with associated gas",
+            "strategy": "Depletion",
+            "ooip": 120.0, "rf_target": 0.42, "horizon": 25,
+            "p_init": 4500.0, "t_res": 210.0, "api": 36.0,
+            "gas_grav": 0.75,
+            "oil_price_bbl": 75.0, "gas_price_mmbtu": 4.0,
+            "opex_fixed": 25.0, "disc": 0.08,
+            "fiscal_regime": "NCS (Norwegian shelf)",
+            "capex_well": 60.0, "aban_cost": 90.0,
+        },
+        "NCS oil — water injection (IOR)": {
+            "_desc": "Same field with water injection lifting RF.",
+            "units": "field",
+            "fluid": "Oil with associated gas",
+            "strategy": "Injection",
+            "ooip": 120.0, "rf_target": 0.55, "horizon": 30,
+            "p_init": 4500.0, "t_res": 210.0, "api": 36.0,
+            "gas_grav": 0.75,
+            "oil_price_bbl": 75.0, "gas_price_mmbtu": 4.0,
+            "opex_fixed": 32.0, "disc": 0.08,
+            "fiscal_regime": "NCS (Norwegian shelf)",
+            "capex_well": 60.0, "aban_cost": 90.0,
+        },
+        "NCS gas-condensate": {
+            "_desc": "≈500 Bscf gas-condensate, depletion, 4 wells.",
+            "units": "field",
+            "fluid": "Gas with condensate",
+            "strategy": "Depletion",
+            "ogip": 500.0, "rf_target": 0.70, "horizon": 20,
+            "p_init": 6000.0, "t_res": 260.0, "gas_grav": 0.70,
+            "oil_price_bbl": 75.0, "gas_price_mmbtu": 5.0,
+            "opex_fixed": 18.0, "disc": 0.08,
+            "fiscal_regime": "NCS (Norwegian shelf)",
+            "capex_well": 70.0, "aban_cost": 70.0,
+        },
+        "Tax/royalty oil — small development": {
+            "_desc": "≈40 MMstb oil, Tax/Royalty regime, depletion.",
+            "units": "field",
+            "fluid": "Oil with associated gas",
+            "strategy": "Depletion",
+            "ooip": 40.0, "rf_target": 0.35, "horizon": 20,
+            "p_init": 3800.0, "t_res": 190.0, "api": 32.0,
+            "gas_grav": 0.78,
+            "oil_price_bbl": 70.0, "gas_price_mmbtu": 3.5,
+            "opex_fixed": 15.0, "disc": 0.10,
+            "fiscal_regime": "Tax/Royalty",
+            "capex_well": 45.0, "aban_cost": 60.0,
+        },
+    }
+
+
+def _fv_scenario_presets_unused_guard():
+    pass
 
 
 def main():
@@ -11947,8 +12514,28 @@ def main():
                 st.session_state["active_page"] = _opt
                 st.rerun()
         st.markdown("---")
-
-    # ---- Landing menu -----------------------------------------------------
+        with st.expander("⚙️ App tools", expanded=False):
+            if st.button("🧹 Clear compute cache",
+                         use_container_width=True, key="clear_cache_btn",
+                         help="Force a fresh recompute of all cached cases "
+                              "(batch, Monte-Carlo, decision-tree leaves). "
+                              "Use after hand-editing a payload or if a "
+                              "result looks stale."):
+                try:
+                    _run_payload_cached.clear()
+                except Exception:
+                    pass
+                # also clear the hand-rolled per-source NPV caches
+                for _k in ("dz_npv_cache", "dz_npv_cache_base",
+                           "dz_yaml_npv_cache", "dz_case_npv_cache",
+                           "dz_stea_npv_cache", "_concept_cc_fig"):
+                    st.session_state.pop(_k, None)
+                st.success("Compute cache cleared.")
+            st.checkbox(
+                "🐞 Debug mode (surface hidden errors)", key="fv_debug",
+                help="When on, internal operations that normally fail "
+                     "silently will show the error, to help diagnose "
+                     "problems. Leave off for normal use.")
     if page == _MENU:
         _render_landing_menu(_page_opts)
         st.markdown(
@@ -12003,6 +12590,30 @@ def main():
             unsafe_allow_html=True,
         )
         return
+
+    # ---- Scenario presets ----
+    # One-click starting points that populate the sidebar inputs with a
+    # sensible, runnable case so a new user isn't staring at a blank field.
+    # Each preset is a flat dict of session_state keys → values, applied then
+    # the page reruns so the sidebar widgets pick them up.
+    with st.expander("⚡ Start from a preset (typical NCS cases)",
+                     expanded=False):
+        st.caption("Load a complete, runnable starting case, then tweak it in "
+                   "the sidebar. Presets overwrite the current field inputs.")
+        _presets = _fv_scenario_presets()
+        pc1, pc2 = st.columns([2, 1])
+        _pick = pc1.selectbox("Preset", list(_presets.keys()),
+                              key="fv_preset_pick")
+        pc2.caption(_presets[_pick].get("_desc", ""))
+        if st.button(f"⚡ Load '{_pick}'", key="fv_preset_load"):
+            for k, v in _presets[_pick].items():
+                if k.startswith("_"):
+                    continue
+                st.session_state[k] = v
+            st.session_state["_fv_preset_loaded"] = _pick
+            st.success(f"Loaded preset '{_pick}'. Adjust in the sidebar, "
+                       f"then run.")
+            st.rerun()
 
     # ---- Guided walkthrough ----
     # A self-contained onboarding panel that takes the user from a blank
@@ -15408,6 +16019,50 @@ def run_payload_case(payload: dict, default_start_date,
     return res
 
 
+def _fv_debug_error(context: str, exc: Exception) -> None:
+    """Surface an otherwise-swallowed error when debug mode is on. Safe to
+    call from any except block: it never raises and does nothing unless the
+    user has ticked the Debug toggle in the sidebar."""
+    try:
+        if st.session_state.get("fv_debug"):
+            st.warning(f"🐞 {context}: {type(exc).__name__}: {exc}")
+    except Exception:
+        pass
+
+
+@st.cache_data(show_spinner=False, max_entries=512)
+def _run_payload_cached(payload_json: str, start_iso: str,
+                        default_units: str) -> dict:
+    """Cached core of run_payload_case. Keyed on a JSON-serialised payload +
+    ISO start date + unit system, all hashable, so identical cases (re-runs,
+    repeated batch/MC/decision-tree scenarios) are computed once. The payload
+    is round-tripped through JSON so the cache key is stable regardless of
+    dict ordering. run_payload_case itself is pure, so this is safe."""
+    import json as _json
+    from datetime import date as _date
+    payload = _json.loads(payload_json)
+    start = _date.fromisoformat(start_iso) if start_iso else None
+    return run_payload_case(payload, start, default_units=default_units)
+
+
+def run_payload_case_cached(payload: dict, default_start_date,
+                            default_units: str = "field") -> dict:
+    """Drop-in cached version of run_payload_case. Falls back to a direct
+    (uncached) run if the payload can't be JSON-serialised (e.g. exotic
+    objects) so it never breaks a case that the uncached path would run."""
+    import json as _json
+    try:
+        payload_json = _json.dumps(payload, sort_keys=True, default=str)
+        start_iso = (default_start_date.isoformat()
+                     if hasattr(default_start_date, "isoformat")
+                     else str(default_start_date or ""))
+        return _run_payload_cached(payload_json, start_iso, default_units)
+    except Exception as _ex:
+        _fv_debug_error("Cache wrapper fell back to direct run", _ex)
+        return run_payload_case(payload, default_start_date,
+                                default_units=default_units)
+
+
 # =============================================================================
 # Scenario comparison
 # =============================================================================
@@ -17747,7 +18402,7 @@ def batch_mode_section(units, fluid):
         payload["_meta"] = meta
         progress.progress((i + 0.5) / len(cases),
                           text=f"Running '{meta.get('name', f'Case {i+1}')}'…")
-        res = run_payload_case(payload, default_sd, units)
+        res = run_payload_case_cached(payload, default_sd, units)
         res["name"] = meta.get("name", f"Case {i+1}")
         results.append(res)
         if save_cases and res["ok"]:
@@ -19004,7 +19659,37 @@ tables:
 Rules: ask a question for every REQUIRED field the text doesn't give; list \
 every default you assume in "assumptions". Numbers must be plain (no units \
 in values). Use the user's stated unit system. Production wells: if the text \
-gives a field rate or well count, build that many producer rows."""
+gives a field rate or well count, build that many producer rows.
+
+ELICITATION — be thorough. A vague description produces a weak case, so \
+ASK rather than silently defaulting the value-driving inputs. Generate a \
+question for EACH of the following that the text does not clearly pin down \
+(group related ones, but do not skip a category just because a default \
+exists):
+  • Units & fluid: field vs metric? oil / gas-condensate / dry gas? (never \
+guess the unit system — always confirm if unstated)
+  • Volumes in place: OOIP / OGIP, and the recovery factor (or whether to \
+auto-scale RF from drive mechanism)? expected reserves if they'd rather give \
+that?
+  • Well rates & count: initial rate per well, number of producers, decline \
+type (exp/hyperbolic/harmonic) and rate (Di, b-factor)? plateau or straight \
+decline? water cut start/final and ramp?
+  • Drainage strategy: depletion or injection (water/gas/WAG)? number of \
+injectors and injection rate if injection?
+  • Prices & revenue: oil $/bbl, gas $/MMBtu, any condensate/NGL credit, \
+processing/transport tariffs?
+  • Costs — CAPEX: drilling $/well (or rig day-rate + days), facility CAPEX \
+total and timing (subsea/topside split), abandonment cost?
+  • Costs — OPEX: variable OPEX ($/bbl oil, $/Mscf gas) AND fixed OPEX \
+($MM/yr) — ask for both, they drive break-even strongly?
+  • Fiscal: regime (Tax/Royalty, PSC, or NCS)? tax & royalty rates, or NCS \
+CIT/SPT/uplift? discount rate and real-vs-nominal basis?
+  • Schedule: first-production date, project horizon, ramp-up?
+  • Emissions: CO2 price / intensity if the user cares about it?
+Prefer asking 4-8 well-targeted questions over assuming. Each question should \
+name the quantity AND its unit (e.g. \"Initial oil rate per producer in \
+stb/d?\", \"Fixed OPEX in $MM/yr?\"). Put concrete fallback values into the \
+YAML so it always runs, and record every such fallback in \"assumptions\"."""
 
 
 def _llm_chat(provider: str, cfg: dict, system: str, messages: list):
@@ -19101,8 +19786,29 @@ injection / WAG), Number of producers (4 / 6 / 8 wells via
 _n_producers_override), Host facility (Tie-back / New FPSO / Jacket via
 _facility_capex_override_MM), Oil price scenario (Low/Base/High via
 oil_price_bbl). Give each dimension 2-5 options. Use the user's stated unit
-system. Ask a question for every REQUIRED base-case field the text doesn't
-give; list every default in "assumptions". Numbers are plain (no units)."""
+system. Numbers are plain (no units).
+
+ELICITATION — be thorough so the BASE case and the DIMENSIONS are both well
+grounded. Ask a question for EACH of the following that the text doesn't pin
+down (group sensibly; don't skip a category just because a default exists):
+  • Base case essentials: unit system (field/metric — always confirm if
+unstated), fluid type, OOIP/OGIP, recovery factor, first-production date,
+horizon.
+  • Base rates & wells: initial rate per producer, base well count, decline
+type and rate, water-cut profile.
+  • Base economics: oil/gas prices, variable AND fixed OPEX, tariffs, drilling
+CAPEX per well, facility CAPEX total, abandonment, discount rate, fiscal
+regime (Tax/Royalty, PSC, or NCS terms).
+  • Which AXES to compare: which of these the user wants as decision
+dimensions — drainage strategy, well count, host/facility concept, oil-price
+scenario, recovery factor, fiscal regime — and the discrete OPTIONS for each
+(e.g. exactly which well counts, which host concepts, which price levels)?
+  • For each option, the cost / recovery DELTA: e.g. the CAPEX of each host
+concept, the RF uplift from each drainage strategy, the price level of each
+scenario — so the patches are realistic, not placeholders.
+Prefer 4-8 targeted questions. Each question names the quantity and its unit.
+Put concrete fallback values in base_yaml and option patches so the study
+always runs, and record every fallback in "assumptions"."""
 
 
 def _nl_run_study(base_payload: dict, dimensions: list, start_date):
@@ -19124,7 +19830,7 @@ def _nl_run_study(base_payload: dict, dimensions: list, start_date):
                 case_payload = _apply_concept_patches(base_payload, picks)
                 case_payload.setdefault("_meta", {})["name"] = (
                     f"{d.get('name','Dim')} · {label}")
-                r = run_payload_case(case_payload, start_date)
+                r = run_payload_case_cached(case_payload, start_date)
                 k = r.get("kpis", {})
                 results[(d["name"], label)] = {
                     "name": f"{d.get('name','Dim')} · {label}",
@@ -19259,7 +19965,7 @@ def _nl_tornado(payload: dict, start_date, base_npv: float) -> "pd.DataFrame":
                     if not any_set:
                         npvs.append(None)
                         continue
-                r = run_payload_case(t, start_date)
+                r = run_payload_case_cached(t, start_date)
                 npvs.append(r["kpis"].get("npv_MM") if r.get("ok") else None)
             except Exception:
                 npvs.append(None)
@@ -19295,7 +20001,7 @@ def _nl_monte_carlo(payload: dict, start_date, n: int = 100,
             ft["amount_MMUSD"] = [float(x) * ffac
                                   for x in ft["amount_MMUSD"]]
         try:
-            r = run_payload_case(t, start_date)
+            r = run_payload_case_cached(t, start_date)
             if r.get("ok") and r["kpis"].get("npv_MM") is not None:
                 draws.append(float(r["kpis"]["npv_MM"]))
         except Exception:
@@ -19450,6 +20156,65 @@ def _nl_demo_envelope(text: str) -> dict:
     else:
         questions.append("What is the facility CAPEX (in $MM or MNOK)?")
 
+    # ---- recovery factor ----
+    rf_target = None
+    m_rf = _re.search(r"(?:recovery factor|\brf\b)\D{0,8}(\d{1,2})\s?%", lo)
+    if m_rf:
+        rf_target = float(m_rf.group(1)) / 100.0
+        assumptions.append(f"recovery factor = {rf_target:.0%} (stated)")
+    else:
+        questions.append("What recovery factor do you expect (%), or should "
+                         "it be auto-scaled from the drive mechanism?")
+
+    # ---- prices ----
+    oil_price = None
+    # Require a $ sign or the word "price" nearby so a rate like "8000 bbl/d"
+    # is not misread as a price.
+    m_op = _re.search(
+        r"(?:\$|\boil price\D{0,6})\s?(\d{2,3})\s?(?:/|\s?per\s?)?\s?"
+        r"(?:bbl|barrel|\b)", lo)
+    if m_op and ("$" in m_op.group(0) or "price" in m_op.group(0)):
+        oil_price = float(m_op.group(1))
+        assumptions.append(f"oil price = ${oil_price:g}/bbl (stated)")
+    elif is_oil:
+        questions.append("What oil price ($/bbl) should I use?")
+    gas_price = None
+    m_gp = _re.search(r"\$\s?(\d{1,2}(?:\.\d)?)\s?(?:/|\s?per\s?)?\s?mmbtu",
+                      lo)
+    if m_gp:
+        gas_price = float(m_gp.group(1))
+        assumptions.append(f"gas price = ${gas_price:g}/MMBtu (stated)")
+
+    # ---- OPEX (variable + fixed) ----
+    opex_fixed = None
+    m_of = _re.search(r"fixed opex\D{0,8}(\d{1,3})", lo)
+    if m_of:
+        opex_fixed = float(m_of.group(1))
+        assumptions.append(f"fixed OPEX = ${opex_fixed:g}MM/yr (stated)")
+    else:
+        questions.append("What is the fixed OPEX ($MM/yr) and the variable "
+                         "OPEX ($/bbl oil, $/Mscf gas)?")
+
+    # ---- drilling CAPEX per well ----
+    capex_well = None
+    m_cw = _re.search(r"(?:well cost|drilling cost|capex per well)"
+                      r"\D{0,8}(\d{1,4})", lo)
+    if m_cw:
+        capex_well = float(m_cw.group(1))
+        assumptions.append(f"drilling CAPEX = ${capex_well:g}MM/well "
+                           "(stated)")
+    else:
+        questions.append("What is the drilling CAPEX per well ($MM), or a "
+                         "rig day-rate + days per well?")
+
+    # ---- abandonment + discount ----
+    if not _re.search(r"abandon|decommission|p&a|cessation", lo):
+        questions.append("What abandonment / decommissioning cost ($MM) "
+                         "should I assume?")
+    if not _re.search(r"discount|\bwacc\b|\bnpv\d", lo):
+        questions.append("What discount rate (%) and is the basis real or "
+                         "nominal?")
+
     # ---- fiscal & strategy ----
     if _re.search(r"\bncs\b|norweg|norway|78\s?%", lo):
         fiscal = "NCS (Norwegian shelf)"
@@ -19504,12 +20269,20 @@ def _nl_demo_envelope(text: str) -> dict:
     case = {"scalar": {"units": units, "fluid": fluid,
                        "strategy": strategy, "start_date": start_date,
                        "horizon": 25,
-                       "rf_target": 0.35 if is_oil else 0.65,
-                       "auto_scale_rf": True,
-                       "oil_price_bbl": 75.0, "gas_price_mmbtu": 10.0,
-                       "opex_fixed": 20.0, "disc": 0.10,
+                       "rf_target": (rf_target if rf_target is not None
+                                     else (0.35 if is_oil else 0.65)),
+                       "auto_scale_rf": rf_target is None,
+                       "oil_price_bbl": (oil_price if oil_price is not None
+                                         else 75.0),
+                       "gas_price_mmbtu": (gas_price if gas_price is not None
+                                           else 10.0),
+                       "opex_fixed": (opex_fixed if opex_fixed is not None
+                                      else 20.0),
+                       "disc": 0.10,
                        "fiscal_regime": fiscal,
-                       "capex_well": 50.0, "well_cost_mode": "fixed",
+                       "capex_well": (capex_well if capex_well is not None
+                                      else 50.0),
+                       "well_cost_mode": "fixed",
                        "aban_cost": 80.0, "co2_price": 80.0},
             "tables": {
                 "rigs_df": [{"name": "Rig-A", "start_date": rig_start,
@@ -20079,7 +20852,7 @@ def case_from_text_section(default_start_date):
                         key="nl_run_btn"):
             try:
                 payload, _meta = fh.yaml_to_payload(yaml_text)
-                res = run_payload_case(payload, default_start_date)
+                res = run_payload_case_cached(payload, default_start_date)
                 if not res.get("ok"):
                     st.error(f"Engine error: {res.get('error')}")
                 else:
@@ -20573,6 +21346,54 @@ def concept_selector_section(default_start_date):
     # itself via _concept_register_fig so the "export all images" feature can
     # bundle them into one SVG zip or one multi-page PDF.
     _concept_reset_fig_registry()
+
+    # ---- Save / load this study (dimensions + selections + flags) ---------
+    with st.expander("💾 Save / load this study", expanded=False):
+        import yaml as _yaml
+        st.caption("Save the whole study — dimensions, options, which are "
+                   "selected, the reference plan and any show-stoppers — to a "
+                   "file you can reload later or share. (Results aren't "
+                   "saved; re-run the batch after loading.)")
+        _doc = fh.concept_study_to_doc(
+            dimensions, selected, concept_reference, concept_showstoppers,
+            base_payload=st.session_state.get("concept_base_payload"),
+            name=st.session_state.get("concept_study_name", "Concept study"))
+        cs1, cs2 = st.columns(2)
+        cs1.download_button(
+            "⬇️ Download study (YAML)",
+            data=_yaml.safe_dump(_doc, sort_keys=False).encode(),
+            file_name="concept_study.yaml", mime="text/yaml",
+            key="concept_dl_yaml")
+        cs2.download_button(
+            "⬇️ Download study (JSON)",
+            data=json.dumps(_doc, indent=2, default=str).encode(),
+            file_name="concept_study.json", mime="application/json",
+            key="concept_dl_json")
+        up = st.file_uploader("Load a saved study (.yaml / .json)",
+                              type=["yaml", "yml", "json"],
+                              key="concept_study_upload")
+        if up is not None and st.button("📂 Load uploaded study",
+                                        key="concept_study_load"):
+            try:
+                raw = up.read().decode("utf-8")
+                doc = (json.loads(raw) if up.name.lower().endswith("json")
+                       else _yaml.safe_load(raw))
+                loaded = fh.concept_study_from_doc(doc)
+                st.session_state["concept_dimensions"] = loaded["dimensions"]
+                st.session_state["concept_selected"] = loaded["selected"]
+                st.session_state["concept_reference"] = loaded["reference"]
+                st.session_state["concept_showstoppers"] = \
+                    loaded["showstoppers"]
+                st.session_state["concept_study_name"] = loaded["name"]
+                if loaded.get("base_payload"):
+                    st.session_state["concept_base_payload"] = \
+                        loaded["base_payload"]
+                st.session_state["concept_results"] = {}   # require re-run
+                st.success(f"Loaded study '{loaded['name']}'. Re-run the "
+                           f"batch to populate results.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not load study: {e}")
 
     # ---- Base case source -------------------------------------------------
     # The batch sweeps each combination ON TOP OF a base payload. By default
@@ -22000,7 +22821,7 @@ def concept_selector_section(default_start_date):
                                         f"(cache hits: {cache_hits})")
                 continue
             try:
-                res = run_payload_case(case_payload, default_start_date,
+                res = run_payload_case_cached(case_payload, default_start_date,
                                         default_units=st.session_state.get(
                                             "units", "field"))
                 if res.get("ok"):
@@ -22307,7 +23128,7 @@ def concept_selector_section(default_start_date):
                             _tbl["fac_df"] = _newfac
                             _trial["tables"] = _tbl
                         try:
-                            _r = run_payload_case(
+                            _r = run_payload_case_cached(
                                 _trial, default_start_date,
                                 default_units=st.session_state.get(
                                     "units", "field"))
@@ -22699,7 +23520,7 @@ def concept_selector_section(default_start_date):
                         _r.get("resolved_payload") and not _r.get("manual"):
                     try:
                         _rp = _r["resolved_payload"]
-                        _re = run_payload_case(
+                        _re = run_payload_case_cached(
                             _rp, default_start_date,
                             default_units=_run_units)
                         if _re.get("ok"):
