@@ -10754,8 +10754,8 @@ def _dz_tree_svg(tree, max_depth=6, scale=1.0):
     optimal branch out of each decision is drawn thick/gold. `scale` enlarges
     spacing and fonts so the tree is readable (1.0 = base, 1.5/2.0 = bigger)."""
     import html as _html
-    leaf_gap = int(54 * scale)
-    x_step = int(240 * scale)
+    leaf_gap = int(64 * scale)
+    x_step = int(230 * scale)
     fs_node = max(11, int(13 * scale))     # node label font
     fs_edge = max(10, int(12 * scale))     # branch label font
     fs_val = max(11, int(13 * scale))      # value font
@@ -10793,43 +10793,52 @@ def _dz_tree_svg(tree, max_depth=6, scale=1.0):
             px, py = parent_xy
             col = "#E0A500" if is_opt else "#6f8aa0"
             w = (4 if is_opt else 2) * (scale ** 0.5)
+            # elbow connector: horizontal out of parent, vertical, horizontal
+            # into child — far clearer than a single diagonal curve and keeps
+            # branch labels off the nodes.
+            midx = (px + x) / 2
             parts.append(
-                f'<path d="M{px},{py} C{(px+x)/2},{py} {(px+x)/2},{y} '
-                f'{x},{y}" stroke="{col}" stroke-width="{w:.1f}" '
-                f'fill="none"/>')
+                f'<path d="M{px},{py} L{midx},{py} L{midx},{y} L{x},{y}" '
+                f'stroke="{col}" stroke-width="{w:.1f}" fill="none"/>')
             lbl = _html.escape(str(edge_label)[:18])
             if prob is not None:
                 lbl += f" (p={prob:.2f})"
+            # branch label sits on the horizontal-into-child segment, just
+            # above it, so it never overlaps a node or its value.
             parts.append(
-                f'<text x="{(px+x)/2}" y="{(py+y)/2-4*scale}" '
+                f'<text x="{(midx + x) / 2}" y="{y - 4 * scale}" '
                 f'fill="#aebfcd" font-size="{fs_edge}" '
                 f'text-anchor="middle">{lbl}</text>')
         if node.kind == "leaf" or depth >= max_depth:
             v = node.value or 0.0
+            vcol = "#9DBA00" if v >= 0 else "#EB0037"
             parts.append(f'<circle cx="{x}" cy="{y}" r="{leaf_r}" '
-                         f'fill="#9DBA00"/>')
+                         f'fill="{vcol}"/>')
             parts.append(
-                f'<text x="{x+leaf_r+4}" y="{y+4}" fill="#e6efce" '
+                f'<text x="{x + leaf_r + 5}" y="{y + 4}" fill="#e6efce" '
                 f'font-size="{fs_val}" font-weight="bold">{v:,.0f}</text>')
             return
         if node.kind == "decision":
             parts.append(
-                f'<rect x="{x-dec_half}" y="{y-dec_half}" '
-                f'width="{dec_half*2}" height="{dec_half*2}" rx="2" '
-                f'fill="#E0A500" stroke="#fff" stroke-width="1"/>')
+                f'<rect x="{x - dec_half}" y="{y - dec_half}" '
+                f'width="{dec_half * 2}" height="{dec_half * 2}" rx="2" '
+                f'fill="#E0A500" stroke="#fff" stroke-width="1.5"/>')
         else:
             parts.append(
                 f'<circle cx="{x}" cy="{y}" r="{chance_r}" fill="#3aa6c4" '
-                f'stroke="#fff" stroke-width="1"/>')
+                f'stroke="#fff" stroke-width="1.5"/>')
+        # Node NAME above the node; rolled-back VALUE to the LEFT of the node
+        # (between it and its incoming edge) so name/value never collide and
+        # are clear of the branch labels which sit to the right.
+        parts.append(
+            f'<text x="{x}" y="{y - chance_r - 6 * scale}" fill="#ffffff" '
+            f'font-size="{fs_node}" font-weight="bold" '
+            f'text-anchor="middle">{_html.escape(node.label[:18])}</text>')
         if node.value is not None:
             parts.append(
-                f'<text x="{x}" y="{y-chance_r-6*scale}" fill="#cfe0ec" '
+                f'<text x="{x - chance_r - 5}" y="{y + 4}" fill="#cfe0ec" '
                 f'font-size="{fs_val}" font-weight="bold" '
-                f'text-anchor="middle">{node.value:,.0f}</text>')
-        parts.append(
-            f'<text x="{x}" y="{y+chance_r+fs_node+2}" fill="#ffffff" '
-            f'font-size="{fs_node}" text-anchor="middle">'
-            f'{_html.escape(node.label[:18])}</text>')
+                f'text-anchor="end">{node.value:,.0f}</text>')
         for i, (blabel, bprob, ch) in enumerate(node.branches):
             opt = (node.kind == "decision" and node.optimal_branch == i)
             draw(ch, depth + 1, (x, y), blabel, bprob, opt)
@@ -10934,6 +10943,15 @@ def _dz_seed_field_a_example():
                         lv[key] = prod_npv[prod] + cost_delta[cost]
     st.session_state["dz_leaf_values"] = lv
     st.session_state["dz_solved"] = False
+
+
+def _dz_leaf_widget_id(scenario) -> str:
+    """A stable, collision-free widget-key fragment for a leaf scenario.
+    Built from the (node,state) pairs via md5 so it's identical across reruns
+    (unlike hash() of a frozenset, which is per-process randomised)."""
+    import hashlib as _hl
+    items = "|".join(f"{n}={s}" for n, s in sorted(scenario))
+    return _hl.md5(items.encode()).hexdigest()[:12]
 
 
 def _dz_source_pools():
@@ -11536,11 +11554,15 @@ def decision_tree_section():
                 stea_pool[f.name] = (f.getvalue(), pools["sc"])
 
         st.session_state.setdefault("dz_leaf_values", {})
+        _leaf_changed = False
         with st.expander(f"✏️ Leaf values — {len(leaves)} leaf(s)",
                          expanded=len(leaves) <= 16):
             for scn in leaves:
                 k = fdz.leaf_key(scn)
-                kid = str(hash(k))
+                # Deterministic, collision-free widget key from the scenario
+                # content (hash() of a frozenset is per-process randomised and
+                # unsafe as a stable widget key).
+                kid = _dz_leaf_widget_id(scn)
                 label = "  →  ".join(f"{n}={s}" for n, s in scn)
                 st.markdown(f"**{label}**")
                 a1, a2 = st.columns([1, 3])
@@ -11554,9 +11576,17 @@ def decision_tree_section():
                 if val is not None:
                     if kind != "Constant value":
                         a2.caption(f"→ **{val:,.1f}** {diagram.value.units}")
+                    if abs(float(val) - cur) > 1e-9:
+                        _leaf_changed = True
                     st.session_state["dz_leaf_values"][k] = float(val)
                 else:
                     a2.caption("Provide an input above to resolve a value.")
+        # If any leaf value changed, the previously-shown solution is stale —
+        # invalidate it so the user re-Calculates against the new values.
+        if _leaf_changed:
+            st.session_state["dz_solved"] = False
+            st.info("Leaf values changed — press **🧮 Calculate decision "
+                    "tree** below to update the results.")
 
     # ===== 5d · Distribution-valued leaves (P10/P50/P90) ====================
     if leaves and diagram.sequence:
@@ -11582,7 +11612,7 @@ def decision_tree_section():
             st.session_state.setdefault("dz_leaf_dist", {})
             for scn in leaves:
                 k = fdz.leaf_key(scn)
-                kid = str(hash(k))
+                kid = _dz_leaf_widget_id(scn)
                 lab = "  →  ".join(f"{n}={s}" for n, s in scn)
                 use = st.checkbox(
                     f"Distribution for: {lab}", key=f"dz_distchk_{kid}",
@@ -12131,7 +12161,8 @@ def decision_tree_section():
                         st.session_state["dz_leaf_co2"][k] = st.number_input(
                             f"{lab} — tCO₂", value=float(
                                 st.session_state["dz_leaf_co2"].get(k, 0.0)),
-                            step=1000.0, key=f"dz_co2_{hash(k)}")
+                            step=1000.0,
+                            key=f"dz_co2_{_dz_leaf_widget_id(scn)}")
                 _cpmax = st.slider(
                     "Max carbon price to scan ($/tCO₂)", 0.0, 500.0, 150.0,
                     10.0, key="dz_carbon_max")
