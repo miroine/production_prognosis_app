@@ -10793,20 +10793,19 @@ def _dz_tree_svg(tree, max_depth=6, scale=1.0):
             px, py = parent_xy
             col = "#E0A500" if is_opt else "#6f8aa0"
             w = (4 if is_opt else 2) * (scale ** 0.5)
-            # elbow connector: horizontal out of parent, vertical, horizontal
-            # into child — far clearer than a single diagonal curve and keeps
-            # branch labels off the nodes.
-            midx = (px + x) / 2
+            # smooth cubic Bézier from parent to child (the look preferred over
+            # straight elbows), with the label placed near the child end so it
+            # doesn't overlap the node or its value.
             parts.append(
-                f'<path d="M{px},{py} L{midx},{py} L{midx},{y} L{x},{y}" '
-                f'stroke="{col}" stroke-width="{w:.1f}" fill="none"/>')
+                f'<path d="M{px},{py} C{(px + x) / 2},{py} '
+                f'{(px + x) / 2},{y} {x},{y}" stroke="{col}" '
+                f'stroke-width="{w:.1f}" fill="none"/>')
             lbl = _html.escape(str(edge_label)[:18])
             if prob is not None:
                 lbl += f" (p={prob:.2f})"
-            # branch label sits on the horizontal-into-child segment, just
-            # above it, so it never overlaps a node or its value.
+            # label sits above the curve toward the child, clear of nodes
             parts.append(
-                f'<text x="{(midx + x) / 2}" y="{y - 4 * scale}" '
+                f'<text x="{px + (x - px) * 0.72}" y="{y - 5 * scale}" '
                 f'fill="#aebfcd" font-size="{fs_edge}" '
                 f'text-anchor="middle">{lbl}</text>')
         if node.kind == "leaf" or depth >= max_depth:
@@ -10996,16 +10995,23 @@ def _dz_resolve_source(kind, key_id, pools, stea_pool, *,
         up = c.file_uploader(f"{label_prefix}Upload a YAML case",
                              type=["yaml", "yml"],
                              key=f"dz_src_yaml_up_{key_id}")
-        ytxt = ""
+        up_txt = ""
         if up is not None:
             try:
-                ytxt = up.getvalue().decode("utf-8")
+                up_txt = up.getvalue().decode("utf-8")
             except Exception as _ex:
                 _fv_debug_error("YAML source decode", _ex)
-        ytxt = c.text_area(f"{label_prefix}…or paste YAML", value=ytxt,
-                           height=120, key=f"dz_src_yaml_txt_{key_id}",
-                           label_visibility="collapsed",
-                           placeholder="scalar:\n  units: field\n  ...")
+        # The text box and the uploader are INDEPENDENT inputs — we must not
+        # pass the uploaded text through the keyed text_area (Streamlit
+        # ignores value= once the widget has a key + stored state, which would
+        # silently discard the uploaded file). Prefer whichever has content.
+        paste_txt = c.text_area(
+            f"{label_prefix}…or paste YAML", value="", height=120,
+            key=f"dz_src_yaml_txt_{key_id}", label_visibility="collapsed",
+            placeholder="scalar:\n  units: field\n  ...")
+        ytxt = (paste_txt.strip() or up_txt.strip())
+        if not ytxt:
+            return None
         return _dz_yaml_npv(ytxt)
     if kind == "Concept":
         pool = pools["concept_pool"]
