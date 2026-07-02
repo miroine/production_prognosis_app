@@ -3485,41 +3485,45 @@ _SUBSEA_WELL_COST_BENCHMARKS = [
 # a user can see roughly where a concept sits among comparable NCS/UKCS
 # developments. The user can filter any point in or out in the UI.
 _PEER_PROJECTS = [
+    # Peer/analog projects are anonymised as "Field A", "Field B", … to keep
+    # the analog set confidential — only the region tag (NCS/UKCS) and the
+    # screening-level numeric metrics are retained. Order is stable so a given
+    # letter always maps to the same row.
     # name,            region, well_cost_MNOK, days_per_well, meters_per_well,
     #                  dw_capex_usd_boe, reserves_mmboe,
     #                  umb_unit_kNOK_m, umb_length_m,
     #                  subsea_fac_kNOK_well, n_wells,
     #                  pipe_unit_kNOK_m, pipe_length_m
-    ("Wisting RS",        "NCS",  520,  42,  3200,  2.1,  440,
+    ("Field A",  "NCS",  520,  42,  3200,  2.1,  440,
         18,  9000,  1500, 8,  90,  12000),
-    ("TWIN",              "NCS",  600,  48,  3600,  1.9,  520,
+    ("Field B",  "NCS",  600,  48,  3600,  1.9,  520,
         22,  8000,  1750, 6,  110, 9000),
-    ("Hedrun Extension",  "NCS",  640,  52,  3900,  3.0,  210,
+    ("Field C",  "NCS",  640,  52,  3900,  3.0,  210,
         28,  6500,  1850, 4,  120, 7000),
-    ("Heidrun Extension", "NCS",  650,  53,  4000,  3.1,  200,
+    ("Field D",  "NCS",  650,  53,  4000,  3.1,  200,
         28,  6300,  1900, 4,  120, 6800),
-    ("J.Sverdrup Ph.3",   "NCS",  720,  58,  4300,  1.4,  900,
+    ("Field E",  "NCS",  720,  58,  4300,  1.4,  900,
         30,  18000, 1400, 12, 70,  22000),
-    ("Fram Sør",          "NCS",  760,  60,  4500,  2.7,  240,
+    ("Field F",  "NCS",  760,  60,  4500,  2.7,  240,
         32,  6000,  1950, 4,  130, 6500),
-    ("Grane Energy",      "NCS",  430,  38,  2900,  2.4,  300,
+    ("Field G",  "NCS",  430,  38,  2900,  2.4,  300,
         24,  20000, 1600, 7,  150, 18000),
-    ("RVV_Grosbeak",      "NCS",  640,  55,  4100,  2.8,  230,
+    ("Field H",  "NCS",  640,  55,  4100,  2.8,  230,
         45,  5000,  2000, 5,  140, 5500),
-    ("Linnorm",           "NCS",  900,  72,  5200, -0.1,  300,
+    ("Field I",  "NCS",  900,  72,  5200, -0.1,  300,
         40,  12000, 1300, 6,  100, 14000),
-    ("Njord NHA",         "NCS", 1180,  92,  6400, -0.2,  150,
+    ("Field J",  "NCS", 1180,  92,  6400, -0.2,  150,
         85,  500,   1200, 6,  100, 5000),
-    ("Kristin Sør DG3",   "NCS", 1050,  80,  6000,  1.6,  340,
+    ("Field K",  "NCS", 1050,  80,  6000,  1.6,  340,
         20,  31000, 1350, 5,  140, 50000),
-    ("Snøhvit (Albatross)","NCS", 880,  70,  5000,  1.7,  280,
+    ("Field L",  "NCS",  880,  70,  5000,  1.7,  280,
         35,  10000, 1500, 5,  120, 11000),
     # UKCS analogs
-    ("Glengorm (UKCS)",   "UKCS", 980,  78,  5500,  2.9,  220,
+    ("Field M",  "UKCS", 980,  78,  5500,  2.9,  220,
         50,  7000,  1700, 5,  150, 8000),
-    ("Cambo (UKCS)",      "UKCS", 1100, 88,  6200,  3.4,  170,
+    ("Field N",  "UKCS", 1100, 88,  6200,  3.4,  170,
         60,  9000,  1600, 6,  140, 10000),
-    ("Rosebank (UKCS)",   "UKCS", 1200, 95,  6600,  3.0,  300,
+    ("Field O",  "UKCS", 1200, 95,  6600,  3.0,  300,
         70,  15000, 1450, 8,  130, 18000),
 ]
 _PEER_FIELDS = (
