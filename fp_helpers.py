@@ -212,6 +212,63 @@ def duplicate_case(filename: str, new_name: str) -> str:
     return save_case(new_name, src.get("description", "") + " (copy)", src["payload"])
 
 
+def export_case_db() -> bytes:
+    """Zip the entire case database (all saved cases + concept studies) into
+    bytes for download. On Streamlit Cloud the case directory is EPHEMERAL —
+    it is wiped whenever the app reboots or redeploys — so this backup is the
+    only way saved cases survive; users should download it regularly."""
+    import io as _io
+    import zipfile as _zip
+    buf = _io.BytesIO()
+    with _zip.ZipFile(buf, "w", _zip.ZIP_DEFLATED) as z:
+        for p in sorted(CASE_DIR.glob("*.json")):
+            z.write(p, arcname=p.name)
+        if STUDY_DIR.exists():
+            for p in sorted(STUDY_DIR.glob("*.json")):
+                z.write(p, arcname=f"concept_studies/{p.name}")
+    return buf.getvalue()
+
+
+def import_case_db(zip_bytes: bytes, overwrite: bool = False) -> dict:
+    """Restore cases from an export_case_db zip. Writes each .json back into
+    the case directory (and concept_studies/). Skips files that already exist
+    unless `overwrite`. Returns {'restored': n, 'skipped': n, 'errors': [..]}.
+    Only plain .json members in the expected folders are accepted — anything
+    else in the archive is ignored (defensive against hand-built zips)."""
+    import io as _io
+    import zipfile as _zip
+    restored = skipped = 0
+    errors = []
+    try:
+        z = _zip.ZipFile(_io.BytesIO(zip_bytes))
+    except Exception as e:
+        return {"restored": 0, "skipped": 0,
+                "errors": [f"Not a valid zip: {e}"]}
+    for info in z.infolist():
+        nm = info.filename
+        if not nm.endswith(".json") or nm.startswith("/") or ".." in nm:
+            continue
+        if nm.startswith("concept_studies/"):
+            dest = STUDY_DIR / Path(nm).name
+        elif "/" not in nm:
+            dest = CASE_DIR / Path(nm).name
+        else:
+            continue
+        try:
+            data = z.read(info)
+            json.loads(data)                     # must be valid JSON
+            if dest.exists() and not overwrite:
+                skipped += 1
+                continue
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(data)
+            restored += 1
+        except Exception as e:
+            errors.append(f"{nm}: {e}")
+    return {"restored": restored, "skipped": skipped, "errors": errors}
+
+
 # =============================================================================
 # JSON / API export
 # =============================================================================
@@ -1322,6 +1379,160 @@ input:focus, select:focus, textarea:focus,
 .eq-chip.oil   { background: #E6F0EB; color: #2C5C42; border-color: #BFD9C8; }
 .eq-chip.gas   { background: #FFE6EC; color: #B5072B; border-color: #FFB8C7; }
 .eq-chip.water { background: #E6EBF7; color: #1F3A8A; border-color: #BFCAE6; }
+
+/* ==========================================================================
+   Polish layer — quiet refinement on Streamlit's own widgets. Selectors use
+   stable data-testid attributes only, so a Streamlit upgrade degrades
+   gracefully to defaults rather than breaking.
+   ========================================================================== */
+
+/* Metric cards: framed, with the navy value and a red hairline on top */
+[data-testid="stMetric"] {
+    background: #FFFFFF;
+    border: 1px solid var(--eq-mist);
+    border-top: 3px solid var(--eq-red);
+    border-radius: 10px;
+    padding: 12px 14px 10px 14px;
+    box-shadow: 0 1px 4px rgba(0, 21, 72, 0.06);
+}
+[data-testid="stMetricValue"] {
+    color: var(--eq-navy);
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+[data-testid="stMetricLabel"] {
+    color: var(--eq-slate);
+    opacity: 0.85;
+    text-transform: uppercase;
+    font-size: 0.72em;
+    letter-spacing: 0.06em;
+}
+
+/* Tabs: underline indicator in brand red, calmer inactive labels */
+[data-testid="stTabs"] button[role="tab"] {
+    color: var(--eq-slate);
+    font-weight: 600;
+}
+[data-testid="stTabs"] button[aria-selected="true"] {
+    color: var(--eq-navy);
+    border-bottom: 3px solid var(--eq-red);
+}
+
+/* Expanders: header reads as a section, not a plain row */
+[data-testid="stExpander"] > details {
+    border: 1px solid var(--eq-mist);
+    border-radius: 10px;
+    background: #FFFFFF;
+}
+[data-testid="stExpander"] summary {
+    font-weight: 600;
+    color: var(--eq-navy);
+}
+[data-testid="stExpander"] summary:hover {
+    color: var(--eq-red);
+}
+
+/* Buttons: consistent radius, confident primary, quiet secondary */
+[data-testid="stBaseButton-primary"],
+button[kind="primary"] {
+    border-radius: 8px;
+    font-weight: 600;
+    box-shadow: 0 2px 6px rgba(255, 18, 67, 0.20);
+}
+[data-testid="stBaseButton-secondary"],
+button[kind="secondary"] {
+    border-radius: 8px;
+    border-color: var(--eq-mist);
+}
+button[kind="secondary"]:hover {
+    border-color: var(--eq-navy);
+    color: var(--eq-navy);
+}
+
+/* Dataframes: soften the frame corners to match the cards */
+[data-testid="stDataFrame"] {
+    border: 1px solid var(--eq-mist);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+/* File uploader: dashed drop zone in brand tones */
+[data-testid="stFileUploaderDropzone"] {
+    border: 1.5px dashed #B7C3CB;
+    border-radius: 10px;
+    background: var(--eq-sand);
+}
+
+/* Sidebar: slightly denser, with a hairline edge */
+[data-testid="stSidebar"] {
+    border-right: 1px solid var(--eq-mist);
+}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.55rem;
+}
+
+/* Landing menu — the app's front door ---------------------------------- */
+.fv-hero {
+    background:
+        radial-gradient(1100px 340px at 85% -60%, rgba(255,18,67,0.16), transparent 60%),
+        linear-gradient(115deg, var(--eq-navy) 0%, var(--eq-navy-2) 60%, #003A8C 100%);
+    color: #FFFFFF;
+    border-radius: 16px;
+    padding: 30px 34px 26px 34px;
+    margin-bottom: 20px;
+    border-left: 6px solid var(--eq-red);
+    box-shadow: 0 6px 24px rgba(0, 21, 72, 0.25);
+}
+.fv-hero h1 {
+    margin: 0;
+    font-size: 2.0em;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: #FFFFFF;
+}
+.fv-hero .tag {
+    margin-top: 8px;
+    font-size: 1.0em;
+    color: #DCE4F5;
+}
+.fv-hero .strip {
+    margin-top: 14px;
+    font-size: 0.78em;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #9FB0D6;
+}
+.fv-card {
+    border: 1px solid var(--eq-mist);
+    border-left: 6px solid var(--eq-navy);
+    border-radius: 12px;
+    padding: 18px 20px;
+    margin: 8px 0 4px 0;
+    min-height: 165px;
+    background: #FFFFFF;
+    box-shadow: 0 1px 4px rgba(0, 21, 72, 0.05);
+    transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+.fv-card:hover {
+    box-shadow: 0 6px 18px rgba(0, 21, 72, 0.14);
+    transform: translateY(-2px);
+}
+.fv-card .title {
+    font-size: 1.22rem;
+    font-weight: 700;
+    color: var(--eq-navy);
+    margin-bottom: 6px;
+}
+.fv-card .desc {
+    font-size: 0.9rem;
+    line-height: 1.45;
+    color: var(--eq-slate);
+    opacity: 0.9;
+}
+@media (prefers-reduced-motion: reduce) {
+    .fv-card { transition: none; }
+    .fv-card:hover { transform: none; }
+}
 </style>
 """
 

@@ -1,16 +1,29 @@
 # FieldVista — Integrated Field Development & Economics
 
-A Streamlit application for early-phase oil & gas field production forecasting.
-Multi-rig drilling, PVT-aware material balance, optional multi-reservoir mode
-with mixed-fluid systems, fiscal economics with breakeven, gas disposition &
-CO₂ emissions, and structured exports (Excel, JSON-API, PDF).
+A Streamlit platform for early-phase oil & gas decision support: production
+forecasting, fiscal economics, concept screening, LLM-assisted case building,
+and full decision analysis — in one app with a consistent Equinor-inspired
+design language.
 
 > ⚠️ **Disclaimer**: For **early-phase screening** only. Uses simplified PVT
-> correlations, material balance proxies, and illustrative economic assumptions.
-> Results MUST NOT be used for investment decisions, reserves booking, or
-> production-grade reservoir studies.
+> correlations, material-balance proxies, and illustrative economic
+> assumptions (AACE Class 4–5). Results MUST NOT be used for investment
+> decisions, reserves booking, or production-grade reservoir studies.
 
 © 2026 **Merouane Hamdani** — released under the **MIT License** (see `LICENSE`).
+
+## The four sub-apps
+
+FieldVista opens on a **landing menu**; pick a tool, and return any time with
+the **🏠 Menu** button. The Field Setup sidebar appears only where it's used
+(the Business case builder), so each tool gets a clean, relevant screen.
+
+| Sub-app | What it does |
+|---|---|
+| 🛢️ **Business case builder** | The full single-case model: reservoir + wells + schedule + facilities + fiscal economics, with sensitivity, Monte-Carlo and exports. One-click **scenario presets** give a runnable starting case. |
+| 🌳 **Concept Selector** | Hanging-garden concept screening: decision dimensions × options, batch-run every concept, compare NPV vs CAPEX, profitability index, emissions and a Design-to-Cost staircase. Studies **save/load** to YAML/JSON. |
+| 🤖 **Case from text** | Describe a case (or a whole concept study) in plain language; an LLM (your own API key — Anthropic, Azure OpenAI, or the offline demo parser) elicits missing inputs with targeted questions and produces a runnable YAML. Results can be **saved into the case database**. |
+| 🎯 **Decision tree** | A full decision-analysis workbench: influence diagram (decisions / uncertainties / value), CPTs, tree compile + rollback, risk-averse utility (certainty equivalent), EVPI/EVII, tornadoes, decision-flip thresholds, risk profiles, Monte-Carlo, NPV+CO₂ multi-objective, Bayesian updating, and per-leaf values sourced from YAML / concept results / saved cases / STEA profiles. |
 
 ## Install & run
 
@@ -19,9 +32,29 @@ pip install -r requirements.txt
 streamlit run field_prognosis_app.py
 ```
 
-`reportlab` and `kaleido` are required for the PDF export with embedded plots;
-the app degrades gracefully without them (PDF will still render with KPIs and
-assumptions).
+`reportlab` and `kaleido` are required for PDF/SVG chart export; the app
+degrades gracefully without them.
+
+## Data safety on Streamlit Cloud
+
+Saved cases live on **ephemeral disk** — they are wiped on every app reboot
+or redeploy. Use **⚙️ App tools → 💾 Case-database backup** in the sidebar to
+download a zip of all saved cases (and restore it later). Decision diagrams
+and concept studies can also be exported to YAML/JSON from their own pages.
+
+## Confidentiality
+
+The benchmarking peer/analog dataset is **anonymised at the source** — peers
+are named *Field A … Field O* with only the region tag (NCS/UKCS) and
+screening-level numeric metrics retained. No real project names exist
+anywhere in the code, so the app and screenshots are safe to share.
+
+---
+
+# 🛢️ Business case builder
+
+The sections below document the Business case builder — the full production
++ economics model.
 
 ## Features
 
@@ -479,3 +512,120 @@ red `#FF1243`, sand `#F7F7F2`, plus phase-specific tokens (oil green, gas red,
 water blue, injection navy) applied consistently across every plot. The
 typography prefers the Equinor brand face when installed locally, with Inter
 and system fonts as fallbacks.
+
+---
+
+# 🌳 Concept Selector
+
+A standalone hanging-garden screening tool for comparing development concepts.
+
+- **Decision dimensions × options**: define any number of dimensions
+  (drainage strategy, well count, host facility, price scenario, …) each with
+  2–5 options. Each option links to its own case: a scalar patch on a base
+  case, a pasted YAML, or a saved case.
+- **Batch run** every selected concept through the same engine as the
+  Business case builder (cached — identical option payloads run once).
+- **Comparison analytics**: NPV-vs-CAPEX cross-plot with P90→P10 uncertainty
+  brackets, **profitability index** ranking bar chart, emissions intensity,
+  qualitative screening matrix, and a Design-to-Cost staircase.
+- **Reference plan & show-stoppers**: mark one option per dimension as the
+  reference; flag options as show-stoppers to exclude them visually.
+- **Study save/load**: the whole study (dimensions, selections, reference,
+  show-stoppers, base payload) exports to YAML/JSON and reloads exactly.
+- **Chart export**: bundle the comparison charts to SVG (zip) or a multipage
+  PDF for a decision memo.
+
+# 🤖 Case from text
+
+LLM-assisted case building — describe the business case in plain language.
+
+- **Two modes**: a single case, or a whole **concept study** (the LLM
+  proposes decision dimensions + option patches on a base case).
+- **Providers**: Anthropic Claude or Azure OpenAI over raw HTTP with your own
+  API key (never stored), with automatic **retry** on transient API failures
+  — plus a deterministic **offline demo parser** that needs no key.
+- **Active elicitation**: the prompts instruct the model to ask 4–8 targeted
+  questions (naming quantity and unit) for anything the text doesn't pin
+  down: units & fluid, volumes & recovery factor, well rates/count/decline,
+  drainage, prices & tariffs, CAPEX (drilling/facility/abandonment), variable
+  **and** fixed OPEX, fiscal terms, schedule, emissions. Every fallback the
+  model assumes is listed under *Assumptions*.
+- **Run & analyse**: KPIs (NPV, IRR, breakeven, PI, payback), production and
+  cash-flow plots, sensitivity tornado and Monte-Carlo — with SVG/PDF export.
+- **Save to case database**: one click stores the generated case for use in
+  the case manager, Concept Selector, and decision-tree leaf sources.
+
+# 🎯 Decision tree
+
+A decision-analysis workbench built on a pure, unit-tested engine
+(`fp_decision.py`, 59 tests).
+
+**Build** — decision nodes (options), uncertainty nodes (outcomes, with
+optional parents → conditional probability tables), a value node, and a
+sequence defining information order. Per-row CPT **Σ=1 validation**, an
+edit-then-Apply pattern (orange = unsaved, green = applied), an auto-laid-out
+influence-diagram SVG, and two seeded examples (Drill/Don't and a generic
+NCS "Field A" development).
+
+**Leaf values** — every tree leaf takes its value from **one source**:
+- a typed constant,
+- a **YAML case** (paste or upload; runs through the engine),
+- an already-run **Concept Selector** option,
+- a **saved case** from the database,
+- a **STEA profile** (shared pool or per-leaf upload; parsed and priced on
+  the current sidebar economic basis),
+- or the **per-scenario engine link**: map each node *state* to a `key=value`
+  patch; every leaf's merged patches run on a base case and the resulting
+  NPV becomes the leaf value (cached — re-computing after editing one state
+  only re-runs the affected leaves).
+
+**Distribution leaves** — any leaf can carry a P10/P50/P90 spread instead of
+a point value (each percentile from any source above); it expands via
+Swanson's rule (0.30/0.40/0.30) into an *Outcome spread* chance node at
+solve time.
+
+**Solve** — risk-neutral expected value, or **risk-averse exponential
+utility** with a risk-tolerance R: the headline becomes the **certainty
+equivalent**, the risk premium is reported, and the recommendation can flip.
+State-dependent optimal choices are listed where a downstream decision
+depends on what was observed. Trees above 256 leaves suppress the SVG
+(analysis still runs).
+
+**Analysis suite** (tabs): probability tornado · value tornado ·
+decision-flip threshold (breakeven probability, with shaded optimal-choice
+regions) · risk profile (CDF per first-decision strategy) · policy
+comparison table (EV, P90/P50/P10, P(loss), min/max) · **EVII** (value of
+imperfect information from a test-reliability matrix, with test-efficiency
+vs EVPI) · **Monte-Carlo** NPV histogram with P10/P50/P90 markers ·
+**Carbon** (NPV − carbon-price × tCO₂ per leaf, with the carbon price at
+which the optimal decision flips).
+
+**Also**: EVPI table + bar chart, Bayesian belief updating on CPTs,
+diagram save/load (YAML/JSON, exact round-trip incl. leaf values), bulk leaf
+controls, and SVG/PDF export of the tree + analysis charts.
+
+---
+
+# Architecture & testing
+
+| Module | Role |
+|---|---|
+| `field_prognosis_app.py` | Streamlit UI + the simulation engine (pure functions, AST-verified Streamlit-free) |
+| `fp_engine.py` | Stable, Streamlit-free public surface of the engine (`run_payload_case`, `compute_economics`, …) |
+| `fp_helpers.py` | YAML schema, case database (+ zip backup/restore), STEA parsing, benchmark data, plot template, CSS |
+| `fp_core.py` | Pure unit conversions (field ↔ metric) |
+| `fp_economics.py` | Pure economics mapping |
+| `fp_decision.py` | Pure decision-analysis engine (tree, rollback, utility, EVPI/EVII, tornadoes, MC, multi-objective) |
+
+**Test suites** (all run in CI on every push): `test_v2.py` (engine smoke),
+`test_units.py` (77 unit-conversion checks), `test_parity.py` (24
+golden-master + live-vs-batch parity checks), `test_decision.py` (59
+decision-analysis checks vs hand-computed references), `test_integration.py`
+(8 headless render smoke tests — every sub-app section must render without
+raising).
+
+**Performance**: `run_payload_case` results are cached (`st.cache_data`,
+keyed on a JSON-stable payload signature) across batch, Monte-Carlo, and
+decision-tree loops; per-source NPV caches (YAML/saved-case/STEA) avoid
+re-parsing. **⚙️ App tools** offers a cache-clear button and a **debug
+toggle** that surfaces normally-silent internal errors.

@@ -1,170 +1,125 @@
-# FieldVista — User Guide & Walkthrough
+# FieldVista — User Guide
 
-**FieldVista — Integrated Field Development & Economics** (v4.4)
-Early-phase screening tool for oil & gas field production forecasting and economics.
+**FieldVista — Integrated Field Development & Economics** (v4.5+)
 
-> ⚠️ **Screening only.** Results are AACE Class 4–5 (−50%/+100%). Not for investment decisions, reserves booking, or production-grade reservoir studies.
-
----
-
-## 1. Getting started
-
-The app has two pages, selected from the **📑 Page** radio at the top of the left sidebar:
-
-1. **🛢️ Field prognosis** — the full production + economics model for a single field development.
-2. **🌳 Concept Selector** — a standalone hanging-garden tool for screening many concept options side by side.
-
-Work through the sidebar top-to-bottom, then click **Run prognosis**.
+> ⚠️ **Screening only.** Results are AACE Class 4–5 (−50%/+100%). Not for
+> investment decisions, reserves booking, or production-grade studies.
 
 ---
 
-## 2. Field prognosis page
+## 1 · Finding your way around
 
-### 2.1 Sidebar inputs (in order)
+The app opens on a **landing menu** with four cards. Click **Open** on a
+card, or use the sidebar buttons; **🏠 Menu** (sidebar or top of every page)
+brings you back. The Field Setup sidebar only appears on the Business case
+builder — the other tools don't need it.
 
-- **Units** — Field (bbl, ft, psi, °F) or Metric (Sm³, m, bar, °C). All inputs and outputs convert automatically.
-- **Fluid system** — Oil with associated gas, dry gas, gas-condensate, etc. Sets which phase is "primary".
-- **Drainage strategy** — Depletion, Water injection, Gas injection, WAG.
-- **Reservoir** — OOIP/OGIP, initial pressure, temperature, API/SG, solution GOR, bubble point, aquifer support, etc.
-- **Wells** — the producer/injector table: rates, decline (exponential/harmonic/hyperbolic), water-cut ramp, uptime, IPR mode.
-- **Capacity** — facility throughput limits (oil/gas/water/liquid) that choke production.
-- **Economics** — three expanders:
-  - 💵 Prices & OPEX
-  - ⚒️ Well cost model (rig-rate or fixed $/well)
-  - 📊 Discount rate, tax, royalty, tariffs, abandonment
-- **Development concept builder** — design the facilities concept and auto-generate a CAPEX schedule (see §2.3).
-
-### 2.2 Results tabs (after Run)
-
-| Tab | What it shows |
-|-----|---------------|
-| Production | Phase rates over time + surface-capacity choke factor |
-| Cumulatives & RF | Cumulative volumes and recovery factor vs target |
-| Per-well | Stacked per-well contribution by phase |
-| Drilling sequence | Gantt of the drilling + completion schedule |
-| Material balance | Reservoir pressure & RF (drive mechanism) |
-| Economics | Annual cashflow buildup + cumulative NPV |
-| Sensitivity | NPV tornado (configurable drivers/ranges) |
-| Monte Carlo | Probabilistic NPV / reserves distribution |
-| Data | Export tables; generate the comprehensive PDF report |
-| Methodology | Every equation the engine uses, with a symbol glossary |
-
-### 2.3 Development concept builder
-
-Choose the host (FPSO / semi-sub / TLP / Spar / fixed jacket / subsea-to-shore — each draws a distinct side-view), SURF elements (field architecture, flowlines, umbilical, risers, boosting, hydrate management, installation method), and topside modifications. The schematic and CAPEX schedule update live. The **🏗️ Topside modification advisor** lists the cross-functional topside scope your concept implies.
-
-### 2.4 Well Planner
-
-The **🛠️ Well Planner** (below the results) designs a representative well + completion and draws a cross-section: casing strings, cement, tubing, packers, lower completion (open hole / perforated / screens+gravel / frac-pack), artificial lift and the wellhead/tree. Context-aware design notes flag trade-offs.
-
-### 2.5 PDF report
-
-On the **Data** tab, **Generate PDF report** produces a multi-page report with all figures (production, cumulatives, pressure, per-well, drilling, economics, NPV waterfall, CO₂, sensitivity tornado, Monte-Carlo), a KPI table, assumptions, and an AI-style written narrative interpreting the results. Requires `kaleido` for the figures (already in requirements.txt).
+**⚙️ App tools** (bottom of the sidebar navigation) holds three utilities:
+- **🧹 Clear compute cache** — force a fresh recompute if a result looks
+  stale after hand-editing.
+- **🐞 Debug mode** — surfaces internal errors that are normally silent;
+  turn it on when something behaves oddly, off for normal use.
+- **💾 Case-database backup** — *important on Streamlit Cloud*: saved cases
+  are wiped on every reboot/redeploy. Download the backup zip regularly and
+  restore it after a redeploy.
 
 ---
 
-## 3. Concept Selector page (hanging garden)
+## 2 · 🛢️ Business case builder
 
-This is a standalone screening tool. Each **dimension** is a column of **options**; each option is its own standalone case. Click **Run** and every selected option runs one by one (no combinations are formed), then results are compared.
+The full single-case model. Work the sidebar top-to-bottom, then **Run**.
 
-### 3.1 Workflow
+1. **⚡ Start from a preset** (top of the page) — four runnable NCS starting
+   cases (oil tie-back, water-injection IOR, gas-condensate, tax/royalty
+   small oil). Load one, then adjust.
+2. **Field Setup (sidebar)** — units & fluid, volumes & recovery, PVT,
+   aquifer/gas-cap, drainage strategy, wells & rigs, capacities, facilities,
+   gas disposition, abandonment, prices, OPEX, fiscal regime (NCS /
+   Tax-Royalty / PSC), discounting.
+3. **Run** — production profiles, cash-flow waterfall, KPIs (NPV, IRR,
+   breakeven, RF, payback, PI), sensitivity tornado, Monte-Carlo, scenario
+   comparison, and exports (Excel, JSON, PDF).
+4. **Case manager** — save/load/duplicate/diff cases. Saved cases are also
+   available to the Concept Selector and the decision tree.
 
-1. **Pick a starting point.** Use **📋 Load a predefined template** (Subsurface / Drilling & Well / SURF / Topside facilities / All combined) or **🔄 Reset to NCS default**, or build from scratch with **➕ Add dimension**.
-2. **Link cases.** In the **Dimension editor**, each option can link a full case — pick a saved case from the database or upload a YAML/JSON — or apply lightweight `key: value` patches on top of a base case. **Click ✅ Apply edits in each dimension to commit your changes** (edits are drafted while you type to keep things responsive).
-3. **Tick the options** you want to run (checkbox on the left of each option). The **Cases to run** counter updates live.
-4. **Set run options** — ♻️ cache (skip unchanged cases) and 🎲 probabilistic Monte-Carlo (P90/Mean/P10 per case, with its own progress bar).
-5. **Run.** Watch the progress bar; results populate below.
+## 3 · 🌳 Concept Selector
 
-### 3.2 Reading the results
+Screen many development concepts side by side.
 
-- **Hanging garden** — each ticked option box is coloured by its NPV on a red→green ramp, with an NPV badge.
-- **🎯 Concept Comparison** — NPV vs discounted CAPEX bubble chart, P90/Mean/P10 per concept, emissions on the right axis, breakeven labels. ★ marks the Pareto frontier; dominated concepts are greyed.
-- **🚦 Qualitative decision matrix** — score each concept green/yellow/red on HSE / risk / robustness / operability criteria, with per-criterion **weights**. **Edit, then click ✅ Apply matrix edits** to refresh the coloured view and scores (this keeps editing fast).
-- **🏆 Combined ranking** — blends the NPV ranking with the weighted qualitative score; the economics-vs-qualitative weight is adjustable.
-- **🪜 Design-to-Cost staircase** — concepts ranked by ascending CAPEX, each step showing ΔNPV/ΔBE; the highest-NPV concept is the circled "Recommended solution".
+1. Define **dimensions** (e.g. Drainage strategy, Well count, Host) and
+   their **options**; link each option to a case (patch / YAML / saved case).
+2. Select the options to include, mark a **reference** per dimension, flag
+   **show-stoppers**.
+3. **Run batch** — every concept runs through the engine (cached).
+4. Compare: hanging garden, **NPV vs CAPEX** with P90→P10 brackets,
+   **PI ranking**, emissions, qualitative matrix, Design-to-Cost staircase.
+5. **💾 Save / load this study** — the whole setup to YAML/JSON (results are
+   re-run after loading). **🖼️ Export** the charts to SVG/PDF.
 
-### 3.3 Saving your work — 💾 Study library
+## 4 · 🤖 Case from text
 
-Your matrix lives in the session while you work, but **save it to keep it durably**:
+Describe a case in plain language; get a runnable YAML.
 
-- **💾 Save** — stores the whole matrix (dimensions, options, patches, selections) + last results. Saving the same name again **auto-increments the version** (v1 → v2 → v3) and stamps the **save date**.
-- **📂 Load** — restore any saved study (shows name · version · cases · date).
-- **📑 Duplicate** — copy a study under a new name (version resets to 1).
-- **🗑️ Delete**, and **📥 Import** a study YAML/JSON to rebuild the matrix.
+1. Pick **Single case** or **Concept study** mode.
+2. Choose a provider (Anthropic / Azure OpenAI — your own key, never stored
+   — or the offline demo). Transient API failures retry automatically.
+3. The model asks **targeted questions** (rates, recovery factor, prices,
+   CAPEX, fixed *and* variable OPEX, fiscal, schedule…). Answer what you
+   can; everything it assumes is listed under **Assumptions**.
+4. Review/edit the YAML, **Run**, and analyse (KPIs, plots, tornado, MC).
+5. **💾 Save this case to the case database** to use it everywhere else.
 
-You can also **🧾 Download study (nested YAML)** from the results section — a complete audit trail (matrix + base case + every result's KPIs), ideal for version-tracking in git.
+## 5 · 🎯 Decision tree
 
-### 3.4 Patch key reference — what you can put in a patch
+Full decision analysis: influence diagram → tree → solved recommendation.
 
-A **patch** is one or more `key: value` pairs typed in an option's *Patches* box, comma-separated (e.g. `oil_price_bbl: 55, disc: 0.10`). When that option runs, the pairs are written onto the base case's `scalar` block before the engine runs — so a patch means *"take the base case, but change these inputs."* Keys are the same names you see in an exported YAML's `scalar:` section; values are plain numbers, text, or `true`/`false`.
+**Quick start:** click **🧪 Drill example** or **🛢️ Field A example**, then
+**🧮 Calculate decision tree**.
 
-**Two special keys** (underscore-prefixed) rewrite a whole table rather than set a scalar:
-
-| Special key | Value | What it does |
-|---|---|---|
-| `_n_producers_override` | integer | Truncates or replicates the producers table to N wells, keeping the base per-well design (rates, decline) and renumbering P-01…P-N. Sweeps drilling-programme size. |
-| `_facility_capex_override_MM` | number ($MM) | Rescales the whole facility CAPEX schedule to total this figure, preserving the relative timing/ordering of cost rows. Sweeps host-facility cost without rebuilding the SURF concept. |
-
-**Common scalar keys** used in screening sweeps:
-
-| Key | Meaning |
-|---|---|
-| `strategy` | Depletion / Water injection / Gas injection / WAG |
-| `oil_price_bbl` | Flat oil price, US$/bbl |
-| `gas_price_mmbtu` | Flat gas price, US$/MMBtu |
-| `opex_var_oil` | Variable OPEX on oil, $/bbl |
-| `opex_var_gas` | Variable OPEX on gas, $/Mscf |
-| `opex_fixed` | Fixed OPEX, $MM/yr |
-| `disc` | Discount rate as a fraction (0.08 = 8%) |
-| `tax_rate` | Flat tax rate as a fraction (NCS uses the `ncs_*` keys) |
-| `rf_target` | Target recovery factor as a fraction (0.52 = 52%) |
-| `ooip` / `ogip` | Oil / gas in place (the case's display units) |
-| `vrr` / `inj_eff` | Voidage replacement ratio / injection sweep (injection strategies) |
-| `well_cost_mode` / `rig_dayrate` | `'rig_rate'` to cost wells from day-rates; rig day-rate in $k/day |
-| `horizon` | Forecast horizon, years |
-
-**Notes:**
-- **Don't** patch `units`, `fluid` or `start_date` — those come from the base case; changing them mid-sweep mis-scales rates and shifts the timeline.
-- A patch changes only what you name; everything else stays at the base case.
-- If an option has a **linked case**, patches are ignored unless you tick *apply patches to linked case* — a linked case runs exactly as saved.
-- To discover every available key, export any case as YAML (**Field prognosis → Export current case as YAML**) and read the `scalar:` block; any key there works as a patch key.
-- Use **🧬 Export a single concept case as YAML** at the bottom of the results to see exactly what an option resolved to, and to reload it into the live view for comparison.
-
-### 3.5 Manual & imported KPIs — benchmark against external numbers
-
-Sometimes you want a concept in the comparison whose numbers come from a study report, a partner's estimate, or another tool — not from running an engine case. Two ways to do that:
-
-- **Per option:** tick **✍️ Enter KPIs manually** under any option and type the values (NPV after/pre-tax, CAPEX total/facilities/wells, break-even, total production, recovery factor, IRR, payback, CO₂, resources). The option then skips the engine and uses your numbers directly. Leave a field at 0 to omit it.
-- **From CSV:** open **📥 Import option KPIs from CSV**, download the template (pre-filled with your exact option labels), fill in the columns you have, and upload it. Rows are matched to options by `label` (case-insensitive); matched options switch to manual mode. Unmatched labels are listed back to you.
-
-Recognised CSV columns (all optional except `label`): `npv_MM, npv_pretax_MM, capex_total_MM, capex_facility_MM, capex_well_MM, breakeven_oil, cum_primary, final_rf, irr, payback_yrs, co2_total_Mt, resources_mmboe`.
-
-Manual options are **coloured in the garden and ranked exactly like computed options**, and show *“✍️ manual / imported KPIs”* as their source. They round-trip through the Study library. Note they don't appear in the single-case YAML export or the per-month workbook profiles — they have no underlying case or time series by definition.
-
----
-
-## 4. Tips & troubleshooting
-
-- **Deleting a dimension removes the wrong one?** Fixed in v4.4 — widgets are now keyed by stable identity, so deleting a middle dimension removes exactly that one.
-- **Lag while editing?** Edits are committed on **Apply**, not on every keystroke. Type freely, then Apply.
-- **Breakeven looks odd vs oil price?** Breakeven is a cost/volume/price property and is computed independently of the scenario's starting oil price (fixed in v4.4) — so two cases differing only in assumed price report the same breakeven.
-- **Version mismatch red banner?** `field_prognosis_app.py` and `fp_helpers.py` must always deploy together (both v4.4).
-- **PDF has no figures?** Install `kaleido==0.2.1` (in requirements.txt) — the report still generates text/tables/narrative without it.
-- **Lose work swapping pages?** Session state persists within a session, but use the **Study library** to save durably.
+1. **Nodes** — decisions (comma-separated options) and uncertainties
+   (outcomes; optional parents for conditional probabilities). Apply buttons
+   are 🟠 orange while edits are unsaved, 🟢 green when committed.
+2. **Sequence** — order nodes left→right; an uncertainty placed *before* a
+   decision is observed before deciding.
+3. **Probabilities** — one row per parent-state combination; rows that don't
+   sum to 1 are flagged and normalised on Apply.
+4. **Influence diagram** — drawn automatically (gold = decision, teal =
+   uncertainty, green = value).
+5. **Leaf values** — each leaf takes its value from **one source** picked in
+   its dropdown: Constant · YAML (paste/upload) · Concept result · Saved
+   case · STEA (shared pool or per-leaf upload). Or use the **engine link**:
+   patch each node state (`oil_price_bbl=95, _n_producers_override=8`) and
+   compute every leaf from a base case in one click (cached). Bulk buttons
+   fill missing leaves with 0 or reset all sources to Constant.
+   *Optional:* mark leaves as **distributions** (P10/P50/P90 → Swanson
+   expansion at solve).
+6. **Solve** — choose **Risk-neutral (EV)** or **Risk-averse (utility)**
+   with a risk tolerance R; risk aversion reports the certainty equivalent
+   + risk premium and can flip the recommendation. Read the optimal policy,
+   the tree (size slider), state-dependent choices, and EVPI.
+7. **📊 Analysis tabs** — probability & value tornadoes, decision-flip
+   threshold (the breakeven probability), risk profile CDF, policy
+   comparison (P(loss), P90/P50/P10), **EVII** (is an imperfect appraisal
+   worth its cost?), **Monte-Carlo** NPV histogram, and **Carbon**
+   (the carbon price at which the decision flips).
+8. **Bayesian updating** — observe an outcome, see the posterior over its
+   parents. **💾 Save/load** the diagram to YAML/JSON; **🖼️ Export** the
+   tree + charts to SVG/PDF.
 
 ---
 
-## 5. Glossary
+## 6 · Tips & troubleshooting
 
-- **NPV** — net present value (discounted cashflow), $MM.
-- **IRR** — internal rate of return (annualised).
-- **RF** — recovery factor (cumulative ÷ in-place).
-- **BE / Breakeven** — flat oil price at which NPV = 0.
-- **P90 / Mean / P10** — downside / expected / upside (petroleum convention: P90 is the conservative value 90% of outcomes exceed).
-- **CAPEX (disc.)** — capital cost discounted to time zero.
-- **SURF** — Subsea, Umbilicals, Risers, Flowlines.
-- **Pareto frontier** — concepts not beaten on both CAPEX and NPV by another.
+- **A result looks stale** → ⚙️ App tools → Clear compute cache, or press
+  the page's Calculate/Run button again (leaf edits flag this for you).
+- **Something silently does nothing** → turn on 🐞 Debug mode and retry;
+  the hidden error will show.
+- **Saved cases disappeared** → the Cloud disk was recycled; restore your
+  backup zip from ⚙️ App tools.
+- **A leaf ignores my YAML** → make sure its source dropdown says *YAML*
+  (not *Constant value*) and that the YAML validates; the resolved NPV shows
+  inline (→ **83.4 $MM**) when it's active.
+- **YAML/STEA leaf values use the sidebar prices** — a STEA profile carries
+  volumes/costs but not prices; a pasted YAML case carries its own.
 
----
-
-*FieldVista © 2026 Merouane Hamdani · MIT License. Reference data: public Sokkeldirektoratet (Norwegian Offshore Directorate) field records.*
+*© 2026 Merouane Hamdani · MIT License*

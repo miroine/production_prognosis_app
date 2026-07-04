@@ -11560,6 +11560,29 @@ def decision_tree_section():
                 stea_pool[f.name] = (f.getvalue(), pools["sc"])
 
         st.session_state.setdefault("dz_leaf_values", {})
+        # Bulk controls — with many leaves the per-leaf editor is tedious;
+        # these fill the gaps in one click.
+        _missing = [fdz.leaf_key(s) for s in leaves
+                    if fdz.leaf_key(s) not in
+                    st.session_state["dz_leaf_values"]]
+        _bc1, _bc2, _bc3 = st.columns([1.5, 1.7, 2])
+        if _bc1.button(f"0️⃣ Fill {len(_missing)} missing with 0",
+                       key="dz_fill0", disabled=not _missing):
+            for _k in _missing:
+                st.session_state["dz_leaf_values"][_k] = 0.0
+            st.session_state["dz_solved"] = False
+            st.rerun()
+        if _bc2.button("🔁 Reset all sources to Constant",
+                       key="dz_reset_sources",
+                       help="Every leaf's source dropdown returns to "
+                            "'Constant value'; the current values are kept."):
+            for scn in leaves:
+                st.session_state.pop(
+                    f"dz_src_kind_{_dz_leaf_widget_id(scn)}", None)
+            st.rerun()
+        if _missing:
+            _bc3.caption(f":orange[{len(_missing)} leaf value(s) not yet "
+                         f"set — unset leaves solve as 0.]")
         _leaf_changed = False
         with st.expander(f"✏️ Leaf values — {len(leaves)} leaf(s)",
                          expanded=len(leaves) <= 16):
@@ -12377,21 +12400,26 @@ def _render_landing_menu(page_opts):
             "profiles and Bayesian updating.",
             "#EB0037"),
     }
-    st.markdown("## Choose a tool")
-    st.caption("FieldVista bundles four tools. Pick one to begin — you can "
-               "return here any time with the **🏠 Menu** button.")
+    st.markdown(
+        '<div class="fv-hero">'
+        '<h1>FieldVista</h1>'
+        '<div class="tag">Integrated field development &amp; economics — '
+        'from first volumes to a defensible decision.</div>'
+        '<div class="strip">Production forecasting · Economics (NCS / '
+        'Tax-Royalty / PSC) · Concept screening · Decision analysis</div>'
+        '</div>',
+        unsafe_allow_html=True)
+    st.markdown("#### Choose a tool")
+    st.caption("Four tools, one workflow. Return here any time with the "
+               "**🏠 Menu** button.")
     cols = st.columns(2)
     for i, opt in enumerate(page_opts):
         desc, color = cards.get(opt, ("", "#00243D"))
         with cols[i % 2]:
             st.markdown(
-                f'<div style="border:1px solid #d9e1e8;border-left:6px solid '
-                f'{color};border-radius:10px;padding:16px 18px;margin:8px 0;'
-                f'min-height:170px;background:#ffffff09">'
-                f'<div style="font-size:1.25rem;font-weight:700;'
-                f'margin-bottom:6px">{opt}</div>'
-                f'<div style="font-size:0.9rem;line-height:1.4;opacity:0.85">'
-                f'{desc}</div></div>',
+                f'<div class="fv-card" style="border-left-color:{color}">'
+                f'<div class="title">{opt}</div>'
+                f'<div class="desc">{desc}</div></div>',
                 unsafe_allow_html=True)
             if st.button(f"Open {opt}", key=f"menu_open_{i}",
                          use_container_width=True, type="primary"):
@@ -12588,6 +12616,33 @@ def main():
                 help="When on, internal operations that normally fail "
                      "silently will show the error, to help diagnose "
                      "problems. Leave off for normal use.")
+            st.markdown("---")
+            st.markdown("**💾 Case-database backup**")
+            st.caption(
+                ":orange[⚠️ On Streamlit Cloud, saved cases live on "
+                "ephemeral disk — they are **wiped on every app reboot or "
+                "redeploy**. Download a backup regularly.]")
+            _n_cases = len(fh.list_cases())
+            st.download_button(
+                f"⬇️ Backup all saved cases ({_n_cases})",
+                data=fh.export_case_db(),
+                file_name="fieldvista_cases_backup.zip",
+                mime="application/zip", key="case_db_backup",
+                use_container_width=True, disabled=_n_cases == 0)
+            _bk_up = st.file_uploader(
+                "Restore from a backup zip", type=["zip"],
+                key="case_db_restore_up")
+            _bk_ow = st.checkbox("Overwrite existing cases",
+                                 key="case_db_restore_ow", value=False)
+            if _bk_up is not None and st.button(
+                    "📂 Restore backup", key="case_db_restore_btn",
+                    use_container_width=True):
+                _r = fh.import_case_db(_bk_up.getvalue(), overwrite=_bk_ow)
+                if _r["errors"]:
+                    st.error("Some files failed: "
+                             + "; ".join(_r["errors"][:3]))
+                st.success(f"Restored {_r['restored']} case(s), "
+                           f"skipped {_r['skipped']} existing.")
     if page == _MENU:
         _render_landing_menu(_page_opts)
         st.markdown(
@@ -19745,6 +19800,27 @@ YAML so it always runs, and record every such fallback in \"assumptions\"."""
 
 
 def _llm_chat(provider: str, cfg: dict, system: str, messages: list):
+    """Retrying front-end for the LLM call: transient failures (rate limits,
+    5xx, network timeouts) are retried twice with a short backoff before
+    giving up, so one API hiccup doesn't fail a whole case generation.
+    Returns (content, error) like _llm_chat_once; never raises."""
+    import time as _time
+    _TRANSIENT = ("429", "500", "502", "503", "529",
+                  "timeout", "timed out", "connection", "temporarily")
+    last_err = None
+    for attempt in range(3):
+        content, err = _llm_chat_once(provider, cfg, system, messages)
+        if err is None:
+            return content, None
+        last_err = err
+        if not any(t in err.lower() for t in _TRANSIENT):
+            return None, err          # permanent (auth, bad request…)
+        if attempt < 2:
+            _time.sleep(1.5 * (attempt + 1))
+    return None, f"{last_err} (after 3 attempts)"
+
+
+def _llm_chat_once(provider: str, cfg: dict, system: str, messages: list):
     """Provider-agnostic chat call over raw HTTP (no SDK dependency).
 
     `messages` = [{"role": "user"|"assistant", "content": str}, ...]
@@ -20955,6 +21031,37 @@ def case_from_text_section(default_start_date):
         n3.metric("Payback",
                   f"{k['payback_yrs']:,.1f} yr"
                   if k.get("payback_yrs") is not None else "—")
+
+        # ---- Save the generated case into the case database ----
+        # Closes the workflow loop: an LLM-generated case becomes a saved
+        # case usable by the Business builder, the Concept Selector, and the
+        # decision tree's "Saved case" leaf source.
+        with st.expander("💾 Save this case to the case database",
+                         expanded=False):
+            _sv1, _sv2 = st.columns([2, 3])
+            _sv_name = _sv1.text_input(
+                "Case name", value=st.session_state.get(
+                    "nl_save_name", "Case from text"),
+                key="nl_save_name")
+            _sv_desc = _sv2.text_input(
+                "Description", value="Generated by Case-from-text",
+                key="nl_save_desc")
+            if st.button("💾 Save case", key="nl_save_case_btn"):
+                try:
+                    _pl, _meta = fh.yaml_to_payload(
+                        st.session_state.get("nl_yaml", ""))
+                    _fp = fh.save_case(_sv_name, _sv_desc, _pl)
+                    import os as _os
+                    st.success(
+                        f"Saved '{_sv_name}' to the case database "
+                        f"({_os.path.basename(_fp)}). It's now available "
+                        f"in the case manager and as a 'Saved case' leaf "
+                        f"source in the decision tree. Remember the case "
+                        f"DB is ephemeral on Streamlit Cloud — use the "
+                        f"backup in ⚙️ App tools.")
+                except Exception as _ex:
+                    st.error(f"Could not save: {_ex}")
+
         df = res.get("df")
         df_e = res.get("df_e")
         _nl_figs = []   # (name, fig) for the export-all feature
