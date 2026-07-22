@@ -3401,6 +3401,21 @@ def on_units_change():
         return
     if new_units == old_units:
         return
+    _convert_all_units(old_units, new_units)
+
+
+def _convert_all_units(old_units: str, new_units: str) -> None:
+    """Convert EVERY unit-bearing value in session state from `old_units` to
+    `new_units` — scalars and tables — and sync the `_table_units` tracker.
+
+    This is the single conversion engine behind two entry points:
+      * on_units_change — the sidebar radio's callback, and
+      * the reconcile guard at the top of sidebar_inputs, which self-heals
+        any desync left by a programmatic load path (case load, YAML import,
+        preset) that set values without updating the tracker. Together they
+        guarantee that switching units in EITHER direction always converts
+        the displayed numbers, no matter how the current values got there.
+    """
 
     # Conversion direction: convert displayed values from old to new
     # i.e., multiply by (factor_old_to_field / factor_new_to_field) on the field-equivalent
@@ -3479,11 +3494,13 @@ def on_units_change():
                 try:
                     fv = float(v)
                     if old_units == "field" and new_units == "metric":
-                        # MMscf/d -> Mscf/d (×1000) -> Sm³/d (/M2F) -> kSm³/d (/1000)
-                        return fv * 1000.0 / M2F["gas_rate"] / 1000.0
+                        # MMscf/d → Mscf/d (×1000) → kSm³/d (÷ M2F, since
+                        # 1 kSm³ = 35.3147 Mscf). NOTE: no further /1000 —
+                        # dividing Mscf/d by M2F lands directly on kSm³/d.
+                        return fv * 1000.0 / M2F["gas_rate"]
                     elif old_units == "metric" and new_units == "field":
-                        # kSm³/d -> Sm³/d (×1000) -> Mscf/d (×M2F/1000) -> MMscf/d (/1000)
-                        return fv * 1000.0 * M2F["gas_rate"] / 1000.0 / 1000.0
+                        # kSm³/d → Mscf/d (× M2F) → MMscf/d (÷1000)
+                        return fv * M2F["gas_rate"] / 1000.0
                     return fv
                 except (ValueError, TypeError):
                     return v
@@ -3651,6 +3668,17 @@ def sidebar_inputs():
     # Track the units that table values are currently expressed in
     if "_table_units" not in st.session_state:
         st.session_state["_table_units"] = units
+    elif st.session_state["_table_units"] != units:
+        # Self-heal a units desync: the radio-backed `units` value changed
+        # without the on_change callback running (a programmatic path).
+        # Session values are still expressed in the tracked system, so
+        # convert them to the widget's system now — BEFORE any value widget
+        # below is instantiated — so labels and numbers always agree, in
+        # both directions. NOTE FOR LOADERS: any code that writes values in
+        # a specific unit system (case load, YAML import, presets) MUST also
+        # set st.session_state["_table_units"] to that system, otherwise
+        # this guard will treat the values as being in the old system.
+        _convert_all_units(st.session_state["_table_units"], units)
 
     fluid = st.sidebar.selectbox(
         "Fluid system", list(FLUID_SYSTEMS.keys()), key="fluid", on_change=mark_stale,
@@ -12717,6 +12745,11 @@ def main():
                 if k.startswith("_"):
                     continue
                 st.session_state[k] = v
+            # Presets are authored in a specific unit system — sync the
+            # units tracker so the next manual unit swap converts correctly
+            # instead of silently skipping (old == new) or double-converting.
+            st.session_state["_table_units"] = _presets[_pick].get(
+                "units", st.session_state.get("units"))
             st.session_state["_fv_preset_loaded"] = _pick
             st.success(f"Loaded preset '{_pick}'. Adjust in the sidebar, "
                        f"then run.")

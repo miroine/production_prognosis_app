@@ -289,6 +289,40 @@ def _engine_surface():
                                          "compute_economics"}
 check("fp_engine re-export matches app engine", _engine_surface)
 
+def _unit_swap_roundtrip():
+    """Loading a case then swapping units must CONVERT all values, and a
+    swap back must restore the originals exactly (regression: cap-table gas
+    was off by 1000x on field->metric; presets/loads must sync the units
+    tracker so the next swap isn't silently skipped)."""
+    fh = sys.modules["fp_helpers"]
+    ss = sys.modules["streamlit"].session_state
+    payload, _ = fh.yaml_to_payload(
+        open("test_fixtures/reference_gascond.yaml").read())
+    app.restore_inputs_payload(payload)
+    start_units = ss.get("units")
+    other = "metric" if start_units == "field" else "field"
+    keys = [k for k in ("p_init", "t_res", "ooip", "ogip") if k in ss]
+    orig = {k: float(ss[k]) for k in keys}
+    cap0 = (float(ss["cap_df"]["gas"].iloc[0])
+            if ss.get("cap_df") is not None and "gas" in ss["cap_df"]
+            else None)
+    ss["units"] = other
+    app.on_units_change()
+    # values must actually change (conversion happened)
+    assert any(abs(float(ss[k]) - v) > 1e-6 for k, v in orig.items()), \
+        "unit swap did not convert any scalar"
+    ss["units"] = start_units
+    app.on_units_change()
+    for k, v in orig.items():
+        assert abs(float(ss[k]) - v) < 1e-9 * max(1.0, abs(v)), \
+            f"{k} did not round-trip: {ss[k]} vs {v}"
+    if cap0 is not None:
+        c1 = float(ss["cap_df"]["gas"].iloc[0])
+        assert abs(c1 - cap0) < 1e-9 * max(1.0, cap0), \
+            f"cap gas did not round-trip: {c1} vs {cap0}"
+check("unit swap converts and round-trips exactly", _unit_swap_roundtrip)
+
+
 print(f"\n{'='*52}")
 print(f"INTEGRATION SMOKE TESTS: {_passed} passed, {_failed} failed")
 print(f"{'='*52}")
