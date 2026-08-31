@@ -1,0 +1,30 @@
+name: Claude Weekly Maintenance
+on:
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch: {}
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Run the FieldVista test suite (test_v2.py, test_units.py, test_parity.py,
+            test_decision.py, test_integration.py). Review the code for bugs, dead
+            file-path references, and regressions in the drainage-strategy,
+            recovery-factor, well-count, and capacity-constraint logic. If you find a
+            safe, well-tested fix, create a branch, commit it, and open a pull request
+            explaining what you found and fixed. Never push straight to main. If
+            nothing needs fixing, just say so in the run log.
+          claude_args: "--max-turns 25"
