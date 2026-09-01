@@ -89,4 +89,4 @@ jobs:
             review, distinct from the two mechanical fixes). In each PR body, explain
             exactly what changed, why, and paste the test results that verify it.
             Never push straight to main.
-          claude_args: "--max-turns 40"
+          claude_args: '--max-turns 40 --allowedTools "Bash,Edit,Write,Read,Glob,Grep"'
