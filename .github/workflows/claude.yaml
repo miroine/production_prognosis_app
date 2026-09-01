@@ -20,7 +20,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           prompt: |
-            Apply and verify two known, low-risk fixes first (both fine in one PR):
+            Apply and verify two known, low-risk fixes, both in one PR:
 
             (1) In field_prognosis_app.py, the "Generate CAPEX schedule from this
             concept" button handler writes st.session_state.fac_df but never clears
@@ -40,53 +40,8 @@ jobs:
 
             Verify: ast.parse all .py files clean, and test_v2.py / test_units.py /
             test_parity.py / test_decision.py / test_integration.py all pass (171/171
-            total) after these three moves.
-
-            Second, investigate and fix a real bug: in run_simulation() (~line 1307),
-            the capacity choke for gas / gas-condensate fluid systems (the "else"
-            branch around line 1447) only enforces the gas and oil/condensate
-            capacity caps — it never applies cap["water"] or cap["liquid"], even
-            though the UI (capacity_section) collects Water ("Produced water handling
-            capacity") and Liquid ("Total liquid (oil+water) handling capacity") caps
-            for every fluid system with no indication they're inert for gas systems.
-            Verified: a Dry-gas case with a 100 stb/d water cap and ~50% water cut
-            produces ~36,945 stb/d of water with the cap silently ignored.
-
-            This needs care, not a quick patch: field_l is computed once early
-            (field_p + field_w) for the choke, but field_p means gas (Mscf/d) for gas
-            systems, so reusing it directly would mix units with water (stb/d) —
-            nonsensical. Later in the same function (~line 1841), field_l gets
-            recomputed correctly as field_oil_rate + field_w specifically to handle
-            multi-reservoir mixed oil/gas cases (field_oil_rate is only computed at
-            that later point, from per-reservoir aggregation — not available at the
-            earlier choke). There's also an IPR-limited re-aggregation block in
-            between (~line 1737) that rebuilds field_p/field_s/field_w/field_l again
-            without visibly reapplying the earlier capacity choke factor — trace
-            whether the choke actually survives to the values used in the
-            economics/reporting output, or whether it gets diluted or overridden by
-            these later recompute stages, for BOTH the oil and gas branches. The oil
-            branch already applies the water/liquid choke correctly — use its actual
-            verified end-to-end behavior as the ground truth for what "correct" means,
-            and make the gas branch consistent with it all the way through, not just
-            at the first computation point.
-
-            Implement a correct fix: the produced water cap should always apply, and
-            the liquid cap should use the fluid system's actual liquid stream (oil for
-            oil systems, already correct; condensate for gas / gas-condensate systems)
-            plus water, unit-matched correctly at whichever point in the function is
-            authoritative for the final reported/economics values. Add a new
-            regression test (extend test_units.py or test_integration.py, whichever
-            fits the existing test structure best) covering a Dry-gas or
-            Gas-condensate case with a binding water cap and a binding liquid cap,
-            asserting the field's water rate and liquid rate never exceed the
-            configured caps. Do not modify the golden-master reference case in
-            test_parity.py's fixture in a way that changes its expected values — if
-            your fix changes that reference case's output, treat it as a signal to
-            re-examine the fix, not the fixture.
-
-            Open one PR for the two safe fixes, and a SEPARATE PR for the
-            capacity-cap fix (it's a real behavior change and deserves its own
-            review, distinct from the two mechanical fixes). In each PR body, explain
-            exactly what changed, why, and paste the test results that verify it.
-            Never push straight to main.
-          claude_args: '--max-turns 60 --allowedTools "Bash,Edit,Write,Read,Glob,Grep,TodoWrite" --debug'
+            total) after these three moves. Then create a branch, commit, and open a
+            pull request describing the two fixes and pasting the test results. Never
+            push straight to main. Keep this run focused on ONLY these two fixes —
+            do not investigate anything else.
+          claude_args: '--max-turns 40 --allowedTools "Bash,Edit,Write,Read,Glob,Grep,TodoWrite" --debug'
