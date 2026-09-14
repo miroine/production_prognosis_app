@@ -8764,6 +8764,11 @@ def economics_section(units, start_date):
                 except Exception:
                     _phased = False
                 st.session_state.fac_df = pd.DataFrame(_rows)
+                # Drop the data_editor's buffered state so the on-screen
+                # table re-renders from the newly generated schedule instead
+                # of the stale buffer (which "Apply CAPEX edits" would
+                # otherwise write back over it).
+                st.session_state.pop("fac_editor", None)
                 mark_stale()
                 _msg = (f"Generated {len(_rows)} CAPEX line(s) from the "
                         f"'{concept_type}' concept.")
@@ -14999,6 +15004,9 @@ def _reset_all_inputs():
     for k in KEYS_TO_CLEAR:
         if k in st.session_state:
             del st.session_state[k]
+    # Also drop the facility CAPEX data_editor buffer so the table refreshes
+    # from defaults rather than restoring the pre-reset rows.
+    st.session_state.pop("fac_editor", None)
     st.session_state["stale"] = True
 
 
