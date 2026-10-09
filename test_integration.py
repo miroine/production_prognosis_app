@@ -269,7 +269,7 @@ check("case_from_text_section renders",
 def _cache_smoke():
     fh = sys.modules["fp_helpers"]
     payload, _ = fh.yaml_to_payload(
-        open("test_fixtures/reference_gascond.yaml").read())
+        open("reference_gascond.yaml").read())
     r = app.run_payload_case_cached(payload, today)
     assert r.get("ok") and "npv_MM" in r.get("kpis", {})
 check("run_payload_case_cached returns valid result", _cache_smoke)
@@ -280,7 +280,7 @@ def _engine_surface():
     eng = importlib.import_module("fp_engine")
     fh = sys.modules["fp_helpers"]
     payload, _ = fh.yaml_to_payload(
-        open("test_fixtures/reference_gascond.yaml").read())
+        open("reference_gascond.yaml").read())
     # fp_engine.run_payload_case must equal app.run_payload_case exactly
     r_app = app.run_payload_case(payload, today)
     r_eng = eng.run_payload_case(payload, today)
@@ -297,7 +297,7 @@ def _unit_swap_roundtrip():
     fh = sys.modules["fp_helpers"]
     ss = sys.modules["streamlit"].session_state
     payload, _ = fh.yaml_to_payload(
-        open("test_fixtures/reference_gascond.yaml").read())
+        open("reference_gascond.yaml").read())
     app.restore_inputs_payload(payload)
     start_units = ss.get("units")
     other = "metric" if start_units == "field" else "field"

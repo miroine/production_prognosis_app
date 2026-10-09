@@ -83,7 +83,7 @@ def _load(name, path):
 # legacy single contingency 30%, no study cost. Captured from the batch path
 # on a known-good build. KPIs in $MM (and RF as a fraction).
 HERE = os.path.dirname(os.path.abspath(__file__))
-REFERENCE_YAML = os.path.join(HERE, "test_fixtures", "reference_gascond.yaml")
+REFERENCE_YAML = os.path.join(HERE, "reference_gascond.yaml")
 REFERENCE_START = date(2029, 12, 2)
 REFERENCE_UNITS = "metric"
 

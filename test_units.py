@@ -359,7 +359,7 @@ check("SURF: 4 wells on 1 template unchanged = $70MM",
 # Profitability index = NPV ÷ discounted CAPEX, surfaced in run_payload_case.
 import fp_helpers as _fh2
 _p, _ = _fh2.yaml_to_payload(
-    open("test_fixtures/reference_gascond.yaml").read())
+    open("reference_gascond.yaml").read())
 _r = m.run_payload_case(_p, date(2029, 12, 2))
 _k = _r["kpis"]
 _pi = _k.get("profitability_index")
@@ -367,6 +367,19 @@ check("PI present in KPIs", _pi is not None, True)
 if _pi is not None and _k.get("capex_disc_MM"):
     check("PI = NPV / discounted CAPEX", _pi,
           _k["npv_MM"] / _k["capex_disc_MM"], tol=1e-6, rel=True)
+    _capex = (_r["df_e"]["capex_well"].values
+              + _r["df_e"]["capex_facility"].values)
+    _r_m = (1.0 + _r["df_e"].attrs.get("discount_rate", 0.0)) ** (1 / 12) - 1
+    # run_payload_case discounts CAPEX with the same monthly convention as NPV.
+    # The explicit check below uses the case discount rate rather than attrs,
+    # which are not part of the public result contract.
+    _disc_rate = float(_p["scalar"].get("disc", 0.10))
+    _monthly = (1.0 + _disc_rate) ** (1 / 12) - 1
+    _expected_capex_disc = sum(
+        float(v) / ((1.0 + _monthly) ** i)
+        for i, v in enumerate(_capex)) / 1e6
+    check("discounted CAPEX uses NPV month-index convention",
+          _k["capex_disc_MM"], _expected_capex_disc, tol=1e-6, rel=True)
 
 # Concept-study-from-text: outline round-trip + study run.
 _study_env = m._nl_demo_study_envelope(
