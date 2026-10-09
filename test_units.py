@@ -238,6 +238,29 @@ expected_opex = gas_cum_mscf * 1.5
 check("gas OPEX = gas Mscf x $/Mscf", opex_total, expected_opex,
       tol=0.06, rel=True)
 
+section("8a. NGL shrinkage applies to marketed gas accounting")
+econ_shrink = m.EconInputs(
+    oil_price=75, gas_price=4.0, opex_var=0.0, opex_fixed=0.0,
+    capex_per_well=0, discount_rate=0.10, tax_rate=0.0, royalty_rate=0.0,
+    tariff_oil=0.0, tariff_gas=0.5, abandonment_cost_MM=0.0,
+    facility_capex=m.CapexSchedule(df=fac), well_cost_mode="fixed",
+    ngl_yield_bbl_per_mmscf=20.0, ngl_price_bbl=0.0, ngl_opex_bbl=0.0,
+    ngl_shrinkage_pct=0.10, co2_scope3_enabled=True,
+    co2_scope3_factor_gas=1000.0)
+df_shrink = m.compute_economics(df_g, False, econ_shrink, [wg])
+marketed_mscf = (df_g["gas_export_rate"] * 30.4375 * 0.9).sum()
+check("NGL shrinkage reduces marketed gas", df_shrink["gas_market_rate"].sum(),
+      (df_g["gas_export_rate"] * 0.9).sum(), tol=1e-6, rel=True)
+check("gas revenue uses post-shrinkage gas",
+      df_shrink["revenue_gas"].sum(), marketed_mscf * 4.0,
+      tol=1e-6, rel=True)
+check("gas tariff uses post-shrinkage gas",
+      df_shrink["tariff"].sum(), marketed_mscf * 0.5,
+      tol=1e-6, rel=True)
+check("Scope 3 gas uses post-shrinkage gas",
+      df_shrink["co2_scope3_tonnes"].sum(), marketed_mscf,
+      tol=1e-6, rel=True)
+
 section("9. Discount-rate basis (annual compounded monthly)")
 r_y = 0.10
 r_m = (1 + r_y) ** (1.0 / 12.0) - 1
@@ -369,10 +392,6 @@ if _pi is not None and _k.get("capex_disc_MM"):
           _k["npv_MM"] / _k["capex_disc_MM"], tol=1e-6, rel=True)
     _capex = (_r["df_e"]["capex_well"].values
               + _r["df_e"]["capex_facility"].values)
-    _r_m = (1.0 + _r["df_e"].attrs.get("discount_rate", 0.0)) ** (1 / 12) - 1
-    # run_payload_case discounts CAPEX with the same monthly convention as NPV.
-    # The explicit check below uses the case discount rate rather than attrs,
-    # which are not part of the public result contract.
     _disc_rate = float(_p["scalar"].get("disc", 0.10))
     _monthly = (1.0 + _disc_rate) ** (1 / 12) - 1
     _expected_capex_disc = sum(
