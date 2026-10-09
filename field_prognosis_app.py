@@ -2137,28 +2137,31 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         # Fallback for older dataframes
         sold_gas = df["secondary_rate"] if is_oil else df["primary_rate"]
 
+    ngl_shrinkage = float(getattr(econ, "ngl_shrinkage_pct", 0.0))
+    gas_shrink_factor = (max(1.0 - ngl_shrinkage, 0.0)
+                         if ngl_shrinkage > 0 else 1.0)
+    marketed_gas = sold_gas * gas_shrink_factor
+
     if is_oil:
         rev_oil = df["primary_rate"] * days * econ.oil_price
         # sold_gas is in Mscf/d; gas_price is $/Mscf -> rate * days * price = $/month
-        rev_gas = sold_gas * days * econ.gas_price
+        rev_gas = marketed_gas * days * econ.gas_price
         rev_cond = pd.Series(0.0, index=df.index)
         tariff = df["primary_rate"] * days * econ.tariff_oil + \
-                 sold_gas * days * econ.tariff_gas
+                 marketed_gas * days * econ.tariff_gas
     else:
         rev_oil = pd.Series(0.0, index=df.index)
-        rev_gas = sold_gas * days * econ.gas_price
+        rev_gas = marketed_gas * days * econ.gas_price
         rev_cond = df["secondary_rate"] * days * econ.oil_price
-        tariff = sold_gas * days * econ.tariff_gas + \
+        tariff = marketed_gas * days * econ.tariff_gas + \
                  df["secondary_rate"] * days * econ.tariff_oil
 
     # ---- NGL stream (independent of oil/gas, derived from gross gas) ----
-    # NGL volume = gross_gas (MMscf/d) × yield (bbl/MMscf). We use *gross* gas,
-    # not sold gas, because NGLs are extracted at the plant *before* the gas
-    # disposition split (export/inject/fuel/flare).
+    # NGL volume = gross_gas (MMscf/d) × yield (bbl/MMscf). Gas shrinkage is
+    # applied separately to the marketed gas stream.
     ngl_yield = float(getattr(econ, "ngl_yield_bbl_per_mmscf", 0.0))
     ngl_price = float(getattr(econ, "ngl_price_bbl", 0.0))
     ngl_opex_bbl = float(getattr(econ, "ngl_opex_bbl", 0.0))
-    ngl_shrinkage = float(getattr(econ, "ngl_shrinkage_pct", 0.0))
     if "gross_gas_rate" in df.columns:
         gross_gas_mmscfd = df["gross_gas_rate"] / 1000.0   # Mscf/d -> MMscf/d
     else:
@@ -2167,12 +2170,6 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
     ngl_monthly_bbl = ngl_rate_bpd * days
     rev_ngl = ngl_monthly_bbl * ngl_price
     ngl_opex = ngl_monthly_bbl * ngl_opex_bbl
-
-    # Apply shrinkage to the sold-gas revenue (NGL extraction removes volume
-    # from the gas stream that goes to market).
-    if ngl_shrinkage > 0:
-        shrink_factor = max(1.0 - ngl_shrinkage, 0.0)
-        rev_gas = rev_gas * shrink_factor
 
     revenue = rev_oil + rev_gas + rev_cond + rev_ngl
     royalty = revenue * econ.royalty_rate
@@ -2264,6 +2261,8 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
                              "gas_flare_rate", "injection_rate"]:
                 if rate_col in df.columns:
                     df.loc[df.index[cutoff_idx]:, rate_col] = 0.0
+            marketed_gas = marketed_gas.copy()
+            marketed_gas.iloc[cutoff_idx:] = 0.0
             df.attrs["economic_cutoff_idx"] = int(cutoff_idx)
             df.attrs["economic_cutoff_date"] = str(df["date"].iloc[cutoff_idx].date())
 
@@ -2408,12 +2407,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         oil_sold_monthly_bbl = df["oil_rate"] * days
     else:
         oil_sold_monthly_bbl = pd.Series(0.0, index=df.index)
-    if "gas_export_rate" in df.columns:
-        gas_sold_monthly_Mscf = df["gas_export_rate"] * days
-    elif "gas_rate" in df.columns:
-        gas_sold_monthly_Mscf = df["gas_rate"] * days
-    else:
-        gas_sold_monthly_Mscf = pd.Series(0.0, index=df.index)
+    gas_sold_monthly_Mscf = marketed_gas * days
     co2_scope3_oil_t = (oil_sold_monthly_bbl
                         * econ.co2_scope3_factor_oil / 1000.0)
     co2_scope3_gas_t = (gas_sold_monthly_Mscf
@@ -2508,6 +2502,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["revenue_gas"] = rev_gas
         df_e["revenue_condensate"] = rev_cond
         df_e["revenue_ngl"] = rev_ngl
+        df_e["gas_market_rate"] = marketed_gas
         df_e["ngl_rate"] = ngl_rate_bpd
         df_e["revenue"] = revenue
         df_e["royalty"] = royalty_arr
@@ -2658,6 +2653,7 @@ def compute_economics(df, is_oil, econ: EconInputs, wells):
         df_e["revenue_gas"] = rev_gas
         df_e["revenue_condensate"] = rev_cond
         df_e["revenue_ngl"] = rev_ngl
+        df_e["gas_market_rate"] = marketed_gas
         df_e["ngl_rate"] = ngl_rate_bpd
         df_e["revenue"] = revenue
         df_e["royalty"] = royalty
@@ -16004,7 +16000,7 @@ def run_payload_case(payload: dict, default_start_date,
             # Monthly discount factor matching the engine
             mr = (1.0 + econ_s.discount_rate) ** (1/12.0) - 1.0
             disc_factors = np.array(
-                [1.0 / ((1.0 + mr) ** (i + 0.5))
+                [1.0 / ((1.0 + mr) ** i)
                  for i in range(len(cap_total))])
             capex_disc_MM = float((cap_total * disc_factors).sum()) / 1e6
         except Exception:
@@ -25515,6 +25511,4 @@ def concept_selector_section(default_start_date):
 
 if __name__ == "__main__":
     main()
-
-
 
