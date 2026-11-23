@@ -8760,6 +8760,7 @@ def economics_section(units, start_date):
                 except Exception:
                     _phased = False
                 st.session_state.fac_df = pd.DataFrame(_rows)
+                st.session_state.pop("fac_editor", None)
                 mark_stale()
                 _msg = (f"Generated {len(_rows)} CAPEX line(s) from the "
                         f"'{concept_type}' concept.")
@@ -14995,6 +14996,7 @@ def _reset_all_inputs():
     for k in KEYS_TO_CLEAR:
         if k in st.session_state:
             del st.session_state[k]
+    st.session_state.pop("fac_editor", None)
     st.session_state["stale"] = True
 
 
